@@ -5,6 +5,16 @@ A layered Rust weather client and local weather service. The current frontend is
 Weather data is fetched from the NMC provider, cached locally, and exposed to
 frontends through the shared `weather-schema` protocol.
 
+TUI screenshots:
+
+*Main screen*
+
+![main screenshot](https://raw.githubusercontent.com/nmpassthf/weather.app/refs/heads/master/docs/README/main.png)
+
+*Search menu*
+
+![search screenshot](https://raw.githubusercontent.com/nmpassthf/weather.app/refs/heads/master/docs/README/search.png)
+
 ## Usage
 
 Build the binaries first, then run the TUI:
