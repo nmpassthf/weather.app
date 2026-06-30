@@ -1,0 +1,22 @@
+[package]
+name = "weather-tui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+prost.workspace = true
+ratatui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+weather-configure = { path = "../../weather-core/conf" }
+weather-schema = { path = "../../weather-schema" }
+zeromq.workspace = true
+
+[[bin]]
+name = "weather-tui"
+path = "src/main.rs"

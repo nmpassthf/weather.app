@@ -1,0 +1,16 @@
+[package]
+name = "weather-updater"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+weather-configure = { path = "../conf" }
+weather-schema = { path = "../../weather-schema" }
+weather-utils = { path = "../utils" }
+
+[dev-dependencies]
+tokio.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "weather-utils"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

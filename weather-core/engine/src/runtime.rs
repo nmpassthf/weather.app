@@ -1,0 +1,104 @@
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, atomic::AtomicBool},
+};
+
+use anyhow::Result;
+use weather_configure::{
+    ComponentKind, ComponentRegistry, ConfigState, ensure_config_file, load_or_default,
+};
+use weather_db::DbActor;
+use weather_updater::NmcUpdater;
+
+use crate::{
+    config_normalizer::spawn_config_normalizer,
+    lock::LockGuard,
+    lock::resolve_relative,
+    server::{EventSink, run_engine_sockets},
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineExit {
+    Shutdown,
+    Restart,
+}
+
+#[derive(Clone)]
+pub(crate) struct Engine {
+    pub(crate) config_path: PathBuf,
+    pub(crate) config: ConfigState,
+    pub(crate) db: DbActor,
+    pub(crate) updater: NmcUpdater,
+    pub(crate) sink: EventSink,
+    pub(crate) stop: Arc<AtomicBool>,
+    pub(crate) restart: Arc<AtomicBool>,
+}
+
+pub struct EngineRuntime {
+    engine: Engine,
+    _engine_lock: LockGuard,
+    _db_lock: LockGuard,
+}
+
+pub async fn run_engine(config_path: PathBuf, mode: String) -> Result<EngineExit> {
+    let runtime = EngineRuntime::start(config_path).await?;
+    runtime.run_sockets(mode).await
+}
+
+impl EngineRuntime {
+    pub async fn start(config_path: PathBuf) -> Result<Self> {
+        let config_path = absolute_config_path(config_path)?;
+        ensure_config_file(&config_path)?;
+        let components = ComponentRegistry::for_config_path(&config_path)?;
+        components.record(ComponentKind::Config, &config_path)?;
+        let config = load_or_default(&config_path)?;
+        let base_dir = config_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let engine_lock_path = resolve_relative(&base_dir, &config.engine.lock_path)?;
+        components.record(ComponentKind::Lock, &engine_lock_path)?;
+        let _engine_lock = LockGuard::exclusive(engine_lock_path)?;
+        // db.lock 绑定 db.path:固定为 `<db.path 绝对>.lock`,忽略 config 里的 db.lock_path
+        // (该字段保留只为向后兼容旧 toml)。这样不同 config 指向同一 db 文件时用同一把锁,
+        // 避免绕过锁导致跨进程并发写。
+        let db_path = resolve_relative(&base_dir, &config.db.path)?;
+        let db_lock_path = db_path.with_extension("db.lock");
+        components.record(ComponentKind::Db, &db_path)?;
+        components.record(ComponentKind::Db, db_path.with_extension("db-wal"))?;
+        components.record(ComponentKind::Db, db_path.with_extension("db-shm"))?;
+        components.record(ComponentKind::Lock, &db_lock_path)?;
+        let _db_lock = LockGuard::exclusive(db_lock_path)?;
+        let db = DbActor::start(db_path, config.db.timezone.clone())?;
+        let updater = NmcUpdater::new(&config.updater)?;
+        let config_state = ConfigState::new(config);
+        spawn_config_normalizer(config_path.clone(), config_state.clone());
+        let (sink, _) = tokio::sync::broadcast::channel(256);
+        Ok(Self {
+            engine: Engine {
+                config_path,
+                config: config_state,
+                db,
+                updater,
+                sink,
+                stop: Arc::new(AtomicBool::new(false)),
+                restart: Arc::new(AtomicBool::new(false)),
+            },
+            _engine_lock,
+            _db_lock,
+        })
+    }
+
+    pub async fn run_sockets(self, mode: String) -> Result<EngineExit> {
+        let ipc = self.engine.config.get().ipc;
+        run_engine_sockets(self.engine, ipc.rpc_endpoint, ipc.pub_endpoint, mode).await
+    }
+}
+
+fn absolute_config_path(path: PathBuf) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}

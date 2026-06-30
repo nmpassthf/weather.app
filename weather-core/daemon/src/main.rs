@@ -1,0 +1,51 @@
+mod cli;
+mod path;
+mod probe;
+mod run;
+mod service;
+mod time;
+
+use anyhow::Result;
+use clap::Parser;
+
+use crate::{
+    cli::{Cli, Command, ServiceCommand},
+    probe::probe,
+    run::run,
+    service::{install_service, reinstall_service, uninstall_service},
+};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Run { config, foreground } => run(config, foreground).await,
+        Command::Probe { config, verbose } => probe(config, verbose).await,
+        Command::Service { command } => match command {
+            ServiceCommand::Install {
+                backend,
+                system,
+                path,
+                config,
+                no_modification_service,
+            } => install_service(backend, system, path, config, !no_modification_service),
+            ServiceCommand::Reinstall {
+                backend,
+                system,
+                path,
+                config,
+                no_modification_service,
+            } => reinstall_service(backend, system, path, config, !no_modification_service),
+            ServiceCommand::Remove {
+                backend,
+                with_data,
+                with_bin,
+                all,
+            } => uninstall_service(backend, with_data || all, with_bin || all),
+        },
+        Command::Status => {
+            println!("weather-daemon status is exposed through engine ZMQ GET_ENGINE_STATUS");
+            Ok(())
+        }
+    }
+}

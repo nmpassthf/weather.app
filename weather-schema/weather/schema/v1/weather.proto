@@ -1,0 +1,437 @@
+syntax = "proto3";
+
+package weather.schema.v1;
+
+// PUB/SUB event envelope, broadcast by engine on the pub endpoint.
+// Wire layout on ZMQ PUB/SUB: frame 0 = topic string (UTF-8),
+// frame 1 = EventEnvelope encoded as protobuf.
+message EventEnvelope {
+  string schema_version = 1;
+  string event_id = 2;
+  EventKind kind = 3;
+  int64 timestamp_unix_ms = 4;
+  bytes hmac_sha256 = 5;
+  bytes payload = 6;
+}
+
+// RPC request envelope, carried on DEALER/ROUTER socket as a single ZMQ frame.
+message RpcRequest {
+  string schema_version = 1;
+  string request_id = 2;
+  RpcKind kind = 3;
+  int64 timestamp_unix_ms = 4;
+  bytes hmac_sha256 = 5;
+  bytes payload = 6;
+}
+
+// RPC response envelope, returned on the ROUTER socket as a single ZMQ frame.
+message RpcResponse {
+  string schema_version = 1;
+  string request_id = 2;
+  ResponseStatus status = 3;
+  int64 timestamp_unix_ms = 4;
+  bytes hmac_sha256 = 5;
+  bytes payload = 6;
+  EngineError error = 7;
+}
+
+enum EventKind {
+  EVENT_KIND_UNSPECIFIED = 0;
+  WEATHER_SNAPSHOT = 1;
+  ENGINE_STATUS = 2;
+  FETCH_LOG = 3;
+  REFRESH = 4;
+}
+
+enum RpcKind {
+  RPC_KIND_UNSPECIFIED = 0;
+  PING = 1;
+  GET_ENGINE_STATUS = 2;
+  GET_WEATHER = 10;
+  LIST_PROVINCES = 11;
+  LIST_CITIES = 12;
+  FUZZY_MATCH_STATIONS = 13;
+  LIST_CONFIGURED_STATIONS = 14;
+  BATCH_LIST_REGIONS = 15;
+  RESOLVE_STATION_UUID = 16;
+  MIGRATE_DB_TIMEZONE = 17;
+  GET_CONFIG = 18;
+  UPDATE_CONFIG = 19;
+  TRIGGER_REFRESH = 30;
+  RESTART_ENGINE = 40;
+  SHUTDOWN = 41;
+}
+
+enum ResponseStatus {
+  RESPONSE_STATUS_UNSPECIFIED = 0;
+  OK = 1;
+  ACCEPTED = 2;
+  ERROR = 3;
+}
+
+message Empty {}
+message EngineError { string code = 1; string message = 2; }
+message EngineStatus {
+  bool ready = 1;
+  string mode = 2;
+  string rpc_endpoint = 3;
+  string pub_endpoint = 4;
+  string config_path = 5;
+  optional string last_config_error = 6;
+  optional string message = 7;
+  reserved 8 to 15;
+  reserved "endpoint";
+  string engine_version = 16;
+  string schema_version = 17;
+  string build_version = 18;
+}
+
+message GetWeatherRequest {
+  string unified_uuid = 1;
+  bool refresh = 2;
+  bool include_debug = 3;
+  reserved 4 to 19;
+  reserved 20 to 39;
+}
+
+message ListProvincesRequest {
+  uint32 page_offset = 1;
+  uint32 page_size = 2;
+  reserved 20 to 39;
+}
+message ListProvincesResponse {
+  repeated Province provinces = 1;
+  bool has_more = 2;
+  uint32 next_offset = 3;
+  reserved 20 to 39;
+}
+
+message ListCitiesRequest {
+  string province = 1;
+  uint32 page_offset = 2;
+  uint32 page_size = 3;
+  reserved 20 to 39;
+}
+message ListCitiesResponse {
+  repeated City cities = 1;
+  bool has_more = 2;
+  uint32 next_offset = 3;
+  reserved 20 to 39;
+}
+
+message FuzzyMatchStationsRequest {
+  string query = 1;
+  optional string province = 2;
+  uint32 page_offset = 3;
+  uint32 page_size = 4;
+  reserved 20 to 39;
+}
+
+message FuzzyMatchStationsResponse {
+  repeated StationRef stations = 1;
+  repeated City cities = 2;
+  repeated Province provinces = 3;
+  bool has_more = 4;
+  uint32 next_offset = 5;
+  reserved 20 to 39;
+}
+
+message ListConfiguredStationsRequest {
+  uint32 page_offset = 1;
+  uint32 page_size = 2;
+  reserved 20 to 39;
+}
+message ListConfiguredStationsResponse {
+  repeated ConfiguredStation stations = 1;
+  bool has_more = 2;
+  uint32 next_offset = 3;
+  reserved 20 to 39;
+}
+
+message BatchRegionQuery {
+  string province = 1;
+  uint32 page_offset = 2;
+  uint32 page_size = 3;
+  reserved 20 to 39;
+}
+message BatchListRegionsRequest {
+  repeated BatchRegionQuery queries = 1;
+  reserved 20 to 39;
+}
+message BatchRegionPage {
+  string province = 1;
+  repeated City cities = 2;
+  bool has_more = 3;
+  uint32 next_offset = 4;
+  optional string error = 5;
+  reserved 20 to 39;
+}
+message BatchListRegionsResponse {
+  repeated BatchRegionPage pages = 1;
+  reserved 20 to 39;
+}
+
+// 查询规范化站点名 -> 内部 unified UUID 的映射，用于客户端订阅 PUB/SUB topic。
+message ResolveStationUuidRequest {
+  string name = 1;
+  reserved 20 to 39;
+}
+message ResolveStationUuidResponse {
+  string name = 1;
+  string unified_uuid = 2;
+  reserved 20 to 39;
+}
+
+// 迁移 DB 历史表 date 列到新时区。仅 RPC，无 CLI。
+message MigrateDbTimezoneRequest {
+  string new_timezone = 1;
+  reserved 20 to 39;
+}
+message MigrateDbTimezoneResponse {
+  string old_timezone = 1;
+  string new_timezone = 2;
+  uint64 rows_rewritten = 3;
+  reserved 20 to 39;
+}
+
+message ConfiguredStation { string name = 1; bool enabled = 2; }
+
+// 完整 AppConfig 镜像，用于 GET_CONFIG / UPDATE_CONFIG RPC。
+// 字段号对齐 weather-core/conf/src/types.rs 的 AppConfig 层级。
+message AppConfig {
+  EngineConfig engine = 1;
+  IpcConfig ipc = 2;
+  DbConfig db = 3;
+  UpdaterConfig updater = 4;
+  DaemonConfig daemon = 5;
+  repeated StationConfig stations = 6;
+  uint32 config_version = 7;
+  reserved 20 to 39;
+}
+message EngineConfig {
+  uint64 request_timeout_ms = 1;
+  uint64 startup_timeout_ms = 2;
+  string lock_path = 3;
+  reserved 20 to 39;
+}
+message IpcConfig {
+  string transport = 1;
+  string rpc_endpoint = 2;
+  string pub_endpoint = 3;
+  string hmac = 4;
+  string hmac_key = 5;
+  string hmac_env_key_name = 6;
+  reserved 20 to 39;
+}
+message DbConfig {
+  string path = 1;
+  string lock_path = 2;
+  string timezone = 3;
+  reserved 20 to 39;
+}
+message UpdaterConfig {
+  uint64 weather_ttl_seconds = 1;
+  uint64 province_ttl_seconds = 2;
+  string default_provider = 3;
+  repeated ProviderConfig provider = 4;
+  reserved 20 to 39;
+}
+message ProviderConfig {
+  string name = 1;
+  string base_url = 2;
+  uint64 request_timeout_seconds = 3;
+  reserved 20 to 39;
+}
+message DaemonConfig {
+  string service_backend = 1;
+  bool foreground = 2;
+  string service_scope = 3;
+  reserved 20 to 39;
+}
+message StationConfig {
+  string name = 1;
+  bool enabled = 2;
+  reserved 20 to 39;
+}
+
+message GetConfigRequest {
+  bool defaults = 1;
+  reserved 20 to 39;
+}
+message GetConfigResponse {
+  AppConfig config = 1;
+  reserved 20 to 39;
+}
+message UpdateConfigRequest {
+  AppConfig config = 1;
+  reserved 20 to 39;
+}
+message UpdateConfigResponse {
+  AppConfig config = 1;
+  reserved 20 to 39;
+}
+
+message Province { string name = 1; }
+message City { string province = 1; string city = 2; }
+message StationRef {
+  string province = 1;
+  string city = 2;
+  string name = 3;
+  string unified_uuid = 4;
+}
+
+message WeatherSnapshot {
+  StationRef station = 1;
+  ObservedWeather real = 2;
+  ForecastReport predict = 3;
+  AirQuality air = 4;
+  repeated TemperatureChart tempchart = 5;
+  repeated PassedWeatherChart passedchart = 6;
+  ClimateSummary climate = 7;
+  RadarInfo radar = 8;
+  bool stale = 9;
+  DebugPayload debug = 11;
+  reserved 10;
+  reserved 32 to 63;
+  reserved 100 to 199;
+}
+
+message ObservedWeather {
+  optional string publish_time = 1;
+  optional string info = 2;
+  optional double temperature = 3;
+  optional double feel_temperature = 4;
+  optional double humidity = 5;
+  optional double rain = 6;
+  optional string wind_direct = 7;
+  optional string wind_power = 8;
+  optional double wind_speed = 9;
+  optional string sunrise = 10;
+  optional string sunset = 11;
+  WeatherAlert alert = 12;
+  optional double temperature_diff = 13;
+  optional double air_pressure = 14;
+  optional string comfort_index = 15;
+  optional string comfort_label = 16;
+  optional string weather_icon = 17;
+  optional double wind_degree = 18;
+}
+
+message WeatherAlert {
+  optional string alert = 1;
+  optional string province = 2;
+  optional string city = 3;
+  optional string url = 4;
+  optional string issue_content = 5;
+  optional string prevention = 6;
+  optional string signal_type = 7;
+  optional string signal_level = 8;
+  optional string icon_url = 9;
+  optional string icon_name = 10;
+}
+
+message ForecastReport {
+  optional string publish_time = 1;
+  repeated ForecastDay days = 2;
+}
+message ForecastDay {
+  string date = 1;
+  optional string day_info = 2;
+  optional string night_info = 3;
+  optional string day_temperature = 4;
+  optional string night_temperature = 5;
+  optional string wind_direct = 6;
+  optional string wind_power = 7;
+  optional double precipitation = 8;
+  optional string publish_time = 9;
+  optional string day_weather_icon = 10;
+  optional string night_weather_icon = 11;
+  optional string day_wind_direct = 12;
+  optional string day_wind_power = 13;
+  optional string night_wind_direct = 14;
+  optional string night_wind_power = 15;
+}
+
+message AirQuality {
+  reserved 1;
+  optional string publish_time = 2;
+  optional double aqi = 3;
+  optional string level = 4;
+  optional string category = 5;
+  optional string primary_pollutant = 6;
+  optional double pm2_5 = 7;
+  optional double pm10 = 8;
+  optional double no2 = 9;
+  optional double so2 = 10;
+  optional double co = 11;
+  optional double o3 = 12;
+}
+message TemperatureChart {
+  reserved 1;
+  optional string date = 2;
+  optional double max_temperature = 3;
+  optional double min_temperature = 4;
+  optional string day_info = 5;
+  optional string day_icon = 6;
+  optional string night_info = 7;
+  optional string night_icon = 8;
+}
+message PassedWeatherChart {
+  reserved 1;
+  optional string time = 2;
+  optional double rain_1h = 3;
+  optional double rain_6h = 4;
+  optional double rain_12h = 5;
+  optional double rain_24h = 6;
+  optional double temperature = 7;
+  optional double temperature_diff = 8;
+  optional double humidity = 9;
+  optional double pressure = 10;
+  optional double wind_direction_degree = 11;
+  optional double wind_speed = 12;
+}
+message ClimateSummary {
+  reserved 1;
+  optional string period = 2;
+  repeated ClimateMonth month = 3;
+}
+message ClimateMonth {
+  optional uint32 month = 1;
+  optional double average_max_temperature = 2;
+  optional double average_min_temperature = 3;
+  optional double precipitation = 4;
+}
+message RadarInfo {
+  reserved 1;
+  optional string title = 2;
+  optional string image_url = 3;
+  optional string page_url = 4;
+}
+message DebugPayload {
+  string provider = 1;
+  string operation = 2;
+  string endpoint = 3;
+  string raw_json = 4;
+  repeated string warnings = 5;
+}
+
+// PUB/SUB event payloads (one per EventKind).
+message WeatherSnapshotEvent {
+  WeatherSnapshot snapshot = 1;
+  reserved 20 to 39;
+}
+message FetchLogEvent {
+  optional string unified_uuid = 1;
+  string endpoint = 2;
+  bool ok = 3;
+  optional string message = 4;
+  int64 timestamp_unix_ms = 5;
+  reserved 20 to 39;
+}
+message RefreshEvent {
+  optional string unified_uuid = 1;
+  bool started = 2;
+  bool completed = 3;
+  optional string message = 4;
+  reserved 20 to 39;
+}

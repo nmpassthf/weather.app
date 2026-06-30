@@ -1,0 +1,19 @@
+[package]
+name = "weather-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+fs2.workspace = true
+prost.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+weather-configure = { path = "../conf" }
+weather-db = { path = "../db" }
+weather-schema = { path = "../../weather-schema" }
+weather-updater = { path = "../updater" }
+zeromq.workspace = true

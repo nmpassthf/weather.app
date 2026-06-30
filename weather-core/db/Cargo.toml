@@ -1,0 +1,13 @@
+[package]
+name = "weather-db"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+weather-schema = { path = "../../weather-schema" }
