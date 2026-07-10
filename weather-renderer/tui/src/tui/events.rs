@@ -1,7 +1,10 @@
 use std::time::Instant;
 
 use prost::Message as _;
-use weather_schema::{EngineStatus, EventKind, FetchLogEvent, RefreshEvent, WeatherSnapshotEvent};
+use weather_schema::{
+    EngineStatus, EventKind, FetchLogEvent, FetchOutcome, LifecycleState, RefreshEvent,
+    RefreshOutcome, RefreshPhase, WeatherSnapshotEvent,
+};
 
 use crate::client::EngineEvent;
 
@@ -221,13 +224,37 @@ impl TuiApp {
             }
             kind if kind == EventKind::EngineStatus as i32 => {
                 if let Ok(status) = EngineStatus::decode(payload.as_slice()) {
-                    self.push_log(format!("engine {} ready={}", status.mode, status.ready));
+                    let state = match LifecycleState::try_from(status.lifecycle_state)
+                        .unwrap_or(LifecycleState::Unspecified)
+                    {
+                        LifecycleState::Starting => "starting",
+                        LifecycleState::Ready => "ready",
+                        LifecycleState::Stopping => "stopping",
+                        LifecycleState::Failed => "failed",
+                        LifecycleState::Unspecified if status.ready => "ready",
+                        LifecycleState::Unspecified => "not-ready",
+                    };
+                    let detail = status
+                        .message
+                        .as_deref()
+                        .filter(|message| !message.is_empty())
+                        .map(|message| format!(": {message}"))
+                        .unwrap_or_default();
+                    self.push_log(format!("engine {} {state}{detail}", status.mode));
                 }
             }
             kind if kind == EventKind::FetchLog as i32 => {
                 if let Ok(log) = FetchLogEvent::decode(payload.as_slice()) {
                     let station = self.log_station_label(&log.unified_uuid.unwrap_or_default());
-                    let state = if log.ok { "ok" } else { "fail" };
+                    let state = match FetchOutcome::try_from(log.outcome)
+                        .unwrap_or(FetchOutcome::Unspecified)
+                    {
+                        FetchOutcome::Success => "ok",
+                        FetchOutcome::Warning => "warn",
+                        FetchOutcome::Failure => "fail",
+                        FetchOutcome::Unspecified if log.ok => "ok",
+                        FetchOutcome::Unspecified => "fail",
+                    };
                     self.push_log(format!(
                         "{} {station} {state}: {}",
                         event.topic, log.endpoint
@@ -237,10 +264,40 @@ impl TuiApp {
             kind if kind == EventKind::Refresh as i32 => {
                 if let Ok(refresh) = RefreshEvent::decode(payload.as_slice()) {
                     let station = self.log_station_label(&refresh.unified_uuid.unwrap_or_default());
-                    if refresh.started {
-                        self.push_log(format!("{} {station} started", event.topic));
-                    } else if refresh.completed {
-                        self.push_log(format!("{} {station} completed", event.topic));
+                    match RefreshPhase::try_from(refresh.phase).unwrap_or(RefreshPhase::Unspecified)
+                    {
+                        RefreshPhase::Started => {
+                            self.push_log(format!("{} {station} started", event.topic));
+                        }
+                        RefreshPhase::Completed => {
+                            let outcome = RefreshOutcome::try_from(refresh.outcome)
+                                .unwrap_or(RefreshOutcome::Unspecified);
+                            let state = match outcome {
+                                RefreshOutcome::Success => "success",
+                                RefreshOutcome::Stale => "stale",
+                                RefreshOutcome::Failure => "failure",
+                                RefreshOutcome::Unspecified => "completed",
+                            };
+                            let detail = match outcome {
+                                RefreshOutcome::Failure => refresh
+                                    .message
+                                    .as_deref()
+                                    .and_then(|message| message.strip_prefix("failure: ")),
+                                RefreshOutcome::Unspecified => refresh.message.as_deref(),
+                                RefreshOutcome::Success | RefreshOutcome::Stale => None,
+                            }
+                            .filter(|message| !message.is_empty())
+                            .map(|message| format!(": {message}"))
+                            .unwrap_or_default();
+                            self.push_log(format!("{} {station} {state}{detail}", event.topic));
+                        }
+                        RefreshPhase::Unspecified if refresh.started => {
+                            self.push_log(format!("{} {station} started", event.topic));
+                        }
+                        RefreshPhase::Unspecified if refresh.completed => {
+                            self.push_log(format!("{} {station} completed", event.topic));
+                        }
+                        RefreshPhase::Unspecified => {}
                     }
                 }
             }
@@ -289,6 +346,7 @@ mod tests {
             ok: true,
             message: None,
             timestamp_unix_ms: 0,
+            ..Default::default()
         }
         .encode_to_vec();
         let event = EngineEvent {
@@ -324,6 +382,7 @@ mod tests {
             started: false,
             completed: true,
             message: None,
+            ..Default::default()
         }
         .encode_to_vec();
         let event = EngineEvent {
@@ -343,6 +402,43 @@ mod tests {
         app.drain_events(&mut receiver);
 
         let expected = format!("engine.refresh 北京-北京市-朝阳({uuid}) completed");
+        assert_eq!(app.logs.back().map(String::as_str), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn structured_refresh_outcome_does_not_duplicate_legacy_message() {
+        let mut app = TuiApp::empty_for_test();
+        let uuid = weather_schema::unified_station_uuid("北京-北京市-朝阳");
+        app.config.stations.push(StationConfig {
+            name: "北京-北京市-朝阳".to_string(),
+            enabled: true,
+        });
+        let payload = RefreshEvent {
+            unified_uuid: Some(uuid.clone()),
+            started: false,
+            completed: true,
+            message: Some("failure: upstream timeout".to_string()),
+            phase: RefreshPhase::Completed as i32,
+            outcome: RefreshOutcome::Failure as i32,
+        }
+        .encode_to_vec();
+        let event = EngineEvent {
+            topic: TOPIC_ENGINE_REFRESH.to_string(),
+            envelope: EventEnvelope {
+                schema_version: SCHEMA_VERSION.to_string(),
+                event_id: "event-id".to_string(),
+                kind: EventKind::Refresh as i32,
+                timestamp_unix_ms: 0,
+                hmac_sha256: Vec::new(),
+                payload,
+            },
+        };
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(1);
+        sender.send(event).unwrap();
+
+        app.drain_events(&mut receiver);
+
+        let expected = format!("engine.refresh 北京-北京市-朝阳({uuid}) failure: upstream timeout");
         assert_eq!(app.logs.back().map(String::as_str), Some(expected.as_str()));
     }
 }

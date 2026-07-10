@@ -14,12 +14,12 @@ impl Engine {
         let Ok(req) = decoded else {
             return Self::rpc_error_response(
                 &request.request_id,
-                "BAD_REQUEST",
+                RpcErrorCode::BadRequest,
                 decoded.unwrap_err().to_string(),
             );
         };
         if let Err(err) = validate_batch_size(req.queries.len()) {
-            return Self::rpc_error_response(&request.request_id, "BAD_REQUEST", err);
+            return Self::rpc_error_response(&request.request_id, RpcErrorCode::BadRequest, err);
         }
         let mut queries = Vec::with_capacity(req.queries.len());
         for query in req.queries {
@@ -27,7 +27,11 @@ impl Engine {
                 match normalize_pagination(query.page_offset, query.page_size, DEFAULT_PAGE_SIZE) {
                     Ok(page) => page,
                     Err(err) => {
-                        return Self::rpc_error_response(&request.request_id, "BAD_REQUEST", err);
+                        return Self::rpc_error_response(
+                            &request.request_id,
+                            RpcErrorCode::BadRequest,
+                            err,
+                        );
                     }
                 };
             queries.push((query.province, offset, page_size));
@@ -75,7 +79,7 @@ impl Engine {
         let Ok(req) = decoded else {
             return Self::rpc_error_response(
                 &request.request_id,
-                "BAD_REQUEST",
+                RpcErrorCode::BadRequest,
                 decoded.unwrap_err().to_string(),
             );
         };

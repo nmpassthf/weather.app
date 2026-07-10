@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use prost::Message;
 use prost::bytes::Bytes;
 use tokio::{
@@ -21,6 +21,7 @@ use zeromq::{
     DealerRecvHalf, DealerSendHalf, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage,
 };
 
+pub(crate) use self::failure::RemoteRpcError;
 use self::{
     failure::ClientFailure,
     pending::{PendingLease, PendingRegistry, RegisterError},
@@ -225,11 +226,11 @@ impl EngineClient {
         )
         .await?;
         if response.status == ResponseStatus::Error as i32 {
-            let err = response.error.unwrap_or(EngineError {
-                code: "ENGINE".to_string(),
-                message: "unknown engine error".to_string(),
-            });
-            bail!("{}: {}", err.code, err.message);
+            let error = response.error.map_or_else(
+                RemoteRpcError::missing_engine_error,
+                RemoteRpcError::from_engine_error,
+            );
+            return Err(anyhow::Error::new(error));
         }
         Ok(Resp::decode(response.payload.as_slice())?)
     }

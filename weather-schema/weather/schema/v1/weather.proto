@@ -72,6 +72,43 @@ enum ResponseStatus {
   ERROR = 3;
 }
 
+enum LifecycleState {
+  LIFECYCLE_STATE_UNSPECIFIED = 0;
+  LIFECYCLE_STATE_STARTING = 1;
+  LIFECYCLE_STATE_READY = 2;
+  LIFECYCLE_STATE_STOPPING = 3;
+  LIFECYCLE_STATE_FAILED = 4;
+}
+
+enum FetchOutcome {
+  // Outcome of the logged upstream/cache operation. A failed upstream attempt
+  // can still produce a stale WeatherSnapshot through the refresh flow.
+  FETCH_OUTCOME_UNSPECIFIED = 0;
+  // Upstream succeeded without a non-critical persistence warning.
+  FETCH_OUTCOME_SUCCESS = 1;
+  // Upstream succeeded, but cache/fetch-log persistence reported a warning.
+  FETCH_OUTCOME_WARNING = 2;
+  // Upstream failed, including when a separate refresh result falls back stale.
+  FETCH_OUTCOME_FAILURE = 3;
+}
+
+enum RefreshPhase {
+  REFRESH_PHASE_UNSPECIFIED = 0;
+  REFRESH_PHASE_STARTED = 1;
+  REFRESH_PHASE_COMPLETED = 2;
+}
+
+enum RefreshOutcome {
+  // Terminal result of the end-to-end refresh request.
+  REFRESH_OUTCOME_UNSPECIFIED = 0;
+  // Fresh upstream data was returned.
+  REFRESH_OUTCOME_SUCCESS = 1;
+  // Upstream failed and a cached snapshot was returned.
+  REFRESH_OUTCOME_STALE = 2;
+  // No usable fresh or cached snapshot was returned.
+  REFRESH_OUTCOME_FAILURE = 3;
+}
+
 message Empty {}
 message ShutdownRequest {
   optional string owner_token = 1;
@@ -92,6 +129,8 @@ message EngineStatus {
   string schema_version = 17;
   string build_version = 18;
   string instance_id = 19;
+  // Structured equivalent of ready/message for new clients.
+  LifecycleState lifecycle_state = 20;
 }
 
 message GetWeatherRequest {
@@ -438,6 +477,8 @@ message FetchLogEvent {
   optional string message = 4;
   int64 timestamp_unix_ms = 5;
   reserved 20 to 39;
+  // Kept synchronized with ok/message by v1 servers.
+  FetchOutcome outcome = 40;
 }
 message RefreshEvent {
   optional string unified_uuid = 1;
@@ -445,4 +486,7 @@ message RefreshEvent {
   bool completed = 3;
   optional string message = 4;
   reserved 20 to 39;
+  // Kept synchronized with started/completed/message by v1 servers.
+  RefreshPhase phase = 40;
+  RefreshOutcome outcome = 41;
 }

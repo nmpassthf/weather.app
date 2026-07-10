@@ -20,14 +20,14 @@ impl Engine {
         let Ok(req) = decoded else {
             return Self::rpc_error_response(
                 &request.request_id,
-                "BAD_REQUEST",
+                RpcErrorCode::BadRequest,
                 decoded.unwrap_err().to_string(),
             );
         };
         if chrono_tz::Tz::from_str(&req.new_timezone).is_err() {
             return Self::rpc_error_response(
                 &request.request_id,
-                "BAD_REQUEST",
+                RpcErrorCode::BadRequest,
                 format!("invalid timezone `{}`", req.new_timezone),
             );
         }
@@ -41,7 +41,11 @@ impl Engine {
                     rows_rewritten: migration.rows_rewritten,
                 },
             ),
-            Err(err) => Self::rpc_error_response(&request.request_id, "DB", format!("{err:#}")),
+            Err(err) => Self::rpc_error_response(
+                &request.request_id,
+                RpcErrorCode::Database,
+                format!("{err:#}"),
+            ),
         }
     }
 

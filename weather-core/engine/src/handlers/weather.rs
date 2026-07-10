@@ -21,7 +21,7 @@ impl Engine {
         let Ok(mut req) = decoded else {
             return Self::rpc_error_response(
                 &request.request_id,
-                "BAD_REQUEST",
+                RpcErrorCode::BadRequest,
                 decoded.unwrap_err().to_string(),
             );
         };
@@ -33,7 +33,11 @@ impl Engine {
                 self.publish_snapshot(&snapshot);
                 self.ok(&request.request_id, snapshot)
             }
-            Err(err) => Self::rpc_error_response(&request.request_id, "WEATHER", err.to_string()),
+            Err(err) => Self::rpc_error_response(
+                &request.request_id,
+                RpcErrorCode::Weather,
+                err.to_string(),
+            ),
         }
     }
 

@@ -14,7 +14,7 @@ impl Engine {
         let Ok(req) = decoded else {
             return Self::rpc_error_response(
                 &request.request_id,
-                "BAD_REQUEST",
+                RpcErrorCode::BadRequest,
                 decoded.unwrap_err().to_string(),
             );
         };
@@ -34,14 +34,14 @@ impl Engine {
         let Ok(req) = decoded else {
             return Self::rpc_error_response(
                 &request.request_id,
-                "BAD_REQUEST",
+                RpcErrorCode::BadRequest,
                 decoded.unwrap_err().to_string(),
             );
         };
         let Some(schema_config) = req.config else {
             return Self::rpc_error_response(
                 &request.request_id,
-                "BAD_REQUEST",
+                RpcErrorCode::BadRequest,
                 "missing config field",
             );
         };
@@ -61,15 +61,15 @@ impl Engine {
                 },
             ),
             Err(ConfigCommitError::Invalid(message)) => {
-                Self::rpc_error_response(&request.request_id, "BAD_REQUEST", message)
+                Self::rpc_error_response(&request.request_id, RpcErrorCode::BadRequest, message)
             }
             Err(ConfigCommitError::RestartRequired(fields)) => Self::rpc_error_response(
                 &request.request_id,
-                "RESTART_REQUIRED",
+                RpcErrorCode::RestartRequired,
                 restart_required_message(&fields),
             ),
             Err(ConfigCommitError::Persistence(message)) => {
-                Self::rpc_error_response(&request.request_id, "CONFIG", message)
+                Self::rpc_error_response(&request.request_id, RpcErrorCode::Config, message)
             }
         }
     }

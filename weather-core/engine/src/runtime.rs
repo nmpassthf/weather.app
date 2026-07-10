@@ -244,9 +244,9 @@ mod tests {
         AppConfig, StationConfig, load_from_path, normalize_config_stations, write_config_atomic,
     };
     use weather_schema::{
-        DebugPayload, Empty, ListCitiesRequest, ListCitiesResponse, ListProvincesRequest,
-        ListProvincesResponse, ResponseStatus, RpcKind, RpcRequest, SCHEMA_VERSION,
-        ShutdownRequest, WeatherSnapshot, decode_message, encode_message,
+        DebugPayload, Empty, LifecycleState, ListCitiesRequest, ListCitiesResponse,
+        ListProvincesRequest, ListProvincesResponse, ResponseStatus, RpcKind, RpcRequest,
+        SCHEMA_VERSION, ShutdownRequest, WeatherSnapshot, decode_message, encode_message,
     };
     use weather_updater::{
         ProviderCity, ProviderFuture, ProviderProvince, WeatherFetch, WeatherProvider,
@@ -527,10 +527,11 @@ mod tests {
             )
             .await;
         assert_eq!(legacy.status, ResponseStatus::Accepted as i32);
-        assert_eq!(
-            engine.status("test", "rpc", "pub").instance_id,
-            engine.launch.instance_id
-        );
+        let status = engine.status("test", "rpc", "pub");
+        assert_eq!(status.instance_id, engine.launch.instance_id);
+        assert!(status.ready);
+        assert_eq!(status.lifecycle_state, LifecycleState::Ready as i32);
+        assert_eq!(status.message, None);
 
         runtime.engine.db.shutdown().await.unwrap();
     }

@@ -32,7 +32,7 @@ impl Engine {
         let Ok(req) = decoded else {
             return Self::rpc_error_response(
                 &request.request_id,
-                "BAD_REQUEST",
+                RpcErrorCode::BadRequest,
                 decoded.unwrap_err().to_string(),
             );
         };
@@ -40,12 +40,18 @@ impl Engine {
             match normalize_pagination(req.page_offset, req.page_size, DEFAULT_FUZZY_PAGE_SIZE) {
                 Ok(page) => page,
                 Err(err) => {
-                    return Self::rpc_error_response(&request.request_id, "BAD_REQUEST", err);
+                    return Self::rpc_error_response(
+                        &request.request_id,
+                        RpcErrorCode::BadRequest,
+                        err,
+                    );
                 }
             };
         match self.fuzzy(req, offset, page_size).await {
             Ok(resp) => self.ok(&request.request_id, resp),
-            Err(err) => Self::rpc_error_response(&request.request_id, "FUZZY", err.to_string()),
+            Err(err) => {
+                Self::rpc_error_response(&request.request_id, RpcErrorCode::Fuzzy, err.to_string())
+            }
         }
     }
 

@@ -11,11 +11,11 @@ pub(crate) enum RefreshTerminal {
 }
 
 impl RefreshTerminal {
-    fn message(self) -> String {
+    fn into_diagnostics(self) -> (RefreshOutcome, String) {
         match self {
-            Self::Success => "success".to_string(),
-            Self::Stale => "stale".to_string(),
-            Self::Failure(message) => format!("failure: {message}"),
+            Self::Success => (RefreshOutcome::Success, "success".to_string()),
+            Self::Stale => (RefreshOutcome::Stale, "stale".to_string()),
+            Self::Failure(message) => (RefreshOutcome::Failure, format!("failure: {message}")),
         }
     }
 }
@@ -49,7 +49,25 @@ impl Engine {
     }
 
     pub(crate) fn publish_status(&self, mode: &str, rpc_endpoint: &str, pub_endpoint: &str) {
-        let status = self.status(mode, rpc_endpoint, pub_endpoint);
+        self.publish_lifecycle_status(
+            mode,
+            rpc_endpoint,
+            pub_endpoint,
+            LifecycleState::Ready,
+            None,
+        );
+    }
+
+    pub(crate) fn publish_lifecycle_status(
+        &self,
+        mode: &str,
+        rpc_endpoint: &str,
+        pub_endpoint: &str,
+        lifecycle_state: LifecycleState,
+        message: Option<String>,
+    ) {
+        let status =
+            self.lifecycle_status(mode, rpc_endpoint, pub_endpoint, lifecycle_state, message);
         let payload = status.encode_to_vec();
         let mut envelope = EventEnvelope {
             schema_version: SCHEMA_VERSION.to_string(),
@@ -75,19 +93,17 @@ impl Engine {
         if let Some(line) = fetch_log_output_line(unified_uuid, endpoint, ok, message.as_deref()) {
             println!("{line}");
         }
-        let payload = FetchLogEvent {
-            unified_uuid: unified_uuid.map(str::to_string),
-            endpoint: endpoint.to_string(),
-            ok,
-            message,
-            timestamp_unix_ms: unix_timestamp_ms().unwrap_or_default(),
-        }
-        .encode_to_vec();
+        let payload = fetch_log_event(unified_uuid, endpoint, ok, message).encode_to_vec();
         self.publish_event(TOPIC_ENGINE_LOG, EventKind::FetchLog, payload);
     }
 
     pub(crate) fn publish_refresh_started(&self, unified_uuid: Option<&str>) {
-        self.publish_refresh(unified_uuid, true, false, None);
+        self.publish_refresh(
+            unified_uuid,
+            RefreshPhase::Started,
+            RefreshOutcome::Unspecified,
+            None,
+        );
     }
 
     /// Every started refresh is followed by one completed terminal event.
@@ -98,17 +114,23 @@ impl Engine {
         unified_uuid: Option<&str>,
         outcome: RefreshTerminal,
     ) {
-        self.publish_refresh(unified_uuid, false, true, Some(outcome.message()));
+        let (outcome, message) = outcome.into_diagnostics();
+        self.publish_refresh(
+            unified_uuid,
+            RefreshPhase::Completed,
+            outcome,
+            Some(message),
+        );
     }
 
     fn publish_refresh(
         &self,
         unified_uuid: Option<&str>,
-        started: bool,
-        completed: bool,
+        phase: RefreshPhase,
+        outcome: RefreshOutcome,
         message: Option<String>,
     ) {
-        let payload = refresh_event(unified_uuid, started, completed, message).encode_to_vec();
+        let payload = refresh_event(unified_uuid, phase, outcome, message).encode_to_vec();
         self.publish_event(TOPIC_ENGINE_REFRESH, EventKind::Refresh, payload);
     }
 
@@ -119,17 +141,40 @@ impl Engine {
     }
 }
 
+fn fetch_log_event(
+    unified_uuid: Option<&str>,
+    endpoint: &str,
+    ok: bool,
+    message: Option<String>,
+) -> FetchLogEvent {
+    let outcome = match (ok, message.is_some()) {
+        (true, false) => FetchOutcome::Success,
+        (true, true) => FetchOutcome::Warning,
+        (false, _) => FetchOutcome::Failure,
+    };
+    FetchLogEvent {
+        unified_uuid: unified_uuid.map(str::to_string),
+        endpoint: endpoint.to_string(),
+        ok,
+        message,
+        timestamp_unix_ms: unix_timestamp_ms().unwrap_or_default(),
+        outcome: outcome as i32,
+    }
+}
+
 fn refresh_event(
     unified_uuid: Option<&str>,
-    started: bool,
-    completed: bool,
+    phase: RefreshPhase,
+    outcome: RefreshOutcome,
     message: Option<String>,
 ) -> RefreshEvent {
     RefreshEvent {
         unified_uuid: unified_uuid.map(str::to_string),
-        started,
-        completed,
+        started: phase == RefreshPhase::Started,
+        completed: phase == RefreshPhase::Completed,
         message,
+        phase: phase as i32,
+        outcome: outcome as i32,
     }
 }
 
@@ -193,11 +238,20 @@ mod tests {
 
     #[test]
     fn refresh_terminal_messages_distinguish_outcomes() {
-        assert_eq!(RefreshTerminal::Success.message(), "success");
-        assert_eq!(RefreshTerminal::Stale.message(), "stale");
         assert_eq!(
-            RefreshTerminal::Failure("upstream timeout".to_string()).message(),
-            "failure: upstream timeout"
+            RefreshTerminal::Success.into_diagnostics(),
+            (RefreshOutcome::Success, "success".to_string())
+        );
+        assert_eq!(
+            RefreshTerminal::Stale.into_diagnostics(),
+            (RefreshOutcome::Stale, "stale".to_string())
+        );
+        assert_eq!(
+            RefreshTerminal::Failure("upstream timeout".to_string()).into_diagnostics(),
+            (
+                RefreshOutcome::Failure,
+                "failure: upstream timeout".to_string()
+            )
         );
     }
 
@@ -205,14 +259,32 @@ mod tests {
     fn terminal_refresh_event_is_completed_and_not_started() {
         let event = refresh_event(
             Some("uuid"),
-            false,
-            true,
-            Some(RefreshTerminal::Stale.message()),
+            RefreshPhase::Completed,
+            RefreshOutcome::Stale,
+            Some("stale".to_string()),
         );
 
         assert_eq!(event.unified_uuid.as_deref(), Some("uuid"));
         assert!(!event.started);
         assert!(event.completed);
         assert_eq!(event.message.as_deref(), Some("stale"));
+        assert_eq!(event.phase, RefreshPhase::Completed as i32);
+        assert_eq!(event.outcome, RefreshOutcome::Stale as i32);
+    }
+
+    #[test]
+    fn fetch_outcome_stays_synchronized_with_legacy_fields() {
+        let success = fetch_log_event(Some("uuid"), "endpoint", true, None);
+        assert!(success.ok);
+        assert_eq!(success.message, None);
+        assert_eq!(success.outcome, FetchOutcome::Success as i32);
+
+        let warning = fetch_log_event(None, "endpoint", true, Some("cache failed".to_string()));
+        assert!(warning.ok);
+        assert_eq!(warning.outcome, FetchOutcome::Warning as i32);
+
+        let failure = fetch_log_event(None, "endpoint", false, Some("offline".to_string()));
+        assert!(!failure.ok);
+        assert_eq!(failure.outcome, FetchOutcome::Failure as i32);
     }
 }

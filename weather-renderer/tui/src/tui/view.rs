@@ -671,8 +671,8 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use weather_schema::{
-        ForecastDay, ForecastReport, ObservedWeather, PassedWeatherChart, RadarInfo,
-        TemperatureChart, WeatherAlert, WeatherSnapshot,
+        ForecastDay, ForecastReport, LifecycleState, ObservedWeather, PassedWeatherChart,
+        RadarInfo, TemperatureChart, WeatherAlert, WeatherSnapshot,
     };
 
     use super::*;
@@ -690,6 +690,7 @@ mod tests {
             schema_version: "v1".to_string(),
             build_version: "dev".to_string(),
             instance_id: "test-instance".to_string(),
+            lifecycle_state: LifecycleState::Ready as i32,
         }
     }
 

@@ -101,6 +101,13 @@ pub(crate) async fn run_engine_sockets(
         TaskKind::Refresh,
         run_refresh_loop(engine.clone(), cancellation.clone()),
     );
+    engine.publish_lifecycle_status(
+        &mode,
+        &rpc_endpoint,
+        &pub_endpoint,
+        LifecycleState::Starting,
+        Some("engine tasks starting".to_string()),
+    );
     engine.publish_status(&mode, &rpc_endpoint, &pub_endpoint);
 
     let mut exit_rx = engine.control.subscribe();
@@ -127,6 +134,15 @@ pub(crate) async fn run_engine_sockets(
         },
     };
 
+    let (terminal_state, terminal_message) =
+        terminal_lifecycle(requested_exit, critical_failure.as_ref());
+    engine.publish_lifecycle_status(
+        &mode,
+        &rpc_endpoint,
+        &pub_endpoint,
+        terminal_state,
+        terminal_message,
+    );
     cancellation.cancel();
     let shutdown_timeout = cleanup_timeout(request_timeout);
     if tokio::time::timeout(shutdown_timeout, drain_tasks(&mut tasks))
@@ -171,6 +187,23 @@ fn cleanup_timeout(request_timeout: Duration) -> Duration {
     request_timeout.clamp(MIN_CLEANUP_TIMEOUT, MAX_CLEANUP_TIMEOUT)
 }
 
+fn terminal_lifecycle(
+    requested_exit: Option<EngineExit>,
+    critical_failure: Option<&anyhow::Error>,
+) -> (LifecycleState, Option<String>) {
+    match (requested_exit, critical_failure) {
+        (_, Some(error)) => (LifecycleState::Failed, Some(format!("{error:#}"))),
+        (Some(EngineExit::Restart), None) => (
+            LifecycleState::Stopping,
+            Some("engine restart requested".to_string()),
+        ),
+        _ => (
+            LifecycleState::Stopping,
+            Some("engine shutdown requested".to_string()),
+        ),
+    }
+}
+
 async fn bounded_db_shutdown(engine: &Engine, timeout: Duration) -> Result<()> {
     match tokio::time::timeout(timeout, engine.db.shutdown()).await {
         Ok(result) => result.context("failed to shut down DB actor"),
@@ -203,7 +236,7 @@ async fn run_publisher(
 ) -> Result<()> {
     loop {
         let (topic, event) = tokio::select! {
-            _ = cancellation.cancelled() => return Ok(()),
+            _ = cancellation.cancelled() => return drain_publisher(&mut socket, &mut rx).await,
             event = rx.recv() => match event {
                 Ok(event) => event,
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -218,17 +251,45 @@ async fn run_publisher(
                 }
             }
         };
-        let mut frames = VecDeque::new();
-        frames.push_back(Bytes::from(topic));
-        frames.push_back(Bytes::from(event.encode_to_vec()));
-        let message = ZmqMessage::try_from(frames).expect("non-empty message");
-        tokio::select! {
-            _ = cancellation.cancelled() => return Ok(()),
-            sent = socket.send(message) => {
-                sent.context("failed to send PUB event")?;
+        send_publisher_event(&mut socket, topic, event).await?;
+        if cancellation.is_cancelled() {
+            return drain_publisher(&mut socket, &mut rx).await;
+        }
+    }
+}
+
+async fn drain_publisher(
+    socket: &mut PubSocket,
+    rx: &mut broadcast::Receiver<(String, EventEnvelope)>,
+) -> Result<()> {
+    loop {
+        match rx.try_recv() {
+            Ok((topic, event)) => send_publisher_event(socket, topic, event).await?,
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                eprintln!(
+                    "weather-engine warn: publisher lagged during shutdown; skipped {skipped} events"
+                );
+            }
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+                return Ok(());
             }
         }
     }
+}
+
+async fn send_publisher_event(
+    socket: &mut PubSocket,
+    topic: String,
+    event: EventEnvelope,
+) -> Result<()> {
+    let mut frames = VecDeque::new();
+    frames.push_back(Bytes::from(topic));
+    frames.push_back(Bytes::from(event.encode_to_vec()));
+    let message = ZmqMessage::try_from(frames).expect("non-empty message");
+    socket
+        .send(message)
+        .await
+        .context("failed to send PUB event")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -272,7 +333,7 @@ async fn run_router(
                 };
                 let Some(payload) = frames.pop_front() else {
                     if let Err(err) = send_back_error(
-                        send_half.clone(), identity, "", "BAD_REQUEST", "missing rpc frame",
+                        send_half.clone(), identity, "", RpcErrorCode::BadRequest, "missing rpc frame",
                         cancellation.clone(),
                     ).await {
                         log_response_send_error(&err);
@@ -282,7 +343,7 @@ async fn run_router(
                 if !frames.is_empty() {
                     let request_id = decoded_request_id(&payload);
                     if let Err(err) = send_back_error(
-                        send_half.clone(), identity, &request_id, "BAD_REQUEST",
+                        send_half.clone(), identity, &request_id, RpcErrorCode::BadRequest,
                         "unexpected extra rpc frames", cancellation.clone(),
                     ).await {
                         log_response_send_error(&err);
@@ -295,7 +356,7 @@ async fn run_router(
                         send_half.clone(),
                         identity,
                         &request_id,
-                        "PAYLOAD_TOO_LARGE",
+                        RpcErrorCode::PayloadTooLarge,
                         &format!(
                             "rpc payload {} bytes exceeds maximum {MAX_RPC_PAYLOAD_BYTES}",
                             payload.len()
@@ -311,7 +372,7 @@ async fn run_router(
                     Err(_) => {
                         let request_id = decoded_request_id(&payload);
                         if let Err(err) = send_back_error(
-                            send_half.clone(), identity, &request_id, "BUSY",
+                            send_half.clone(), identity, &request_id, RpcErrorCode::Busy,
                             "maximum concurrent RPC requests reached", cancellation.clone(),
                         ).await {
                             log_response_send_error(&err);
@@ -373,7 +434,7 @@ async fn process_request(
                 Ok(response) => response,
                 Err(_) => Engine::rpc_error_response(
                     &request_id,
-                    "TIMEOUT",
+                    RpcErrorCode::Timeout,
                     format!("rpc request timed out after {request_timeout:?}"),
                 ),
             };
@@ -381,7 +442,11 @@ async fn process_request(
             (response, exit)
         }
         Err(err) => (
-            Engine::rpc_error_response("", "BAD_REQUEST", format!("invalid rpc request: {err}")),
+            Engine::rpc_error_response(
+                "",
+                RpcErrorCode::BadRequest,
+                format!("invalid rpc request: {err}"),
+            ),
             None,
         ),
     };
@@ -438,7 +503,7 @@ async fn send_back_error(
     send_half: RouterSendHalf,
     identity: Bytes,
     request_id: &str,
-    code: &str,
+    code: RpcErrorCode,
     message: &str,
     cancellation: Cancellation,
 ) -> Result<()> {
@@ -483,7 +548,7 @@ mod tests {
 
     #[test]
     fn only_accepted_shutdown_and_restart_responses_request_exit() {
-        let mut response = Engine::rpc_error_response("id", "ERR", "failed");
+        let mut response = Engine::rpc_error_response("id", RpcErrorCode::Engine, "failed");
         assert_eq!(accepted_exit(RpcKind::Shutdown, &response), None);
 
         response.status = ResponseStatus::Accepted as i32;
@@ -530,6 +595,30 @@ mod tests {
         assert_eq!(
             cleanup_timeout(Duration::from_secs(60)),
             MAX_CLEANUP_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn terminal_lifecycle_distinguishes_exit_and_failure() {
+        assert_eq!(
+            terminal_lifecycle(Some(EngineExit::Shutdown), None),
+            (
+                LifecycleState::Stopping,
+                Some("engine shutdown requested".to_string())
+            )
+        );
+        assert_eq!(
+            terminal_lifecycle(Some(EngineExit::Restart), None),
+            (
+                LifecycleState::Stopping,
+                Some("engine restart requested".to_string())
+            )
+        );
+
+        let failure = anyhow!("router failed");
+        assert_eq!(
+            terminal_lifecycle(None, Some(&failure)),
+            (LifecycleState::Failed, Some("router failed".to_string()))
         );
     }
 }
