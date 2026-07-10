@@ -1,19 +1,13 @@
 use std::{
     collections::{HashMap, VecDeque},
-    io::{self, Stdout},
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
-use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use prost::Message as _;
 use ratatui::{
-    Frame, Terminal,
-    backend::CrosstermBackend,
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::Line,
@@ -27,6 +21,7 @@ use weather_schema::*;
 use crate::{
     cli::Cli,
     client::{EngineClient, EngineEvent},
+    terminal::TerminalGuard,
     util::{degrees, hectopascal, meter_per_second, mm, percent, text, wind_summary},
 };
 
@@ -71,32 +66,6 @@ pub(crate) async fn run_interactive(client: &EngineClient, _cli: &Cli) -> Result
         }
     }
     Ok(())
-}
-
-struct TerminalGuard {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
-}
-
-impl TerminalGuard {
-    fn new() -> Result<Self> {
-        enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
-        let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-        Ok(Self { terminal })
-    }
-
-    fn draw(&mut self, f: impl FnOnce(&mut Frame<'_>)) -> Result<()> {
-        self.terminal.draw(f)?;
-        Ok(())
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
-        let _ = self.terminal.show_cursor();
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

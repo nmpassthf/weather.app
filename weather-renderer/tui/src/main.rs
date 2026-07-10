@@ -6,6 +6,7 @@ mod daemon;
 mod pagination;
 mod render;
 mod search;
+mod terminal;
 mod tui;
 mod util;
 
