@@ -18,4 +18,5 @@ weather-updater = { path = "../updater" }
 zeromq.workspace = true
 
 [dev-dependencies]
+rusqlite.workspace = true
 tempfile.workspace = true

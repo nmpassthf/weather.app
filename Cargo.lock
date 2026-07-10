@@ -3055,6 +3055,7 @@ dependencies = [
  "chrono-tz",
  "fs2",
  "prost",
+ "rusqlite",
  "tempfile",
  "tokio",
  "toml",

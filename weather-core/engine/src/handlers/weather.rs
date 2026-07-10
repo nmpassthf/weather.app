@@ -87,13 +87,14 @@ impl Engine {
             }
         }
 
-        let flight_key = format!("{uuid}\0{include_debug}");
+        let flight_key = (uuid.clone(), include_debug);
         let singleflight = self.weather_singleflight.clone();
         let result = singleflight
             .run(flight_key, || async move {
                 self.fetch_weather_uncached(station, include_debug).await
             })
-            .await;
+            .await
+            .map(|snapshot| snapshot.as_ref().clone());
         if req.refresh {
             let outcome = match &result {
                 Ok(snapshot) if snapshot.stale => RefreshTerminal::Stale,

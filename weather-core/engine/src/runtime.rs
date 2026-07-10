@@ -12,11 +12,12 @@ use weather_db::{DatabasePaths, DbActor};
 use weather_updater::{WeatherProvider, create_weather_provider};
 
 use crate::{
+    catalog::CatalogCoordinator,
     lifecycle::EngineControl,
     lock::LockGuard,
     lock::resolve_relative,
     server::{EventSink, run_engine_sockets},
-    singleflight::WeatherSingleflight,
+    singleflight::Singleflight,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,7 +33,8 @@ pub(crate) struct Engine {
     pub(crate) config_commit: Arc<tokio::sync::Mutex<()>>,
     pub(crate) db: DbActor,
     pub(crate) provider: Arc<dyn WeatherProvider>,
-    pub(crate) weather_singleflight: WeatherSingleflight,
+    pub(crate) weather_singleflight: Singleflight<(String, bool), weather_schema::WeatherSnapshot>,
+    pub(crate) catalog: CatalogCoordinator,
     pub(crate) sink: EventSink,
     pub(crate) control: EngineControl,
 }
@@ -113,7 +115,8 @@ impl EngineRuntime {
                 config_commit: Arc::new(tokio::sync::Mutex::new(())),
                 db,
                 provider,
-                weather_singleflight: WeatherSingleflight::default(),
+                weather_singleflight: Singleflight::default(),
+                catalog: CatalogCoordinator::default(),
                 sink,
                 control: EngineControl::new(),
             },
@@ -124,6 +127,11 @@ impl EngineRuntime {
     pub async fn run_sockets(self, mode: String) -> Result<EngineExit> {
         let ipc = self.engine.config.get().ipc;
         run_engine_sockets(self.engine, ipc.rpc_endpoint, ipc.pub_endpoint, mode).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_engine(&self) -> Engine {
+        self.engine.clone()
     }
 }
 

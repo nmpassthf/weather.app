@@ -1,6 +1,7 @@
 pub(crate) const MAX_RPC_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_CONCURRENT_REQUESTS: usize = 64;
 pub(crate) const MAX_CONCURRENT_REFRESHES: usize = 4;
+pub(crate) const MAX_CONCURRENT_CATALOG_FETCHES: usize = 8;
 pub(crate) const MAX_PAGE_SIZE: u32 = 256;
 pub(crate) const MAX_PAGE_OFFSET: u32 = 100_000;
 pub(crate) const MAX_BATCH_QUERIES: usize = 64;

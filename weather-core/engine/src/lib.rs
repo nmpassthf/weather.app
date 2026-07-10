@@ -1,3 +1,4 @@
+mod catalog;
 mod handlers;
 mod lifecycle;
 mod limits;

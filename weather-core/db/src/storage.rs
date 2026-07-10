@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -15,6 +14,7 @@ use weather_schema::{
 use crate::{
     actor::{CatalogCache, ProviderCity, ProviderProvince, ProviderStation, StoredSnapshot},
     migration,
+    validation::{validate_provider_city_catalog, validate_provider_province_catalog},
 };
 
 pub(crate) const FETCH_LOG_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
@@ -177,12 +177,7 @@ impl DbInstance {
         provinces: &[ProviderProvince],
     ) -> Result<()> {
         validate_provider(provider)?;
-        ensure_unique_codes(
-            provinces
-                .iter()
-                .map(|province| province.provider_code.as_str()),
-            "province",
-        )?;
+        validate_provider_province_catalog(provinces)?;
         let now = now_ms();
         let row_count = i64::try_from(provinces.len()).context("province row count overflow")?;
         let tx = self
@@ -318,22 +313,7 @@ impl DbInstance {
         cities: &[ProviderCity],
     ) -> Result<()> {
         validate_provider(provider)?;
-        if provider_province_code.trim().is_empty() {
-            bail!("provider province code must not be empty");
-        }
-        ensure_unique_codes(
-            cities.iter().map(|city| city.provider_code.as_str()),
-            "city",
-        )?;
-        for city in cities {
-            if city.provider_province_code != provider_province_code {
-                bail!(
-                    "city `{}` belongs to provider province `{}`, expected `{provider_province_code}`",
-                    city.provider_code,
-                    city.provider_province_code
-                );
-            }
-        }
+        validate_provider_city_catalog(provider_province_code, cities)?;
         let now = now_ms();
         let row_count = i64::try_from(cities.len()).context("city row count overflow")?;
         let tx = self
@@ -863,19 +843,6 @@ fn validate_provider(provider: &str) -> Result<()> {
 
 fn parse_timezone(value: &str, label: &str) -> Result<Tz> {
     Tz::from_str(value).map_err(|_| anyhow::anyhow!("invalid {label} `{value}`"))
-}
-
-fn ensure_unique_codes<'a>(codes: impl Iterator<Item = &'a str>, kind: &str) -> Result<()> {
-    let mut seen = HashSet::new();
-    for code in codes {
-        if code.trim().is_empty() {
-            bail!("provider {kind} code must not be empty");
-        }
-        if !seen.insert(code) {
-            bail!("duplicate provider {kind} code `{code}`");
-        }
-    }
-    Ok(())
 }
 
 fn validate_catalog_count(
