@@ -1711,6 +1711,7 @@ mod tests {
             engine_version: "0.1.0".to_string(),
             schema_version: "v1".to_string(),
             build_version: "dev".to_string(),
+            instance_id: "test-instance".to_string(),
         }
     }
 

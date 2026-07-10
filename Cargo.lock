@@ -3068,6 +3068,7 @@ dependencies = [
  "prost",
  "rusqlite",
  "same-file",
+ "serde_json",
  "tempfile",
  "tokio",
  "toml",

@@ -1,6 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -9,6 +10,7 @@ use weather_configure::{
     normalize_config_stations, validate, write_config_atomic,
 };
 use weather_db::{DatabasePaths, DbActor};
+use weather_schema::{ENGINE_LOCK_METADATA_VERSION, EngineLockMetadata, correlation_id};
 use weather_updater::{WeatherProvider, create_weather_provider};
 
 use crate::{
@@ -29,6 +31,7 @@ pub enum EngineExit {
 #[derive(Clone)]
 pub(crate) struct Engine {
     pub(crate) config_path: PathBuf,
+    pub(crate) launch: EngineLockMetadata,
     pub(crate) config: ConfigState,
     pub(crate) config_commit: Arc<tokio::sync::Mutex<()>>,
     pub(crate) db: DbActor,
@@ -45,27 +48,56 @@ pub struct EngineRuntime {
 }
 
 pub async fn run_engine(config_path: PathBuf, mode: String) -> Result<EngineExit> {
-    let runtime = EngineRuntime::start(config_path).await?;
+    run_engine_with_owner(config_path, mode, None).await
+}
+
+pub async fn run_engine_with_owner(
+    config_path: PathBuf,
+    mode: String,
+    owner_token: Option<String>,
+) -> Result<EngineExit> {
+    let runtime = EngineRuntime::start_with_owner(config_path, owner_token).await?;
     runtime.run_sockets(mode).await
 }
 
 impl EngineRuntime {
     pub async fn start(config_path: PathBuf) -> Result<Self> {
-        Self::start_with_provider_factory(config_path, create_weather_provider).await
+        Self::start_with_provider_factory(config_path, None, create_weather_provider).await
+    }
+
+    async fn start_with_owner(config_path: PathBuf, owner_token: Option<String>) -> Result<Self> {
+        Self::start_with_provider_factory(config_path, owner_token, create_weather_provider).await
     }
 
     pub async fn start_with_provider(
         config_path: PathBuf,
         provider: Arc<dyn WeatherProvider>,
     ) -> Result<Self> {
-        Self::start_with_provider_factory(config_path, move |config| {
+        Self::start_with_provider_factory(config_path, None, move |config| {
             validate_injected_provider(config, provider.as_ref())?;
             Ok(provider)
         })
         .await
     }
 
-    async fn start_with_provider_factory<F>(config_path: PathBuf, factory: F) -> Result<Self>
+    #[cfg(test)]
+    async fn start_with_provider_and_owner(
+        config_path: PathBuf,
+        provider: Arc<dyn WeatherProvider>,
+        owner_token: String,
+    ) -> Result<Self> {
+        Self::start_with_provider_factory(config_path, Some(owner_token), move |config| {
+            validate_injected_provider(config, provider.as_ref())?;
+            Ok(provider)
+        })
+        .await
+    }
+
+    async fn start_with_provider_factory<F>(
+        config_path: PathBuf,
+        owner_token: Option<String>,
+        factory: F,
+    ) -> Result<Self>
     where
         F: FnOnce(&weather_configure::UpdaterConfig) -> Result<Arc<dyn WeatherProvider>>,
     {
@@ -80,7 +112,8 @@ impl EngineRuntime {
             .unwrap_or_else(|| PathBuf::from("."));
         let engine_lock_path = resolve_relative(&base_dir, &config.engine.lock_path)?;
         components.record(ComponentKind::Lock, &engine_lock_path)?;
-        let _engine_lock = LockGuard::engine(engine_lock_path)?;
+        let launch = launch_metadata(&config_path, owner_token)?;
+        let _engine_lock = LockGuard::engine(engine_lock_path, &launch)?;
         if normalize_config_stations(&mut config) {
             validate(&config)?;
             write_config_atomic(&config_path, &config)?;
@@ -111,6 +144,7 @@ impl EngineRuntime {
         Ok(Self {
             engine: Engine {
                 config_path,
+                launch,
                 config: config_state,
                 config_commit: Arc::new(tokio::sync::Mutex::new(())),
                 db,
@@ -133,6 +167,26 @@ impl EngineRuntime {
     pub(crate) fn test_engine(&self) -> Engine {
         self.engine.clone()
     }
+}
+
+fn launch_metadata(config_path: &Path, owner_token: Option<String>) -> Result<EngineLockMetadata> {
+    if owner_token.as_deref().is_some_and(str::is_empty) {
+        bail!("engine owner token must not be empty");
+    }
+    let started_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_millis()
+        .try_into()
+        .context("engine start timestamp does not fit in u64 milliseconds")?;
+    Ok(EngineLockMetadata {
+        version: ENGINE_LOCK_METADATA_VERSION,
+        pid: std::process::id(),
+        instance_id: correlation_id("engine-instance"),
+        owner_token,
+        started_at_unix_ms,
+        config_path: config_path.display().to_string(),
+    })
 }
 
 fn validate_injected_provider(
@@ -189,9 +243,9 @@ mod tests {
     use anyhow::bail;
     use weather_configure::{AppConfig, StationConfig, load_from_path, write_config_atomic};
     use weather_schema::{
-        DebugPayload, ListCitiesRequest, ListCitiesResponse, ListProvincesRequest,
+        DebugPayload, Empty, ListCitiesRequest, ListCitiesResponse, ListProvincesRequest,
         ListProvincesResponse, ResponseStatus, RpcKind, RpcRequest, SCHEMA_VERSION,
-        WeatherSnapshot, decode_message, encode_message,
+        ShutdownRequest, WeatherSnapshot, decode_message, encode_message,
     };
     use weather_updater::{
         ProviderCity, ProviderFuture, ProviderProvince, WeatherFetch, WeatherProvider,
@@ -358,6 +412,96 @@ mod tests {
                 .is_some()
         );
         assert_eq!(scripted.calls.load(Ordering::Relaxed), 3);
+        runtime.engine.db.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn restart_launches_keep_owner_but_receive_fresh_instance_ids() {
+        let path = Path::new("/tmp/weather.toml");
+        let first = launch_metadata(path, Some("owner-token".to_string())).unwrap();
+        let second = launch_metadata(path, Some("owner-token".to_string())).unwrap();
+
+        assert_eq!(first.owner_token, second.owner_token);
+        assert_ne!(first.instance_id, second.instance_id);
+        assert!(launch_metadata(path, Some(String::new())).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conditional_shutdown_is_accepted_only_for_the_current_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("weather.toml");
+        let mut config = AppConfig::default();
+        config.db.path = directory.path().join("weather.db").display().to_string();
+        config.updater.default_provider = "scripted".to_string();
+        config.updater.provider[0].name = "scripted".to_string();
+        write_config_atomic(&config_path, &config).unwrap();
+        let provider: Arc<dyn WeatherProvider> = Arc::new(ScriptedProvider::new("scripted"));
+        let runtime = EngineRuntime::start_with_provider_and_owner(
+            config_path,
+            provider,
+            "winner-token".to_string(),
+        )
+        .await
+        .unwrap();
+        let engine = runtime.engine.clone();
+
+        let mismatch = engine
+            .handle_rpc_request(
+                RpcRequest {
+                    schema_version: SCHEMA_VERSION.to_string(),
+                    request_id: "mismatch".to_string(),
+                    kind: RpcKind::Shutdown as i32,
+                    payload: encode_message(&ShutdownRequest {
+                        owner_token: Some("loser-token".to_string()),
+                    }),
+                    ..Default::default()
+                },
+                "test",
+                "rpc",
+                "pub",
+            )
+            .await;
+        assert_eq!(mismatch.status, ResponseStatus::Error as i32);
+        assert_eq!(mismatch.error.unwrap().code, "OWNER_MISMATCH");
+
+        let matching = engine
+            .handle_rpc_request(
+                RpcRequest {
+                    schema_version: SCHEMA_VERSION.to_string(),
+                    request_id: "matching".to_string(),
+                    kind: RpcKind::Shutdown as i32,
+                    payload: encode_message(&ShutdownRequest {
+                        owner_token: Some("winner-token".to_string()),
+                    }),
+                    ..Default::default()
+                },
+                "test",
+                "rpc",
+                "pub",
+            )
+            .await;
+        assert_eq!(matching.status, ResponseStatus::Accepted as i32);
+
+        let legacy = engine
+            .handle_rpc_request(
+                RpcRequest {
+                    schema_version: SCHEMA_VERSION.to_string(),
+                    request_id: "legacy".to_string(),
+                    kind: RpcKind::Shutdown as i32,
+                    payload: encode_message(&Empty {}),
+                    ..Default::default()
+                },
+                "test",
+                "rpc",
+                "pub",
+            )
+            .await;
+        assert_eq!(legacy.status, ResponseStatus::Accepted as i32);
+        assert_eq!(
+            engine.status("test", "rpc", "pub").instance_id,
+            engine.launch.instance_id
+        );
+
         runtime.engine.db.shutdown().await.unwrap();
     }
 

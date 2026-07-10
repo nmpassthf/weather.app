@@ -1,7 +1,8 @@
 use std::{
     fs::{File, OpenOptions},
+    io::Read,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -53,6 +54,8 @@ struct ProbeStatus {
     lock_path: String,
     lock_held: bool,
     lock_age_ms: Option<u64>,
+    startup_timeout_ms: u64,
+    lock_metadata: Option<EngineLockMetadata>,
     rpc_endpoint_reachable: bool,
     pub_endpoint_reachable: bool,
     engine_status: Option<EngineStatusView>,
@@ -71,6 +74,7 @@ struct EngineStatusView {
     engine_version: String,
     schema_version: String,
     build_version: String,
+    instance_id: String,
 }
 
 impl From<EngineStatus> for EngineStatusView {
@@ -86,6 +90,7 @@ impl From<EngineStatus> for EngineStatusView {
             engine_version: value.engine_version,
             schema_version: value.schema_version,
             build_version: value.build_version,
+            instance_id: value.instance_id,
         }
     }
 }
@@ -102,6 +107,7 @@ struct LockSnapshot {
     state: LockState,
     identity: Option<same_file::Handle>,
     modified: Option<SystemTime>,
+    metadata: Option<EngineLockMetadata>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,9 +167,14 @@ async fn probe_status(config: Option<PathBuf>) -> Result<ProbeStatus> {
         }
 
         let lock_age = lock_age(&lock_after, SystemTime::now());
+        let held_metadata = (lock_after.state == LockState::Held)
+            .then_some(lock_after.metadata.as_ref())
+            .flatten();
         let status_disposition = engine_status
             .as_ref()
-            .map(|status| status_disposition(&config_path, &config, status, strict_config))
+            .map(|status| {
+                status_disposition(&config_path, &config, status, strict_config, held_metadata)
+            })
             .transpose()?;
         let state = classify_probe(
             lock_after.state,
@@ -195,6 +206,8 @@ async fn probe_status(config: Option<PathBuf>) -> Result<ProbeStatus> {
             lock_path: lock_path.display().to_string(),
             lock_held: lock_after.state == LockState::Held,
             lock_age_ms: lock_age.map(duration_ms),
+            startup_timeout_ms: duration_ms(startup_timeout),
+            lock_metadata: held_metadata.cloned(),
             rpc_endpoint_reachable,
             pub_endpoint_reachable,
             engine_status: engine_status.map(Into::into),
@@ -270,9 +283,17 @@ fn duration_ms(duration: Duration) -> u64 {
 }
 
 fn lock_age(snapshot: &LockSnapshot, now: SystemTime) -> Option<Duration> {
-    (snapshot.state == LockState::Held)
-        .then_some(snapshot.modified?)
-        .map(|modified| now.duration_since(modified).unwrap_or_default())
+    if snapshot.state != LockState::Held {
+        return None;
+    }
+    let started_at = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| {
+            UNIX_EPOCH.checked_add(Duration::from_millis(metadata.started_at_unix_ms))
+        })
+        .or(snapshot.modified)?;
+    Some(now.duration_since(started_at).unwrap_or_default())
 }
 
 async fn rpc_endpoint_status(
@@ -332,13 +353,20 @@ fn status_disposition(
     config: &weather_configure::AppConfig,
     status: &EngineStatus,
     strict_config: bool,
+    lock_metadata: Option<&EngineLockMetadata>,
 ) -> Result<StatusDisposition> {
     let requested = normalize_path(requested_config)?;
     let active = normalize_path(Path::new(&status.config_path))?;
     let matches = requested == active
         && status.rpc_endpoint == config.ipc.rpc_endpoint
         && status.pub_endpoint == config.ipc.pub_endpoint;
-    if !strict_config && status.ready {
+    if let Some(metadata) = lock_metadata {
+        let metadata_config = normalize_path(Path::new(&metadata.config_path))?;
+        if metadata_config != active || metadata.instance_id != status.instance_id {
+            return Ok(StatusDisposition::Foreign);
+        }
+    }
+    if !matches && !strict_config && status.ready {
         return Ok(StatusDisposition::AdoptedReady);
     }
     if !matches {
@@ -368,13 +396,14 @@ fn observe_lock(path: &Path) -> Result<LockSnapshot> {
 }
 
 fn observe_lock_once(path: &Path) -> Result<Option<LockSnapshot>> {
-    let file = match OpenOptions::new().read(true).open(path) {
+    let mut file = match OpenOptions::new().read(true).open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Ok(Some(LockSnapshot {
                 state: LockState::Missing,
                 identity: None,
                 modified: None,
+                metadata: None,
             }));
         }
         Err(err) => {
@@ -393,6 +422,7 @@ fn observe_lock_once(path: &Path) -> Result<Option<LockSnapshot>> {
     let modified = metadata
         .modified()
         .with_context(|| format!("failed to read lock age from {}", path.display()))?;
+    let lock_metadata = read_lock_metadata(&mut file, path)?;
     let state = match FileExt::try_lock_shared(&file) {
         Ok(()) => {
             let matches = file_matches_path(&file, path)?;
@@ -416,7 +446,17 @@ fn observe_lock_once(path: &Path) -> Result<Option<LockSnapshot>> {
         state,
         identity: Some(identity),
         modified: Some(modified),
+        metadata: lock_metadata,
     }))
+}
+
+fn read_lock_metadata(file: &mut File, path: &Path) -> Result<Option<EngineLockMetadata>> {
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)
+        .with_context(|| format!("failed to read lock metadata from {}", path.display()))?;
+    Ok(serde_json::from_slice::<EngineLockMetadata>(&contents)
+        .ok()
+        .filter(EngineLockMetadata::is_supported))
 }
 
 fn file_matches_path(file: &File, path: &Path) -> Result<bool> {
@@ -528,12 +568,81 @@ mod tests {
         };
 
         assert_eq!(
-            status_disposition(&requested, &config, &status, false).unwrap(),
+            status_disposition(&requested, &config, &status, false, None).unwrap(),
             StatusDisposition::AdoptedReady
         );
         assert_eq!(
-            status_disposition(&requested, &config, &status, true).unwrap(),
+            status_disposition(&requested, &config, &status, true, None).unwrap(),
             StatusDisposition::Foreign
+        );
+    }
+
+    #[test]
+    fn default_probe_keeps_a_matching_ready_engine_classified_as_matching() {
+        let directory = tempfile::tempdir().unwrap();
+        let requested = directory.path().join("default.toml");
+        std::fs::write(&requested, weather_configure::default_config_toml()).unwrap();
+        let config = weather_configure::AppConfig::default();
+        let status = EngineStatus {
+            ready: true,
+            rpc_endpoint: config.ipc.rpc_endpoint.clone(),
+            pub_endpoint: config.ipc.pub_endpoint.clone(),
+            config_path: requested.display().to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            status_disposition(&requested, &config, &status, false, None).unwrap(),
+            StatusDisposition::MatchingReady
+        );
+    }
+
+    fn lock_metadata(config_path: &Path, instance_id: &str) -> EngineLockMetadata {
+        EngineLockMetadata {
+            version: ENGINE_LOCK_METADATA_VERSION,
+            pid: 42,
+            instance_id: instance_id.to_string(),
+            owner_token: Some("owner-token".to_string()),
+            started_at_unix_ms: 1_000,
+            config_path: config_path.display().to_string(),
+        }
+    }
+
+    #[test]
+    fn status_instance_must_match_the_held_lock_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let requested = directory.path().join("weather.toml");
+        std::fs::write(&requested, weather_configure::default_config_toml()).unwrap();
+        let config = weather_configure::AppConfig::default();
+        let status = EngineStatus {
+            ready: true,
+            rpc_endpoint: config.ipc.rpc_endpoint.clone(),
+            pub_endpoint: config.ipc.pub_endpoint.clone(),
+            config_path: requested.display().to_string(),
+            instance_id: "rpc-instance".to_string(),
+            ..Default::default()
+        };
+        let metadata = lock_metadata(&requested, "lock-instance");
+
+        assert_eq!(
+            status_disposition(&requested, &config, &status, true, Some(&metadata)).unwrap(),
+            StatusDisposition::Foreign
+        );
+    }
+
+    #[test]
+    fn lock_age_prefers_versioned_start_time_over_file_mtime() {
+        let config_path = Path::new("/tmp/weather.toml");
+        let snapshot = LockSnapshot {
+            state: LockState::Held,
+            identity: None,
+            modified: Some(UNIX_EPOCH + Duration::from_secs(10)),
+            metadata: Some(lock_metadata(config_path, "instance")),
+        };
+
+        assert_eq!(
+            lock_age(&snapshot, UNIX_EPOCH + Duration::from_secs(3)),
+            Some(Duration::from_secs(2))
         );
     }
 
@@ -580,6 +689,26 @@ mod tests {
         let snapshot = observe_lock(&path).unwrap();
 
         assert_eq!(snapshot.state, LockState::Held);
+        FileExt::unlock(&owner).unwrap();
+    }
+
+    #[test]
+    fn observing_a_held_lock_exposes_supported_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("engine.lock");
+        let expected = lock_metadata(&path, "instance");
+        std::fs::write(&path, serde_json::to_vec(&expected).unwrap()).unwrap();
+        let owner = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        FileExt::lock_exclusive(&owner).unwrap();
+
+        let snapshot = observe_lock(&path).unwrap();
+
+        assert_eq!(snapshot.state, LockState::Held);
+        assert_eq!(snapshot.metadata, Some(expected));
         FileExt::unlock(&owner).unwrap();
     }
 

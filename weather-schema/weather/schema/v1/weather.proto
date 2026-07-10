@@ -70,6 +70,10 @@ enum ResponseStatus {
 }
 
 message Empty {}
+message ShutdownRequest {
+  optional string owner_token = 1;
+  reserved 20 to 39;
+}
 message EngineError { string code = 1; string message = 2; }
 message EngineStatus {
   bool ready = 1;
@@ -84,6 +88,7 @@ message EngineStatus {
   string engine_version = 16;
   string schema_version = 17;
   string build_version = 18;
+  string instance_id = 19;
 }
 
 message GetWeatherRequest {

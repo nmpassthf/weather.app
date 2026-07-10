@@ -18,7 +18,7 @@ use crate::{
     client::EngineClient,
     command::run_command,
     connection::{ConnectionPlan, Endpoints, connection_plan},
-    daemon::{DaemonProbeState, DaemonSupervisor},
+    daemon::{DaemonProbeState, DaemonSupervisor, EngineOwnership, probe_state_error},
     tui::run_interactive,
 };
 
@@ -42,13 +42,12 @@ async fn run_direct(cli: &Cli, endpoints: Endpoints, hmac_key: Option<[u8; 32]>)
         println!("engine shutdown accepted");
         return Ok(());
     }
-    run_connected(&client, cli).await
+    run_session(&client, cli, EngineOwnership::Direct).await
 }
 
 async fn run_managed(cli: &Cli, hmac_key: Option<[u8; 32]>) -> Result<()> {
-    let mut foreground = None;
     let daemon = DaemonSupervisor::from_cli(cli)?;
-    let probe = daemon.probe()?;
+    let probe = daemon.probe().await?;
     if matches!(cli.command.as_ref(), Some(CommandKind::Kill)) {
         match probe.state {
             DaemonProbeState::NotRunning => {
@@ -68,20 +67,27 @@ async fn run_managed(cli: &Cli, hmac_key: Option<[u8; 32]>) -> Result<()> {
         println!("engine shutdown accepted");
         return Ok(());
     }
-    match probe.state {
-        DaemonProbeState::NotRunning => foreground = Some(daemon.start_foreground()?),
-        DaemonProbeState::Running => {}
-        state => bail!(probe_state_error(state, probe.message.as_deref())),
-    }
-    let client = EngineClient::connect(probe.rpc_endpoint, probe.pub_endpoint, hmac_key)
-        .await
-        .context("failed to connect engine")?;
+    let ready = daemon.ensure_ready(probe).await?;
+    let client =
+        EngineClient::connect(ready.probe.rpc_endpoint, ready.probe.pub_endpoint, hmac_key)
+            .await
+            .context("failed to connect engine")?;
 
-    let result = run_connected(&client, cli).await;
-    if foreground.is_some() {
-        let _ = client.shutdown().await;
+    run_session(&client, cli, ready.ownership).await
+}
+
+async fn run_session(client: &EngineClient, cli: &Cli, ownership: EngineOwnership) -> Result<()> {
+    let result = run_connected(client, cli).await;
+    if let EngineOwnership::Owned {
+        owner_token,
+        mut foreground,
+    } = ownership
+    {
+        if client.shutdown_if_owned(&owner_token).await.is_ok() {
+            foreground.mark_graceful_shutdown_requested();
+        }
+        drop(foreground);
     }
-    drop(foreground);
     result
 }
 
@@ -90,20 +96,6 @@ async fn run_connected(client: &EngineClient, cli: &Cli) -> Result<()> {
         run_interactive(client, cli).await
     } else {
         run_command(client, cli).await
-    }
-}
-
-fn probe_state_error(state: DaemonProbeState, message: Option<&str>) -> String {
-    let state = match state {
-        DaemonProbeState::NotRunning => "not_running",
-        DaemonProbeState::Starting => "starting",
-        DaemonProbeState::Running => "running",
-        DaemonProbeState::Unhealthy => "unhealthy",
-        DaemonProbeState::EndpointConflict => "endpoint_conflict",
-    };
-    match message {
-        Some(message) => format!("engine probe reported {state}: {message}"),
-        None => format!("engine probe reported {state}"),
     }
 }
 

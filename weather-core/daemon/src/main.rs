@@ -19,7 +19,11 @@ use crate::{
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Run { config, foreground } => run(config, foreground).await,
+        Command::Run {
+            config,
+            foreground,
+            owner_token,
+        } => run(config, foreground, owner_token).await,
         Command::Probe { config, verbose } => probe(config, verbose).await,
         Command::Service { command } => match command {
             ServiceCommand::Install {

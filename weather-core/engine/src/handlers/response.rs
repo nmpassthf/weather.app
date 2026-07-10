@@ -21,6 +21,7 @@ impl Engine {
             engine_version: env!("CARGO_PKG_VERSION").to_string(),
             schema_version: SCHEMA_VERSION.to_string(),
             build_version: env!("BUILD_VERSION").to_string(),
+            instance_id: self.launch.instance_id.clone(),
         }
     }
 

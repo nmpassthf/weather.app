@@ -140,6 +140,16 @@ impl EngineClient {
         self.request(RpcKind::Shutdown, Empty {}).await
     }
 
+    pub(crate) async fn shutdown_if_owned(&self, owner_token: &str) -> Result<Empty> {
+        self.request(
+            RpcKind::Shutdown,
+            ShutdownRequest {
+                owner_token: Some(owner_token.to_string()),
+            },
+        )
+        .await
+    }
+
     pub(crate) async fn configured_stations(
         &self,
         offset: u32,

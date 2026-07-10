@@ -1,3 +1,4 @@
+use prost::Message;
 use weather_schema::*;
 
 use crate::runtime::Engine;
@@ -53,14 +54,62 @@ impl Engine {
             RpcKind::GetWeather => self.handle_get_weather(&request).await,
             RpcKind::FuzzyMatchStations => self.handle_fuzzy(&request).await,
             RpcKind::TriggerRefresh => self.handle_trigger_refresh(&request).await,
-            RpcKind::RestartEngine | RpcKind::Shutdown => {
-                self.accepted(&request.request_id, Empty {})
-            }
+            RpcKind::RestartEngine => self.accepted(&request.request_id, Empty {}),
+            RpcKind::Shutdown => self.handle_shutdown(&request),
             RpcKind::Unspecified => Self::rpc_error_response(
                 &request.request_id,
                 "BAD_REQUEST",
                 "rpc kind is unspecified",
             ),
         }
+    }
+
+    fn handle_shutdown(&self, request: &RpcRequest) -> RpcResponse {
+        let shutdown = match ShutdownRequest::decode(request.payload.as_slice()) {
+            Ok(shutdown) => shutdown,
+            Err(error) => {
+                return Self::rpc_error_response(
+                    &request.request_id,
+                    "BAD_REQUEST",
+                    format!("invalid shutdown payload: {error}"),
+                );
+            }
+        };
+        if !shutdown_owner_authorized(
+            self.launch.owner_token.as_deref(),
+            shutdown.owner_token.as_deref(),
+        ) {
+            return Self::rpc_error_response(
+                &request.request_id,
+                "OWNER_MISMATCH",
+                "engine ownership changed before conditional shutdown",
+            );
+        }
+        self.accepted(&request.request_id, Empty {})
+    }
+}
+
+fn shutdown_owner_authorized(actual: Option<&str>, requested: Option<&str>) -> bool {
+    requested.is_none_or(|requested| actual == Some(requested))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_legacy_shutdown_payload_is_unconditional() {
+        let request = ShutdownRequest::decode(Empty {}.encode_to_vec().as_slice()).unwrap();
+
+        assert_eq!(request.owner_token, None);
+        assert!(shutdown_owner_authorized(Some("owner"), None));
+        assert!(shutdown_owner_authorized(None, None));
+    }
+
+    #[test]
+    fn conditional_shutdown_requires_the_current_owner() {
+        assert!(shutdown_owner_authorized(Some("owner"), Some("owner")));
+        assert!(!shutdown_owner_authorized(Some("winner"), Some("loser")));
+        assert!(!shutdown_owner_authorized(None, Some("owner")));
     }
 }

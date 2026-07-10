@@ -2,11 +2,12 @@ use std::{
     fs::{File, OpenOptions},
     io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
+use weather_schema::EngineLockMetadata;
 
 const ENGINE_LOCK_RETRIES: usize = 8;
 const ENGINE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -23,14 +24,18 @@ impl Drop for LockGuard {
 
 impl LockGuard {
     pub fn exclusive(path: PathBuf) -> Result<Self> {
-        Self::acquire(path, 0, false)
+        Self::acquire(path, 0, None)
     }
 
-    pub(crate) fn engine(path: PathBuf) -> Result<Self> {
-        Self::acquire(path, ENGINE_LOCK_RETRIES, true)
+    pub(crate) fn engine(path: PathBuf, metadata: &EngineLockMetadata) -> Result<Self> {
+        Self::acquire(path, ENGINE_LOCK_RETRIES, Some(metadata))
     }
 
-    fn acquire(path: PathBuf, retries: usize, stamp_start: bool) -> Result<Self> {
+    fn acquire(
+        path: PathBuf,
+        retries: usize,
+        metadata: Option<&EngineLockMetadata>,
+    ) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -67,8 +72,8 @@ impl LockGuard {
             }
 
             let mut guard = Self { _file: file };
-            if stamp_start {
-                guard.write_start_marker(&path)?;
+            if let Some(metadata) = metadata {
+                guard.write_metadata(&path, metadata)?;
                 if !file_matches_path(&guard._file, &path)? {
                     drop(guard);
                     if attempt < retries {
@@ -86,19 +91,17 @@ impl LockGuard {
         unreachable!("lock acquisition loop always returns")
     }
 
-    fn write_start_marker(&mut self, path: &Path) -> Result<()> {
-        let started_at_unix_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("system clock is before the Unix epoch")?
-            .as_millis();
+    fn write_metadata(&mut self, path: &Path, metadata: &EngineLockMetadata) -> Result<()> {
         self._file
             .seek(SeekFrom::Start(0))
             .with_context(|| format!("failed to seek lock file {}", path.display()))?;
         self._file
             .set_len(0)
             .with_context(|| format!("failed to truncate lock file {}", path.display()))?;
-        writeln!(self._file, "started_at_unix_ms={started_at_unix_ms}")
+        serde_json::to_writer(&mut self._file, metadata)
             .with_context(|| format!("failed to initialize lock file {}", path.display()))?;
+        writeln!(self._file)
+            .with_context(|| format!("failed to finalize lock file {}", path.display()))?;
         self._file
             .sync_data()
             .with_context(|| format!("failed to sync lock file {}", path.display()))?;
@@ -136,19 +139,30 @@ pub(crate) fn resolve_relative(base_dir: &Path, value: &str) -> Result<PathBuf> 
 mod tests {
     use super::*;
 
+    fn metadata(instance_id: &str) -> EngineLockMetadata {
+        EngineLockMetadata {
+            version: weather_schema::ENGINE_LOCK_METADATA_VERSION,
+            pid: 42,
+            instance_id: instance_id.to_string(),
+            owner_token: Some("owner-token".to_string()),
+            started_at_unix_ms: 1_788_000_000_000,
+            config_path: "/tmp/weather.toml".to_string(),
+        }
+    }
+
     #[test]
     fn engine_lock_keeps_one_path_identity_across_restarts() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("engine.lock");
 
-        let first = LockGuard::engine(path.clone()).unwrap();
+        let first = LockGuard::engine(path.clone(), &metadata("first")).unwrap();
         let first_identity =
             same_file::Handle::from_file(first._file.try_clone().unwrap()).unwrap();
         assert!(file_matches_path(&first._file, &path).unwrap());
         drop(first);
         assert!(path.exists());
 
-        let second = LockGuard::engine(path.clone()).unwrap();
+        let second = LockGuard::engine(path.clone(), &metadata("second")).unwrap();
         let second_identity =
             same_file::Handle::from_file(second._file.try_clone().unwrap()).unwrap();
         assert_eq!(first_identity, second_identity);
@@ -174,8 +188,22 @@ mod tests {
             FileExt::unlock(&probe).unwrap();
         });
 
-        let guard = LockGuard::engine(path).unwrap();
+        let guard = LockGuard::engine(path, &metadata("retry")).unwrap();
         release.join().unwrap();
         drop(guard);
+    }
+
+    #[test]
+    fn engine_lock_writes_versioned_metadata_on_the_held_inode() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("engine.lock");
+        let expected = metadata("instance");
+
+        let guard = LockGuard::engine(path.clone(), &expected).unwrap();
+        let actual: EngineLockMetadata =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+
+        assert_eq!(actual, expected);
+        assert!(file_matches_path(&guard._file, &path).unwrap());
     }
 }

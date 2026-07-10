@@ -16,6 +16,8 @@ pub(crate) enum Command {
         config: Option<PathBuf>,
         #[arg(long)]
         foreground: bool,
+        #[arg(long, requires = "foreground", hide = true)]
+        owner_token: Option<String>,
     },
     Probe {
         #[arg(long, short = 'c')]
@@ -96,6 +98,36 @@ pub(crate) enum ServiceBackend {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn parses_foreground_owner_token() {
+        let cli = Cli::parse_from([
+            "weather-daemon",
+            "run",
+            "--foreground",
+            "--owner-token",
+            "owner-token",
+        ]);
+
+        let Command::Run {
+            foreground,
+            owner_token,
+            ..
+        } = cli.command
+        else {
+            panic!("expected run command");
+        };
+        assert!(foreground);
+        assert_eq!(owner_token.as_deref(), Some("owner-token"));
+    }
+
+    #[test]
+    fn owner_token_requires_foreground_mode() {
+        assert!(
+            Cli::try_parse_from(["weather-daemon", "run", "--owner-token", "owner-token",])
+                .is_err()
+        );
+    }
 
     #[test]
     fn parses_service_reinstall_systemd_with_install_options() {
