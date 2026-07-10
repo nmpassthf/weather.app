@@ -64,12 +64,9 @@ impl ComponentManifest {
     }
 
     pub fn record(&self, kind: ComponentKind, path: impl AsRef<Path>) -> Result<()> {
+        let entry = component_entry(kind, path.as_ref())?;
         let parent = parent_directory(&self.path);
         fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-        let entry = ComponentEntry {
-            kind,
-            path: PathBuf::from(path.as_ref().display().to_string()),
-        };
         self.with_exclusive_lock(|| {
             let mut entries =
                 if self.path.try_exists().with_context(|| {
@@ -109,14 +106,14 @@ impl ComponentManifest {
                 COMPONENT_MANIFEST_VERSION
             );
         }
-        Ok(document
+        document
             .components
             .into_iter()
-            .map(|entry| ComponentEntry {
-                kind: entry.kind,
-                path: PathBuf::from(entry.path),
+            .map(|entry| {
+                let path = PathBuf::from(entry.path);
+                component_entry(entry.kind, &path)
             })
-            .collect())
+            .collect()
     }
 
     fn write_entries_unlocked(&self, entries: &BTreeSet<ComponentEntry>) -> Result<()> {
@@ -124,11 +121,13 @@ impl ComponentManifest {
             version: COMPONENT_MANIFEST_VERSION,
             components: entries
                 .iter()
-                .map(|entry| StoredComponentEntry {
-                    kind: entry.kind,
-                    path: entry.path.display().to_string(),
+                .map(|entry| {
+                    Ok(StoredComponentEntry {
+                        kind: entry.kind,
+                        path: component_path_string(&entry.path)?,
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>>>()?,
         };
         let content =
             toml::to_string_pretty(&document).context("serialize component manifest as TOML")?;
@@ -180,6 +179,23 @@ impl ComponentManifest {
             .with_context(|| format!("lock component manifest {}", self.path.display()))?;
         finish_locked(operation(), FileExt::unlock(&lock))
     }
+}
+
+fn component_entry(kind: ComponentKind, path: &Path) -> Result<ComponentEntry> {
+    if !path.is_absolute() {
+        bail!("component path must be absolute: {}", path.display());
+    }
+    component_path_string(path)?;
+    Ok(ComponentEntry {
+        kind,
+        path: path.to_path_buf(),
+    })
+}
+
+fn component_path_string(path: &Path) -> Result<String> {
+    path.to_str()
+        .map(str::to_string)
+        .context("component path must be valid UTF-8")
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -246,35 +262,36 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join(COMPONENT_MANIFEST_FILE_NAME);
         let manifest = ComponentManifest::open(&path);
+        let bin_z = directory.path().join("bin/z");
+        let config = directory.path().join("config/weather.toml");
+        let bin_a = directory.path().join("bin/a");
 
-        manifest.record(ComponentKind::Bin, "/tmp/bin/z").unwrap();
-        manifest
-            .record(ComponentKind::Config, "/tmp/config/weather.toml")
-            .unwrap();
-        manifest.record(ComponentKind::Bin, "/tmp/bin/a").unwrap();
-        manifest.record(ComponentKind::Bin, "/tmp/bin/a").unwrap();
+        manifest.record(ComponentKind::Bin, &bin_z).unwrap();
+        manifest.record(ComponentKind::Config, &config).unwrap();
+        manifest.record(ComponentKind::Bin, &bin_a).unwrap();
+        manifest.record(ComponentKind::Bin, &bin_a).unwrap();
 
         assert_eq!(
             manifest.list().unwrap(),
             vec![
                 ComponentEntry {
                     kind: ComponentKind::Bin,
-                    path: PathBuf::from("/tmp/bin/a"),
+                    path: bin_a,
                 },
                 ComponentEntry {
                     kind: ComponentKind::Bin,
-                    path: PathBuf::from("/tmp/bin/z"),
+                    path: bin_z,
                 },
                 ComponentEntry {
                     kind: ComponentKind::Config,
-                    path: PathBuf::from("/tmp/config/weather.toml"),
+                    path: config,
                 },
             ]
         );
         assert!(manifest.lock_path().is_file());
         let persisted = fs::read_to_string(path).unwrap();
         assert!(persisted.starts_with("version = 1\n"));
-        assert_eq!(persisted.matches("path = \"/tmp/bin/a\"").count(), 1);
+        assert_eq!(persisted.matches("path = ").count(), 3);
     }
 
     #[test]
@@ -289,10 +306,9 @@ mod tests {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     let manifest = ComponentManifest::open(path.as_ref());
+                    let component = path.parent().unwrap().join(format!("database-{index}"));
                     barrier.wait();
-                    manifest
-                        .record(ComponentKind::Db, format!("/tmp/database-{index}"))
-                        .unwrap();
+                    manifest.record(ComponentKind::Db, component).unwrap();
                 })
             })
             .collect::<Vec<_>>();
@@ -306,7 +322,7 @@ mod tests {
         for index in 0..THREADS {
             assert!(entries.contains(&ComponentEntry {
                 kind: ComponentKind::Db,
-                path: PathBuf::from(format!("/tmp/database-{index}")),
+                path: directory.path().join(format!("database-{index}")),
             }));
         }
     }
@@ -320,7 +336,11 @@ mod tests {
         let manifest = ComponentManifest::open(&future);
         let error = manifest.list().unwrap_err().to_string();
         assert!(error.contains("version 2 is unsupported"), "{error}");
-        assert!(manifest.record(ComponentKind::Db, "/tmp/new").is_err());
+        assert!(
+            manifest
+                .record(ComponentKind::Db, directory.path().join("new"))
+                .is_err()
+        );
         assert_eq!(fs::read_to_string(&future).unwrap(), future_content);
 
         let unknown = directory.path().join("unknown.toml");
@@ -330,7 +350,11 @@ mod tests {
         let error = format!("{:#}", manifest.list().unwrap_err());
         assert!(error.contains("parse component manifest"), "{error}");
         assert!(error.contains("unknown variant"), "{error}");
-        assert!(manifest.record(ComponentKind::Db, "/tmp/new").is_err());
+        assert!(
+            manifest
+                .record(ComponentKind::Db, directory.path().join("new"))
+                .is_err()
+        );
         assert_eq!(fs::read_to_string(&unknown).unwrap(), unknown_content);
 
         let corrupt = directory.path().join("corrupt.toml");
@@ -338,7 +362,11 @@ mod tests {
         fs::write(&corrupt, corrupt_content).unwrap();
         let manifest = ComponentManifest::open(&corrupt);
         assert!(manifest.list().is_err());
-        assert!(manifest.record(ComponentKind::Db, "/tmp/new").is_err());
+        assert!(
+            manifest
+                .record(ComponentKind::Db, directory.path().join("new"))
+                .is_err()
+        );
         assert_eq!(fs::read_to_string(&corrupt).unwrap(), corrupt_content);
     }
 
@@ -370,5 +398,84 @@ mod tests {
             manifest.lock_path(),
             directory.path().join("component-manifest.toml.lock")
         );
+    }
+
+    #[test]
+    fn rejects_relative_entries_before_creating_manifest_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(COMPONENT_MANIFEST_FILE_NAME);
+        let manifest = ComponentManifest::open(&path);
+
+        let error = manifest
+            .record(ComponentKind::Db, "relative/weather.db")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("component path must be absolute"), "{error}");
+        assert!(!manifest.path().exists());
+        assert!(!manifest.lock_path().exists());
+    }
+
+    #[test]
+    fn relative_entries_in_existing_documents_are_rejected_without_overwrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(COMPONENT_MANIFEST_FILE_NAME);
+        let content = "version = 1\n[[components]]\nkind = \"db\"\npath = \"relative.db\"\n";
+        fs::write(&path, content).unwrap();
+        let manifest = ComponentManifest::open(&path);
+
+        let error = manifest.list().unwrap_err().to_string();
+        assert!(error.contains("component path must be absolute"), "{error}");
+        assert!(
+            manifest
+                .record(ComponentKind::Db, directory.path().join("weather.db"))
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), content);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn non_utf8_entries_are_rejected_without_lossy_overwrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(COMPONENT_MANIFEST_FILE_NAME);
+        let manifest = ComponentManifest::open(&path);
+        manifest
+            .record(ComponentKind::Config, directory.path().join("weather.toml"))
+            .unwrap();
+        let original = fs::read(&path).unwrap();
+
+        let error = manifest
+            .record(ComponentKind::Db, non_utf8_absolute_path())
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("component path must be valid UTF-8"),
+            "{error}"
+        );
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    fn non_utf8_absolute_path() -> PathBuf {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut bytes = b"/tmp/weather-".to_vec();
+        bytes.push(0xff);
+        PathBuf::from(OsString::from_vec(bytes))
+    }
+
+    #[cfg(windows)]
+    fn non_utf8_absolute_path() -> PathBuf {
+        use std::os::windows::ffi::OsStringExt;
+
+        PathBuf::from(OsString::from_wide(&[
+            b'C' as u16,
+            b':' as u16,
+            b'\\' as u16,
+            b'w' as u16,
+            0xd800,
+        ]))
     }
 }
