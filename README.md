@@ -127,8 +127,13 @@ make release-static
 Release artifacts are copied to:
 
 ```text
-target/release-lto-static/
+target/release-artifacts/<target-triple>/
 ```
+
+Cargo's original artifacts remain under
+`target/<target-triple>/release-lto-static/`. Packaging verifies that each copy
+matches its source, writes `SHA256SUMS`, and rejects dynamically linked Linux
+binaries.
 
 Recommended checks after code changes:
 
@@ -160,7 +165,7 @@ Update installed binaries by rebuilding and reinstalling the service:
 
 ```sh
 make release-static
-target/release-lto-static/weather-daemon service reinstall systemd
+target/release-artifacts/<target-triple>/weather-daemon service reinstall systemd
 ```
 
 For upstream API inspection or troubleshooting, use the scripts in `scripts/`.
