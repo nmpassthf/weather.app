@@ -12,12 +12,15 @@ pub(crate) fn merge_station(
     if station.city.is_empty() {
         station.city = requested.city.clone();
     }
-    if station.name.is_empty() {
-        station.name = requested.name.clone();
-    }
-    if station.unified_uuid.is_empty() {
-        station.unified_uuid = requested.unified_uuid.clone();
-    }
+    // Provider metadata may use a slightly different administrative name.
+    // Public identity must stay tied to the canonical station requested by the
+    // client; otherwise cache keys and PUB subscription UUIDs can drift.
+    station.name = requested.name.clone();
+    station.unified_uuid = if requested.unified_uuid.is_empty() {
+        weather_schema::unified_station_uuid(&requested.name)
+    } else {
+        requested.unified_uuid.clone()
+    };
     station
 }
 
@@ -139,5 +142,33 @@ mod tests {
     fn normalize_station_name_drops_empty_parts() {
         assert_eq!(normalize_station_name(" 北京 -  - 朝阳 "), "北京-朝阳");
         assert_eq!(normalize_station_name("北京-北京市"), "北京-北京市");
+    }
+
+    #[test]
+    fn merge_station_keeps_requested_public_identity() {
+        let requested = ProviderStation {
+            provider_name: "nmc".to_string(),
+            display_name: "北京-北京市-朝阳".to_string(),
+            provider_station_id: "X".to_string(),
+            provider_province_code: "ABJ".to_string(),
+            province: "北京市".to_string(),
+            city: "朝阳".to_string(),
+            url: String::new(),
+            name: "北京-北京市-朝阳".to_string(),
+            unified_uuid: "requested-uuid".to_string(),
+        };
+        let upstream = StationRef {
+            province: "北京".to_string(),
+            city: "朝阳区".to_string(),
+            name: "provider-name".to_string(),
+            unified_uuid: "provider-uuid".to_string(),
+        };
+
+        let merged = merge_station(Some(upstream), &requested);
+
+        assert_eq!(merged.name, requested.name);
+        assert_eq!(merged.unified_uuid, requested.unified_uuid);
+        assert_eq!(merged.province, "北京");
+        assert_eq!(merged.city, "朝阳区");
     }
 }

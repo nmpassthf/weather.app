@@ -4,6 +4,7 @@ mod lock;
 mod refresh;
 mod runtime;
 mod server;
+mod singleflight;
 mod station;
 mod time;
 

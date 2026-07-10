@@ -15,6 +15,7 @@ use crate::{
     lock::LockGuard,
     lock::resolve_relative,
     server::{EventSink, run_engine_sockets},
+    singleflight::WeatherSingleflight,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +30,7 @@ pub(crate) struct Engine {
     pub(crate) config: ConfigState,
     pub(crate) db: DbActor,
     pub(crate) updater: NmcUpdater,
+    pub(crate) weather_singleflight: WeatherSingleflight,
     pub(crate) sink: EventSink,
     pub(crate) stop: Arc<AtomicBool>,
     pub(crate) restart: Arc<AtomicBool>,
@@ -80,6 +82,7 @@ impl EngineRuntime {
                 config: config_state,
                 db,
                 updater,
+                weather_singleflight: WeatherSingleflight::default(),
                 sink,
                 stop: Arc::new(AtomicBool::new(false)),
                 restart: Arc::new(AtomicBool::new(false)),

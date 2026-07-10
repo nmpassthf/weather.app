@@ -3,6 +3,23 @@ use weather_schema::*;
 
 use crate::{runtime::Engine, time::now_ms};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RefreshTerminal {
+    Success,
+    Stale,
+    Failure(String),
+}
+
+impl RefreshTerminal {
+    fn message(self) -> String {
+        match self {
+            Self::Success => "success".to_string(),
+            Self::Stale => "stale".to_string(),
+            Self::Failure(message) => format!("failure: {message}"),
+        }
+    }
+}
+
 impl Engine {
     pub(crate) fn publish_event(&self, topic: &str, kind: EventKind, payload: Vec<u8>) {
         let mut envelope = EventEnvelope {
@@ -69,19 +86,29 @@ impl Engine {
         self.publish_event(TOPIC_ENGINE_LOG, EventKind::FetchLog, payload);
     }
 
-    pub(crate) fn publish_refresh(
+    pub(crate) fn publish_refresh_started(&self, unified_uuid: Option<&str>) {
+        self.publish_refresh(unified_uuid, true, false, None);
+    }
+
+    /// Every started refresh is followed by one completed terminal event.
+    /// `message` is a stable `success` / `stale` / `failure: ...` discriminator
+    /// while preserving the existing protobuf wire shape.
+    pub(crate) fn publish_refresh_terminal(
+        &self,
+        unified_uuid: Option<&str>,
+        outcome: RefreshTerminal,
+    ) {
+        self.publish_refresh(unified_uuid, false, true, Some(outcome.message()));
+    }
+
+    fn publish_refresh(
         &self,
         unified_uuid: Option<&str>,
         started: bool,
         completed: bool,
+        message: Option<String>,
     ) {
-        let payload = RefreshEvent {
-            unified_uuid: unified_uuid.map(str::to_string),
-            started,
-            completed,
-            message: None,
-        }
-        .encode_to_vec();
+        let payload = refresh_event(unified_uuid, started, completed, message).encode_to_vec();
         self.publish_event(TOPIC_ENGINE_REFRESH, EventKind::Refresh, payload);
     }
 
@@ -89,6 +116,20 @@ impl Engine {
         let config = self.config.get();
         let key = weather_configure::resolve_hmac_key(&config).ok()??;
         weather_schema::event_hmac(envelope, &key).ok()
+    }
+}
+
+fn refresh_event(
+    unified_uuid: Option<&str>,
+    started: bool,
+    completed: bool,
+    message: Option<String>,
+) -> RefreshEvent {
+    RefreshEvent {
+        unified_uuid: unified_uuid.map(str::to_string),
+        started,
+        completed,
+        message,
     }
 }
 
@@ -148,5 +189,30 @@ mod tests {
         assert!(line.contains("weather-engine warn"));
         assert!(line.contains("endpoint=rest/weather"));
         assert!(line.contains("using stale data"));
+    }
+
+    #[test]
+    fn refresh_terminal_messages_distinguish_outcomes() {
+        assert_eq!(RefreshTerminal::Success.message(), "success");
+        assert_eq!(RefreshTerminal::Stale.message(), "stale");
+        assert_eq!(
+            RefreshTerminal::Failure("upstream timeout".to_string()).message(),
+            "failure: upstream timeout"
+        );
+    }
+
+    #[test]
+    fn terminal_refresh_event_is_completed_and_not_started() {
+        let event = refresh_event(
+            Some("uuid"),
+            false,
+            true,
+            Some(RefreshTerminal::Stale.message()),
+        );
+
+        assert_eq!(event.unified_uuid.as_deref(), Some("uuid"));
+        assert!(!event.started);
+        assert!(event.completed);
+        assert_eq!(event.message.as_deref(), Some("stale"));
     }
 }
