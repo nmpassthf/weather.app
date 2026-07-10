@@ -3041,7 +3041,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "rusqlite",
- "serde_json",
+ "tempfile",
  "tokio",
  "weather-schema",
 ]
@@ -3055,7 +3055,6 @@ dependencies = [
  "chrono-tz",
  "fs2",
  "prost",
- "serde_json",
  "tempfile",
  "tokio",
  "toml",

@@ -1,10 +1,16 @@
-use std::path::PathBuf;
+use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
+    path::{Path, PathBuf},
+};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use tokio::sync::{mpsc, oneshot};
 use weather_schema::{StationRef, WeatherSnapshot};
 
-use crate::storage::DbInstance;
+use crate::storage::{self, DbInstance};
+
+type TimezoneFinalize = Box<dyn FnOnce() -> Result<()> + Send + Sync + 'static>;
+type PostCommitFailure = Box<dyn FnOnce(String) + Send + Sync + 'static>;
 
 #[derive(Clone)]
 pub struct DbActor {
@@ -14,39 +20,37 @@ pub struct DbActor {
 pub(crate) enum DbCommand {
     PutHistorySnapshot {
         snapshot: Box<WeatherSnapshot>,
-        forecast_json: String,
-        alerts_json: String,
-        date: String,
+        fetched_at_unix_ms: i64,
         reply: oneshot::Sender<Result<()>>,
-    },
-    GetHistorySnapshot {
-        uuid: String,
-        date: String,
-        reply: oneshot::Sender<Result<Option<StoredSnapshot>>>,
     },
     GetLatestSnapshot {
         uuid: String,
         reply: oneshot::Sender<Result<Option<StoredSnapshot>>>,
     },
-    PutProviderProvinces {
+    ReplaceProviderProvinces {
+        provider: String,
         provinces: Vec<ProviderProvince>,
         reply: oneshot::Sender<Result<()>>,
     },
     GetProviderProvinces {
-        reply: oneshot::Sender<Result<Vec<ProviderProvince>>>,
+        provider: String,
+        reply: oneshot::Sender<Result<Option<CatalogCache<ProviderProvince>>>>,
     },
     ResolveProviderProvinceCode {
+        provider: String,
         province: String,
         reply: oneshot::Sender<Result<String>>,
     },
-    PutProviderCities {
+    ReplaceProviderCities {
+        provider: String,
         provider_province_code: String,
         cities: Vec<ProviderCity>,
         reply: oneshot::Sender<Result<()>>,
     },
     GetProviderCities {
+        provider: String,
         provider_province_code: String,
-        reply: oneshot::Sender<Result<Vec<ProviderCity>>>,
+        reply: oneshot::Sender<Result<Option<CatalogCache<ProviderCity>>>>,
     },
     GetProviderStationByUuid {
         provider: String,
@@ -65,13 +69,11 @@ pub(crate) enum DbCommand {
     GetDbTimezone {
         reply: oneshot::Sender<Result<Option<String>>>,
     },
-    SetDbTimezone {
-        timezone: String,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    MigrateTimezone {
+    MigrateTimezoneBundle {
         old_timezone: String,
         new_timezone: String,
+        finalize: TimezoneFinalize,
+        postcommit_failure: PostCommitFailure,
         reply: oneshot::Sender<Result<u64>>,
     },
     LogFetch {
@@ -88,6 +90,12 @@ pub(crate) enum DbCommand {
 #[derive(Debug)]
 pub struct StoredSnapshot {
     pub snapshot: WeatherSnapshot,
+    pub fetched_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CatalogCache<T> {
+    pub items: Vec<T>,
     pub fetched_at_unix_ms: i64,
 }
 
@@ -149,20 +157,24 @@ impl ProviderStation {
 }
 
 impl DbActor {
+    pub fn inspect_pending_timezone(path: &Path) -> Result<Option<String>> {
+        storage::inspect_pending_timezone(path)
+    }
+
     pub fn start(path: PathBuf, config_tz: String) -> Result<Self> {
         let (tx, mut rx) = mpsc::channel::<DbCommand>(128);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let result = DbInstance::open(path, &config_tz);
             match result {
-                Ok(db) => {
+                Ok(mut db) => {
                     let _ = ready_tx.send(Ok(()));
                     while let Some(cmd) = rx.blocking_recv() {
                         if matches!(cmd, DbCommand::Shutdown { .. }) {
-                            handle(&db, cmd);
+                            handle(&mut db, cmd);
                             break;
                         }
-                        handle(&db, cmd);
+                        handle(&mut db, cmd);
                     }
                 }
                 Err(err) => {
@@ -177,31 +189,15 @@ impl DbActor {
     pub async fn put_history_snapshot(
         &self,
         snapshot: WeatherSnapshot,
-        forecast_json: String,
-        alerts_json: String,
-        date: String,
+        fetched_at_unix_ms: i64,
     ) -> Result<()> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(DbCommand::PutHistorySnapshot {
                 snapshot: Box::new(snapshot),
-                forecast_json,
-                alerts_json,
-                date,
+                fetched_at_unix_ms,
                 reply,
             })
-            .await?;
-        rx.await?
-    }
-
-    pub async fn get_history_snapshot(
-        &self,
-        uuid: String,
-        date: String,
-    ) -> Result<Option<StoredSnapshot>> {
-        let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(DbCommand::GetHistorySnapshot { uuid, date, reply })
             .await?;
         rx.await?
     }
@@ -214,39 +210,63 @@ impl DbActor {
         rx.await?
     }
 
-    pub async fn put_provider_provinces(&self, provinces: Vec<ProviderProvince>) -> Result<()> {
-        let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(DbCommand::PutProviderProvinces { provinces, reply })
-            .await?;
-        rx.await?
-    }
-
-    pub async fn get_provider_provinces(&self) -> Result<Vec<ProviderProvince>> {
-        let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(DbCommand::GetProviderProvinces { reply })
-            .await?;
-        rx.await?
-    }
-
-    pub async fn resolve_provider_province_code(&self, province: String) -> Result<String> {
-        let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(DbCommand::ResolveProviderProvinceCode { province, reply })
-            .await?;
-        rx.await?
-    }
-
-    pub async fn put_provider_cities(
+    pub async fn replace_provider_provinces(
         &self,
-        provider_province_code: String,
+        provider: &str,
+        provinces: Vec<ProviderProvince>,
+    ) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbCommand::ReplaceProviderProvinces {
+                provider: provider.to_string(),
+                provinces,
+                reply,
+            })
+            .await?;
+        rx.await?
+    }
+
+    pub async fn get_provider_provinces(
+        &self,
+        provider: &str,
+    ) -> Result<Option<CatalogCache<ProviderProvince>>> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbCommand::GetProviderProvinces {
+                provider: provider.to_string(),
+                reply,
+            })
+            .await?;
+        rx.await?
+    }
+
+    pub async fn resolve_provider_province_code(
+        &self,
+        provider: &str,
+        province: &str,
+    ) -> Result<String> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbCommand::ResolveProviderProvinceCode {
+                provider: provider.to_string(),
+                province: province.to_string(),
+                reply,
+            })
+            .await?;
+        rx.await?
+    }
+
+    pub async fn replace_provider_cities(
+        &self,
+        provider: &str,
+        provider_province_code: &str,
         cities: Vec<ProviderCity>,
     ) -> Result<()> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(DbCommand::PutProviderCities {
-                provider_province_code,
+            .send(DbCommand::ReplaceProviderCities {
+                provider: provider.to_string(),
+                provider_province_code: provider_province_code.to_string(),
                 cities,
                 reply,
             })
@@ -256,12 +276,14 @@ impl DbActor {
 
     pub async fn get_provider_cities(
         &self,
-        provider_province_code: String,
-    ) -> Result<Vec<ProviderCity>> {
+        provider: &str,
+        provider_province_code: &str,
+    ) -> Result<Option<CatalogCache<ProviderCity>>> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(DbCommand::GetProviderCities {
-                provider_province_code,
+                provider: provider.to_string(),
+                provider_province_code: provider_province_code.to_string(),
                 reply,
             })
             .await?;
@@ -314,28 +336,46 @@ impl DbActor {
         rx.await?
     }
 
-    pub async fn set_db_timezone(&self, timezone: String) -> Result<()> {
-        let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(DbCommand::SetDbTimezone { timezone, reply })
+    pub async fn migrate_timezone_bundle<F, P>(
+        &self,
+        old_timezone: String,
+        new_timezone: String,
+        finalize: F,
+        postcommit_failure: P,
+    ) -> Result<u64>
+    where
+        F: FnOnce() -> Result<()> + Send + Sync + 'static,
+        P: FnOnce(String) + Send + Sync + 'static,
+    {
+        let rx = self
+            .enqueue_timezone_bundle(
+                old_timezone,
+                new_timezone,
+                Box::new(finalize),
+                Box::new(postcommit_failure),
+            )
             .await?;
         rx.await?
     }
 
-    pub async fn migrate_timezone(
+    async fn enqueue_timezone_bundle(
         &self,
         old_timezone: String,
         new_timezone: String,
-    ) -> Result<u64> {
+        finalize: TimezoneFinalize,
+        postcommit_failure: PostCommitFailure,
+    ) -> Result<oneshot::Receiver<Result<u64>>> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(DbCommand::MigrateTimezone {
+            .send(DbCommand::MigrateTimezoneBundle {
                 old_timezone,
                 new_timezone,
+                finalize,
+                postcommit_failure,
                 reply,
             })
             .await?;
-        rx.await?
+        Ok(rx)
     }
 
     pub async fn log_fetch(
@@ -366,45 +406,50 @@ impl DbActor {
     }
 }
 
-fn handle(db: &DbInstance, cmd: DbCommand) {
+fn handle(db: &mut DbInstance, cmd: DbCommand) {
     match cmd {
         DbCommand::PutHistorySnapshot {
             snapshot,
-            forecast_json,
-            alerts_json,
-            date,
+            fetched_at_unix_ms,
             reply,
         } => {
-            let _ =
-                reply.send(db.put_history_snapshot(&snapshot, &forecast_json, &alerts_json, &date));
-        }
-        DbCommand::GetHistorySnapshot { uuid, date, reply } => {
-            let _ = reply.send(db.get_history_snapshot(&uuid, &date));
+            let _ = reply.send(db.put_history_snapshot(&snapshot, fetched_at_unix_ms));
         }
         DbCommand::GetLatestSnapshot { uuid, reply } => {
             let _ = reply.send(db.get_latest_snapshot(&uuid));
         }
-        DbCommand::PutProviderProvinces { provinces, reply } => {
-            let _ = reply.send(db.put_provider_provinces(&provinces));
+        DbCommand::ReplaceProviderProvinces {
+            provider,
+            provinces,
+            reply,
+        } => {
+            let _ = reply.send(db.replace_provider_provinces(&provider, &provinces));
         }
-        DbCommand::GetProviderProvinces { reply } => {
-            let _ = reply.send(db.get_provider_provinces());
+        DbCommand::GetProviderProvinces { provider, reply } => {
+            let _ = reply.send(db.get_provider_provinces(&provider));
         }
-        DbCommand::ResolveProviderProvinceCode { province, reply } => {
-            let _ = reply.send(db.resolve_provider_province_code(&province));
+        DbCommand::ResolveProviderProvinceCode {
+            provider,
+            province,
+            reply,
+        } => {
+            let _ = reply.send(db.resolve_provider_province_code(&provider, &province));
         }
-        DbCommand::PutProviderCities {
+        DbCommand::ReplaceProviderCities {
+            provider,
             provider_province_code,
             cities,
             reply,
         } => {
-            let _ = reply.send(db.put_provider_cities(&provider_province_code, &cities));
+            let _ =
+                reply.send(db.replace_provider_cities(&provider, &provider_province_code, &cities));
         }
         DbCommand::GetProviderCities {
+            provider,
             provider_province_code,
             reply,
         } => {
-            let _ = reply.send(db.get_provider_cities(&provider_province_code));
+            let _ = reply.send(db.get_provider_cities(&provider, &provider_province_code));
         }
         DbCommand::GetProviderStationByUuid {
             provider,
@@ -426,15 +471,32 @@ fn handle(db: &DbInstance, cmd: DbCommand) {
         DbCommand::GetDbTimezone { reply } => {
             let _ = reply.send(db.get_db_timezone());
         }
-        DbCommand::SetDbTimezone { timezone, reply } => {
-            let _ = reply.send(db.set_db_timezone(&timezone));
-        }
-        DbCommand::MigrateTimezone {
+        DbCommand::MigrateTimezoneBundle {
             old_timezone,
             new_timezone,
+            finalize,
+            postcommit_failure,
             reply,
         } => {
-            let _ = reply.send(db.migrate_timezone(&old_timezone, &new_timezone));
+            let result = match db.migrate_timezone(&old_timezone, &new_timezone) {
+                Ok(rewritten) => match run_timezone_finalize(finalize) {
+                    Ok(()) => match db.clear_pending_timezone(&new_timezone) {
+                        Ok(()) => Ok(rewritten),
+                        Err(err) => {
+                            let message = format!("failed to clear timezone sync marker: {err:#}");
+                            run_postcommit_failure(postcommit_failure, message.clone());
+                            Err(anyhow!(message))
+                        }
+                    },
+                    Err(err) => {
+                        let message = format!("failed to finalize timezone config: {err:#}");
+                        run_postcommit_failure(postcommit_failure, message.clone());
+                        Err(anyhow!(message))
+                    }
+                },
+                Err(err) => Err(err),
+            };
+            let _ = reply.send(result);
         }
         DbCommand::LogFetch {
             unified_uuid,
@@ -453,5 +515,194 @@ fn handle(db: &DbInstance, cmd: DbCommand) {
         DbCommand::Shutdown { reply } => {
             let _ = reply.send(db.checkpoint());
         }
+    }
+}
+
+fn run_timezone_finalize(finalize: TimezoneFinalize) -> Result<()> {
+    match catch_unwind(AssertUnwindSafe(finalize)) {
+        Ok(result) => result,
+        Err(payload) => Err(anyhow!(
+            "timezone config finalizer panicked: {}",
+            panic_message(payload)
+        )),
+    }
+}
+
+fn run_postcommit_failure(callback: PostCommitFailure, message: String) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| callback(message))) {
+        eprintln!(
+            "weather-db warn: timezone post-commit failure callback panicked: {}",
+            panic_message(payload)
+        );
+    }
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use anyhow::bail;
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborted_bundle_caller_still_finalizes_and_clears_pending_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("weather.db");
+        let actor = DbActor::start(path.clone(), "UTC".to_string()).unwrap();
+        let finalized = Arc::new(AtomicBool::new(false));
+        let failed = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let finalize_flag = finalized.clone();
+        let failure_flag = failed.clone();
+        let finalize_entered = entered.clone();
+        let finalize_release = release.clone();
+        let migration_actor = actor.clone();
+
+        let caller = tokio::spawn(async move {
+            migration_actor
+                .migrate_timezone_bundle(
+                    "UTC".to_string(),
+                    "Asia/Shanghai".to_string(),
+                    move || {
+                        finalize_entered.wait();
+                        finalize_release.wait();
+                        finalize_flag.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
+                    move |_| failure_flag.store(true, Ordering::SeqCst),
+                )
+                .await
+        });
+        tokio::task::spawn_blocking(move || entered.wait())
+            .await
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            actor.get_db_timezone().await.unwrap().as_deref(),
+            Some("Asia/Shanghai")
+        );
+        assert!(finalized.load(Ordering::SeqCst));
+        assert!(!failed.load(Ordering::SeqCst));
+        assert_eq!(DbActor::inspect_pending_timezone(&path).unwrap(), None);
+        actor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finalize_failure_keeps_pending_marker_and_invokes_callback() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("weather.db");
+        let actor = DbActor::start(path.clone(), "UTC".to_string()).unwrap();
+        let failure = Arc::new(Mutex::new(None));
+        let captured = failure.clone();
+
+        let result = actor
+            .migrate_timezone_bundle(
+                "UTC".to_string(),
+                "Asia/Shanghai".to_string(),
+                || bail!("injected finalize failure"),
+                move |message| *captured.lock().unwrap() = Some(message),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            failure
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|message| message.contains("injected finalize failure"))
+        );
+        assert_eq!(
+            DbActor::inspect_pending_timezone(&path).unwrap().as_deref(),
+            Some("Asia/Shanghai")
+        );
+        actor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn clear_marker_failure_keeps_pending_marker_and_invokes_callback() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("weather.db");
+        let actor = DbActor::start(path.clone(), "UTC".to_string()).unwrap();
+        let failure = Arc::new(Mutex::new(None));
+        let captured = failure.clone();
+        let trigger_path = path.clone();
+
+        let result = actor
+            .migrate_timezone_bundle(
+                "UTC".to_string(),
+                "Asia/Shanghai".to_string(),
+                move || {
+                    let conn = rusqlite::Connection::open(trigger_path)?;
+                    conn.execute_batch(
+                        r#"CREATE TRIGGER fail_timezone_marker_delete
+                           BEFORE DELETE ON engine_state
+                           WHEN OLD.key = 'timezone_config_sync_pending'
+                           BEGIN SELECT RAISE(ABORT, 'injected marker delete failure'); END;"#,
+                    )?;
+                    Ok(())
+                },
+                move |message| *captured.lock().unwrap() = Some(message),
+            )
+            .await;
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("clear timezone sync marker"), "{err}");
+        assert!(
+            failure
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|message| message.contains("marker delete failure"))
+        );
+        assert_eq!(
+            DbActor::inspect_pending_timezone(&path).unwrap().as_deref(),
+            Some("Asia/Shanghai")
+        );
+        actor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finalizer_panic_is_reported_without_killing_actor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("weather.db");
+        let actor = DbActor::start(path.clone(), "UTC".to_string()).unwrap();
+        let callback_called = Arc::new(AtomicBool::new(false));
+        let callback_flag = callback_called.clone();
+
+        let result = actor
+            .migrate_timezone_bundle(
+                "UTC".to_string(),
+                "Asia/Shanghai".to_string(),
+                || panic!("injected finalizer panic"),
+                move |_| callback_flag.store(true, Ordering::SeqCst),
+            )
+            .await;
+
+        assert!(result.unwrap_err().to_string().contains("panicked"));
+        assert!(callback_called.load(Ordering::SeqCst));
+        assert_eq!(
+            actor.get_db_timezone().await.unwrap().as_deref(),
+            Some("Asia/Shanghai")
+        );
+        actor.shutdown().await.unwrap();
     }
 }

@@ -52,9 +52,9 @@ impl Engine {
     }
 
     pub(super) async fn provider_provinces(&self) -> Result<Vec<ProviderProvince>> {
-        let existing = self.db.get_provider_provinces().await?;
-        if !existing.is_empty() {
-            return Ok(existing);
+        let provider = self.updater.provider_name();
+        if let Some(cache) = self.db.get_provider_provinces(provider).await? {
+            return Ok(cache.items);
         }
         let provinces = self
             .updater
@@ -63,7 +63,9 @@ impl Engine {
             .into_iter()
             .map(db_provider_province)
             .collect::<Vec<_>>();
-        self.db.put_provider_provinces(provinces.clone()).await?;
+        self.db
+            .replace_provider_provinces(provider, provinces.clone())
+            .await?;
         self.db
             .log_fetch(None, "rest/province/all".to_string(), true, None)
             .await?;
@@ -123,8 +125,9 @@ impl Engine {
 
     pub(super) async fn resolve_provider_province_code(&self, province: &str) -> Result<String> {
         let _ = self.provider_provinces().await?;
+        let provider = self.updater.provider_name();
         self.db
-            .resolve_provider_province_code(province.to_string())
+            .resolve_provider_province_code(provider, province)
             .await
     }
 
@@ -132,12 +135,13 @@ impl Engine {
         &self,
         provider_province_code: &str,
     ) -> Result<Vec<ProviderCity>> {
-        let existing = self
+        let provider = self.updater.provider_name();
+        if let Some(cache) = self
             .db
-            .get_provider_cities(provider_province_code.to_string())
-            .await?;
-        if !existing.is_empty() {
-            return Ok(existing);
+            .get_provider_cities(provider, provider_province_code)
+            .await?
+        {
+            return Ok(cache.items);
         }
         let cities = self
             .updater
@@ -147,7 +151,7 @@ impl Engine {
             .map(db_provider_city)
             .collect::<Vec<_>>();
         self.db
-            .put_provider_cities(provider_province_code.to_string(), cities.clone())
+            .replace_provider_cities(provider, provider_province_code, cities.clone())
             .await?;
         self.db
             .log_fetch(

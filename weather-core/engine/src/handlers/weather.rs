@@ -183,24 +183,9 @@ impl Engine {
     }
 
     async fn persist_snapshot(&self, snapshot: WeatherSnapshot) -> Result<()> {
-        let forecast_json = snapshot
-            .predict
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .context("failed to serialize forecast cache")?
-            .unwrap_or_default();
-        let alerts_json = snapshot
-            .real
-            .as_ref()
-            .and_then(|real| real.alert.as_ref())
-            .map(serde_json::to_string)
-            .transpose()
-            .context("failed to serialize alert cache")?
-            .unwrap_or_default();
-        let date = date_for_tz(now_ms(), &self.config.get().db.timezone)?;
+        let fetched_at_unix_ms = now_ms();
         self.db
-            .put_history_snapshot(snapshot, forecast_json, alerts_json, date)
+            .put_history_snapshot(snapshot, fetched_at_unix_ms)
             .await
     }
 

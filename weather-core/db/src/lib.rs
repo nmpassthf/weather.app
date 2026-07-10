@@ -1,4 +1,7 @@
 mod actor;
+mod migration;
 mod storage;
 
-pub use actor::{DbActor, ProviderCity, ProviderProvince, ProviderStation, StoredSnapshot};
+pub use actor::{
+    CatalogCache, DbActor, ProviderCity, ProviderProvince, ProviderStation, StoredSnapshot,
+};

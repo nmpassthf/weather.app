@@ -1,10 +1,18 @@
-//! 处理 `MIGRATE_DB_TIMEZONE` RPC：把 DB 历史表 date 列迁移到新时区。
+//! Atomically coordinate database timezone migration with persisted/live config.
 
 use std::str::FromStr;
 
+use anyhow::{Context, Result};
+use weather_configure::{prepare_config_atomic, validate};
 use weather_schema::*;
 
-use crate::runtime::Engine;
+use crate::runtime::{Engine, EngineExit};
+
+pub(crate) struct TimezoneMigration {
+    pub(crate) old_timezone: String,
+    pub(crate) new_timezone: String,
+    pub(crate) rows_rewritten: u64,
+}
 
 impl Engine {
     pub(crate) async fn handle_migrate_db_timezone(&self, request: &RpcRequest) -> RpcResponse {
@@ -23,27 +31,87 @@ impl Engine {
                 format!("invalid timezone `{}`", req.new_timezone),
             );
         }
-        let old = match self.db.get_db_timezone().await {
-            Ok(Some(tz)) => tz,
-            Ok(None) => String::new(),
-            Err(err) => {
-                return Self::rpc_error_response(&request.request_id, "DB", err.to_string());
-            }
-        };
-        match self
-            .db
-            .migrate_timezone(old.clone(), req.new_timezone.clone())
-            .await
-        {
-            Ok(rows) => self.ok(
+
+        match self.migrate_db_timezone(req.new_timezone).await {
+            Ok(migration) => self.ok(
                 &request.request_id,
                 MigrateDbTimezoneResponse {
-                    old_timezone: old,
-                    new_timezone: req.new_timezone,
-                    rows_rewritten: rows,
+                    old_timezone: migration.old_timezone,
+                    new_timezone: migration.new_timezone,
+                    rows_rewritten: migration.rows_rewritten,
                 },
             ),
-            Err(err) => Self::rpc_error_response(&request.request_id, "DB", err.to_string()),
+            Err(err) => Self::rpc_error_response(&request.request_id, "DB", format!("{err:#}")),
         }
+    }
+
+    pub(crate) async fn migrate_db_timezone(
+        &self,
+        new_timezone: String,
+    ) -> Result<TimezoneMigration> {
+        let commit_guard = self.config_commit.clone().lock_owned().await;
+        let current = self.config.get();
+        let old_timezone = current.db.timezone.clone();
+
+        if old_timezone == new_timezone {
+            let rows_rewritten = self
+                .db
+                .migrate_timezone_bundle(
+                    old_timezone.clone(),
+                    new_timezone.clone(),
+                    || Ok(()),
+                    postcommit_failure(commit_guard, self.config.clone(), self.control.clone()),
+                )
+                .await?;
+            return Ok(TimezoneMigration {
+                old_timezone,
+                new_timezone,
+                rows_rewritten,
+            });
+        }
+
+        let mut candidate = current;
+        candidate.db.timezone = new_timezone.clone();
+        validate(&candidate).context("invalid timezone migration config")?;
+        let prepare_path = self.config_path.clone();
+        let prepare_candidate = candidate.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            prepare_config_atomic(&prepare_path, &prepare_candidate)
+        })
+        .await
+        .context("timezone config prepare task failed")??;
+
+        let finalize_state = self.config.clone();
+        let finalize_candidate = candidate;
+        let rows_rewritten = self
+            .db
+            .migrate_timezone_bundle(
+                old_timezone.clone(),
+                new_timezone.clone(),
+                move || {
+                    prepared.persist()?;
+                    finalize_state.apply(finalize_candidate);
+                    Ok(())
+                },
+                postcommit_failure(commit_guard, self.config.clone(), self.control.clone()),
+            )
+            .await?;
+        Ok(TimezoneMigration {
+            old_timezone,
+            new_timezone,
+            rows_rewritten,
+        })
+    }
+}
+
+fn postcommit_failure(
+    commit_guard: tokio::sync::OwnedMutexGuard<()>,
+    config: weather_configure::ConfigState,
+    control: crate::lifecycle::EngineControl,
+) -> impl FnOnce(String) + Send + Sync + 'static {
+    move |message| {
+        let _commit_guard = commit_guard;
+        control.request_exit(EngineExit::Restart);
+        config.record_error(message);
     }
 }
