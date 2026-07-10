@@ -17,3 +17,6 @@ weather-db = { path = "../db" }
 weather-schema = { path = "../../weather-schema" }
 weather-updater = { path = "../updater" }
 zeromq.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

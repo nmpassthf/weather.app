@@ -87,14 +87,6 @@ pub(crate) fn short_region_name(value: &str) -> &str {
         .unwrap_or(value)
 }
 
-pub(crate) fn normalize_station_name(name: &str) -> String {
-    name.split('-')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,12 +128,6 @@ mod tests {
             }),
             vec!["北京-北京市-朝阳".to_string()]
         );
-    }
-
-    #[test]
-    fn normalize_station_name_drops_empty_parts() {
-        assert_eq!(normalize_station_name(" 北京 -  - 朝阳 "), "北京-朝阳");
-        assert_eq!(normalize_station_name("北京-北京市"), "北京-北京市");
     }
 
     #[test]

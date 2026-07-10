@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -6,6 +7,7 @@ use toml::Value;
 
 use crate::{
     AppConfig, ComponentKind, ComponentRegistry, SUPPORTED_CONFIG_VERSION, default_config_toml,
+    normalize_station_name,
 };
 
 /// 按 `ipc.hmac` 模式解析出实际 HMAC key。
@@ -228,9 +230,14 @@ pub fn validate(config: &AppConfig) -> Result<()> {
     {
         bail!("updater.default_provider must match a configured provider");
     }
+    let mut station_names = HashSet::new();
     for station in &config.stations {
-        if station.enabled && station.name.trim().is_empty() {
-            bail!("enabled station.name must not be empty");
+        let normalized = normalize_station_name(&station.name);
+        if normalized.is_empty() {
+            bail!("station.name must not be empty");
+        }
+        if !station_names.insert(normalized.clone()) {
+            bail!("duplicate station.name `{normalized}` after normalization");
         }
     }
     Ok(())
@@ -424,6 +431,39 @@ mod tests {
             enabled: true,
         }];
         assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_disabled_station() {
+        let mut config = base_config();
+        config.stations = vec![crate::types::StationConfig {
+            name: " -  - ".to_string(),
+            enabled: false,
+        }];
+
+        let err = validate(&config).unwrap_err().to_string();
+
+        assert!(err.contains("station.name must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn rejects_station_duplicates_after_normalization() {
+        let mut config = base_config();
+        config.stations = vec![
+            crate::types::StationConfig {
+                name: "北京 - 北京市 - 朝阳".to_string(),
+                enabled: true,
+            },
+            crate::types::StationConfig {
+                name: "北京-北京市-朝阳".to_string(),
+                enabled: false,
+            },
+        ];
+
+        let err = validate(&config).unwrap_err().to_string();
+
+        assert!(err.contains("duplicate station.name"), "{err}");
+        assert!(err.contains("北京-北京市-朝阳"), "{err}");
     }
 
     #[test]

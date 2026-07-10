@@ -1,4 +1,3 @@
-mod config_normalizer;
 mod handlers;
 mod lifecycle;
 mod limits;

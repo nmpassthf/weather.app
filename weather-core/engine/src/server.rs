@@ -11,7 +11,6 @@ use weather_schema::*;
 use zeromq::{PubSocket, RouterSendHalf, RouterSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
 use crate::{
-    config_normalizer::run_config_normalizer,
     lifecycle::{Cancellation, wait_for_exit},
     limits::{MAX_CONCURRENT_REQUESTS, MAX_RPC_PAYLOAD_BYTES},
     refresh::run_refresh_loop,
@@ -26,7 +25,6 @@ enum TaskKind {
     Router,
     Signal,
     Refresh,
-    ConfigNormalizer,
 }
 
 type TaskOutput = (TaskKind, Result<()>);
@@ -103,16 +101,6 @@ pub(crate) async fn run_engine_sockets(
         TaskKind::Refresh,
         run_refresh_loop(engine.clone(), cancellation.clone()),
     );
-    spawn_task(
-        &mut tasks,
-        TaskKind::ConfigNormalizer,
-        run_config_normalizer(
-            engine.config_path.clone(),
-            engine.config.clone(),
-            cancellation.clone(),
-        ),
-    );
-
     engine.publish_status(&mode, &rpc_endpoint, &pub_endpoint);
 
     let mut exit_rx = engine.control.subscribe();
