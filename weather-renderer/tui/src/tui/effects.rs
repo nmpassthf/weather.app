@@ -1,7 +1,10 @@
 use tokio::{sync::mpsc, task::JoinSet};
 use weather_schema::*;
 
-use crate::{client::EngineClient, pagination::PageCursor};
+use crate::{
+    client::{EngineClient, require_config},
+    pagination::PageCursor,
+};
 
 use super::state::SearchPage;
 
@@ -134,7 +137,7 @@ impl EffectRunner {
                     let result = client
                         .update_config(*config)
                         .await
-                        .map(|response| response.config.unwrap_or_default())
+                        .and_then(|response| require_config(response.config, "update-config"))
                         .map_err(|error| format!("{error:#}"));
                     let _ = sender.send(EffectResult::Config { token, result }).await;
                 });

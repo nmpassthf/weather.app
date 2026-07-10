@@ -58,6 +58,13 @@ pub(crate) struct EngineEvent {
     pub envelope: EventEnvelope,
 }
 
+pub(crate) fn require_config(
+    config: Option<weather_schema::AppConfig>,
+    operation: &str,
+) -> Result<weather_schema::AppConfig> {
+    config.with_context(|| format!("engine {operation} response is missing config"))
+}
+
 impl EngineClient {
     /// 连接到 RPC 与 PUB endpoint，启动收发后台任务。
     pub(crate) async fn connect(
@@ -367,6 +374,16 @@ mod tests {
     use tokio::{sync::oneshot, time::advance};
 
     use super::*;
+
+    #[test]
+    fn missing_config_payload_is_rejected() {
+        let error = require_config(None, "get-config").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "engine get-config response is missing config"
+        );
+    }
 
     fn configured_station(index: usize) -> ConfiguredStation {
         ConfiguredStation {

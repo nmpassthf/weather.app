@@ -1,5 +1,8 @@
-use anyhow::{Result, bail};
-use weather_configure::{default_config_file, load_or_default};
+use std::{fs, path::PathBuf};
+
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
+use weather_schema::{DEFAULT_ZMQ_PUB_ENDPOINT, DEFAULT_ZMQ_RPC_ENDPOINT};
 
 use crate::cli::Cli;
 
@@ -50,11 +53,50 @@ fn configured_endpoints(cli: &Cli) -> Result<Endpoints> {
         Some(path) => path.clone(),
         None => default_config_file()?,
     };
-    let config = load_or_default(&config_path)?;
+    let content = match fs::read_to_string(&config_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(default_endpoints());
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read config {}", config_path.display()));
+        }
+    };
+    let config: EndpointConfig = toml::from_str(&content)
+        .with_context(|| format!("failed to parse config endpoints {}", config_path.display()))?;
     Ok(Endpoints {
         rpc: config.ipc.rpc_endpoint,
         publisher: config.ipc.pub_endpoint,
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct EndpointConfig {
+    ipc: EndpointIpcConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct EndpointIpcConfig {
+    rpc_endpoint: String,
+    pub_endpoint: String,
+}
+
+fn default_endpoints() -> Endpoints {
+    Endpoints {
+        rpc: DEFAULT_ZMQ_RPC_ENDPOINT.to_string(),
+        publisher: DEFAULT_ZMQ_PUB_ENDPOINT.to_string(),
+    }
+}
+
+fn default_config_file() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .context("neither HOME nor USERPROFILE is set")?;
+    Ok(PathBuf::from(home)
+        .join(".weather")
+        .join("config")
+        .join("weather.toml"))
 }
 
 #[cfg(test)]
@@ -62,7 +104,6 @@ mod tests {
     use std::{cell::Cell, fs};
 
     use clap::Parser;
-    use weather_configure::AppConfig;
 
     use super::*;
 
@@ -198,10 +239,24 @@ mod tests {
     fn single_endpoint_reads_missing_side_from_selected_config() {
         let directory = tempfile::tempdir().unwrap();
         let config_path = directory.path().join("weather.toml");
-        let mut config = AppConfig::default();
-        config.ipc.rpc_endpoint = "tcp://config:46001".to_string();
-        config.ipc.pub_endpoint = "tcp://config:46002".to_string();
-        fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
+        fs::write(
+            &config_path,
+            r#"
+config_version = 1
+
+[engine]
+request_timeout_ms = 3000
+
+[ipc]
+transport = "tcp"
+rpc_endpoint = "tcp://config:46001"
+pub_endpoint = "tcp://config:46002"
+
+[daemon]
+foreground = true
+"#,
+        )
+        .unwrap();
         let cli = Cli::parse_from([
             "weather-tui",
             "--config",
@@ -216,6 +271,41 @@ mod tests {
         assert_eq!(
             plan,
             ConnectionPlan::Direct(endpoints("tcp://remote:46001", "tcp://config:46002"))
+        );
+    }
+
+    #[test]
+    fn single_endpoint_reads_future_config_shape_without_legacy_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("weather.toml");
+        fs::write(
+            &config_path,
+            r#"
+config_version = 2
+
+[ipc]
+rpc_endpoint = "tcp://config:46101"
+pub_endpoint = "tcp://config:46102"
+
+[db]
+path = "weather.db"
+"#,
+        )
+        .unwrap();
+        let cli = Cli::parse_from([
+            "weather-tui",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--pub-endpoint",
+            "tcp://remote:46102",
+            "status",
+        ]);
+
+        let plan = connection_plan(&cli).unwrap();
+
+        assert_eq!(
+            plan,
+            ConnectionPlan::Direct(endpoints("tcp://config:46101", "tcp://remote:46102"))
         );
     }
 

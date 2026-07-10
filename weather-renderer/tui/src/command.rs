@@ -4,7 +4,7 @@ use weather_schema::*;
 
 use crate::{
     cli::{Cli, CommandKind, OutputFormat, StationsCommand},
-    client::EngineClient,
+    client::{EngineClient, require_config},
     render::{
         render_configured_stations, render_search_results, render_station_candidates,
         render_station_change, render_status, render_weather,
@@ -21,7 +21,7 @@ struct StationChangeOutput {
 pub(crate) async fn run_command(client: &EngineClient, cli: &Cli) -> Result<()> {
     if cli.core_get_default_config {
         let resp = client.get_config(true).await?;
-        let config = resp.config.unwrap_or_default();
+        let config = require_config(resp.config, "get-default-config")?;
         let toml = toml::to_string_pretty(&config)
             .map_err(|e| anyhow::anyhow!("failed to serialize config: {e}"))?;
         print!("{toml}");
@@ -29,7 +29,7 @@ pub(crate) async fn run_command(client: &EngineClient, cli: &Cli) -> Result<()> 
     }
     if cli.core_get_config {
         let resp = client.get_config(false).await?;
-        let config = resp.config.unwrap_or_default();
+        let config = require_config(resp.config, "get-config")?;
         let toml = toml::to_string_pretty(&config)
             .map_err(|e| anyhow::anyhow!("failed to serialize config: {e}"))?;
         print!("{toml}");
@@ -125,18 +125,7 @@ async fn run_stations_command(
             }
             let station_name = results.stations[0].name.clone();
             let mut config = current_config(client).await?;
-            let already = config.stations.iter().any(|s| s.name == station_name);
-            if already {
-                if let Some(existing) = config.stations.iter_mut().find(|s| s.name == station_name)
-                {
-                    existing.enabled = true;
-                }
-            } else {
-                config.stations.push(weather_configure::StationConfig {
-                    name: station_name.clone(),
-                    enabled: true,
-                });
-            }
+            let already = upsert_station(&mut config, station_name.clone());
             let updated = update_config(client, config).await?;
             let message = if already {
                 format!("已启用已有站点 `{station_name}`")
@@ -147,9 +136,7 @@ async fn run_stations_command(
         }
         StationsCommand::Remove { selector } => {
             let mut config = current_config(client).await?;
-            let index = resolve_station_selector(&config.stations, selector)?;
-            let name = config.stations[index].name.clone();
-            config.stations.remove(index);
+            let name = remove_station(&mut config, selector)?;
             let updated = update_config(client, config).await?;
             output_station_change(
                 cli.format,
@@ -165,11 +152,7 @@ async fn run_stations_command(
         }
         StationsCommand::Move { from, to } => {
             let mut config = current_config(client).await?;
-            let from_index = resolve_station_selector(&config.stations, from)?;
-            let to_index = resolve_station_selector(&config.stations, to)?;
-            let name = config.stations[from_index].name.clone();
-            let station = config.stations.remove(from_index);
-            config.stations.insert(to_index, station);
+            let (name, from_index, to_index) = move_station(&mut config, from, to)?;
             let updated = update_config(client, config).await?;
             output_station_change(
                 cli.format,
@@ -191,9 +174,7 @@ async fn set_station_state(
     enabled: bool,
 ) -> Result<()> {
     let mut config = current_config(client).await?;
-    let index = resolve_station_selector(&config.stations, selector)?;
-    let name = config.stations[index].name.clone();
-    config.stations[index].enabled = enabled;
+    let name = set_station_enabled(&mut config, selector, enabled)?;
     let updated = update_config(client, config).await?;
     let action = if enabled { "已启用" } else { "已停用" };
     output_station_change(
@@ -217,29 +198,57 @@ async fn write_search_result_to_config(
     }
     let station_name = results.stations[0].name.clone();
     let mut config = current_config(client).await?;
-    if let Some(existing) = config.stations.iter_mut().find(|s| s.name == station_name) {
-        existing.enabled = true;
-    } else {
-        config.stations.push(weather_configure::StationConfig {
-            name: station_name,
-            enabled: true,
-        });
-    }
+    upsert_station(&mut config, station_name);
     update_config(client, config).await?;
     Ok(())
 }
 
-async fn current_config(client: &EngineClient) -> Result<weather_configure::AppConfig> {
+async fn current_config(client: &EngineClient) -> Result<AppConfig> {
     let resp = client.get_config(false).await?;
-    Ok(resp.config.unwrap_or_default().into())
+    require_config(resp.config, "get-config")
 }
 
-async fn update_config(
-    client: &EngineClient,
-    config: weather_configure::AppConfig,
-) -> Result<weather_schema::AppConfig> {
-    let resp = client.update_config(config.into()).await?;
-    Ok(resp.config.unwrap_or_default())
+async fn update_config(client: &EngineClient, config: AppConfig) -> Result<AppConfig> {
+    let resp = client.update_config(config).await?;
+    require_config(resp.config, "update-config")
+}
+
+fn upsert_station(config: &mut AppConfig, station_name: String) -> bool {
+    if let Some(existing) = config
+        .stations
+        .iter_mut()
+        .find(|station| station.name == station_name)
+    {
+        existing.enabled = true;
+        true
+    } else {
+        config.stations.push(StationConfig {
+            name: station_name,
+            enabled: true,
+        });
+        false
+    }
+}
+
+fn remove_station(config: &mut AppConfig, selector: &str) -> Result<String> {
+    let index = resolve_station_selector(&config.stations, selector)?;
+    Ok(config.stations.remove(index).name)
+}
+
+fn move_station(config: &mut AppConfig, from: &str, to: &str) -> Result<(String, usize, usize)> {
+    let from_index = resolve_station_selector(&config.stations, from)?;
+    let to_index = resolve_station_selector(&config.stations, to)?;
+    let station = config.stations.remove(from_index);
+    let name = station.name.clone();
+    config.stations.insert(to_index, station);
+    Ok((name, from_index, to_index))
+}
+
+fn set_station_enabled(config: &mut AppConfig, selector: &str, enabled: bool) -> Result<String> {
+    let index = resolve_station_selector(&config.stations, selector)?;
+    let station = &mut config.stations[index];
+    station.enabled = enabled;
+    Ok(station.name.clone())
 }
 
 async fn run_weather(client: &EngineClient, cli: &Cli) -> Result<()> {
@@ -328,10 +337,7 @@ fn output_station_change(
     })
 }
 
-fn resolve_station_selector(
-    stations: &[weather_configure::StationConfig],
-    selector: &str,
-) -> Result<usize> {
+fn resolve_station_selector(stations: &[StationConfig], selector: &str) -> Result<usize> {
     if let Ok(index) = selector.parse::<usize>() {
         if index == 0 || index > stations.len() {
             bail!("station index {index} is out of range");
@@ -362,4 +368,102 @@ fn output<T: Serialize>(
         OutputFormat::Tui => println!("{}", tui()),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wire_config() -> AppConfig {
+        AppConfig {
+            engine: Some(EngineConfig {
+                request_timeout_ms: 111,
+                startup_timeout_ms: 222,
+                lock_path: "custom-engine.lock".to_string(),
+            }),
+            ipc: Some(IpcConfig {
+                transport: "tcp".to_string(),
+                rpc_endpoint: "tcp://example:3001".to_string(),
+                pub_endpoint: "tcp://example:3002".to_string(),
+                hmac: "disabled".to_string(),
+                hmac_key: "wire-key".to_string(),
+                hmac_env_key_name: "WIRE_KEY".to_string(),
+            }),
+            db: Some(DbConfig {
+                path: "custom.sqlite3".to_string(),
+                lock_path: "custom.sqlite3.lock".to_string(),
+                timezone: "UTC".to_string(),
+            }),
+            updater: Some(UpdaterConfig {
+                weather_ttl_seconds: 333,
+                province_ttl_seconds: 444,
+                default_provider: "custom".to_string(),
+                provider: vec![ProviderConfig {
+                    name: "custom".to_string(),
+                    base_url: "https://example.invalid".to_string(),
+                    request_timeout_seconds: 555,
+                }],
+            }),
+            daemon: Some(DaemonConfig {
+                service_backend: "custom".to_string(),
+                foreground: false,
+                service_scope: "system".to_string(),
+            }),
+            stations: vec![
+                StationConfig {
+                    name: "first".to_string(),
+                    enabled: false,
+                },
+                StationConfig {
+                    name: "second".to_string(),
+                    enabled: true,
+                },
+            ],
+            config_version: 77,
+        }
+    }
+
+    fn without_stations(mut config: AppConfig) -> AppConfig {
+        config.stations.clear();
+        config
+    }
+
+    #[test]
+    fn station_upsert_preserves_every_non_station_wire_field() {
+        let mut config = wire_config();
+        let original = without_stations(config.clone());
+
+        assert!(upsert_station(&mut config, "first".to_string()));
+        assert!(!upsert_station(&mut config, "third".to_string()));
+
+        assert_eq!(without_stations(config.clone()), original);
+        assert!(config.stations[0].enabled);
+        assert_eq!(config.stations[2].name, "third");
+        assert!(config.stations[2].enabled);
+    }
+
+    #[test]
+    fn station_edits_preserve_every_non_station_wire_field() {
+        let mut config = wire_config();
+        let original = without_stations(config.clone());
+
+        assert_eq!(
+            set_station_enabled(&mut config, "2", false).unwrap(),
+            "second"
+        );
+        assert_eq!(
+            move_station(&mut config, "2", "1").unwrap(),
+            ("second".to_string(), 1, 0)
+        );
+        assert_eq!(remove_station(&mut config, "first").unwrap(), "first");
+
+        assert_eq!(without_stations(config.clone()), original);
+        assert_eq!(
+            config.stations,
+            vec![StationConfig {
+                name: "second".to_string(),
+                enabled: false,
+            }]
+        );
+    }
 }

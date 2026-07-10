@@ -20,7 +20,7 @@ use weather_schema::*;
 
 use crate::{
     cli::Cli,
-    client::{EngineClient, EngineEvent},
+    client::{EngineClient, EngineEvent, require_config},
     terminal::TerminalGuard,
     util::{degrees, hectopascal, meter_per_second, mm, percent, text, wind_summary},
 };
@@ -192,7 +192,7 @@ impl TuiApp {
     }
 
     async fn load(client: &EngineClient) -> Result<Self> {
-        let config = client.get_config(false).await?.config.unwrap_or_default();
+        let config = require_config(client.get_config(false).await?.config, "get-config")?;
         let stations = configured_stations(&config);
         let about_status = client.status().await.ok();
         let selected_station = normalize_station_selection(&stations, &HashSet::new(), None);
