@@ -1,10 +1,10 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashSet, VecDeque},
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use prost::Message as _;
 use ratatui::{
     Frame,
@@ -15,7 +15,7 @@ use ratatui::{
         Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap,
     },
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use weather_schema::*;
 
 use crate::{
@@ -25,66 +25,84 @@ use crate::{
     util::{degrees, hectopascal, meter_per_second, mm, percent, text, wind_summary},
 };
 
+mod effects;
+mod input;
+mod state;
+mod view;
+
+use self::{
+    effects::{Effect, EffectResult, EffectRunner},
+    input::TerminalInput,
+    state::{
+        InputMode, MoveDraft, PanelFocus, SearchIntent, SearchState, SearchStatus,
+        move_station_selection, moved_index, normalize_station_selection,
+    },
+};
+
 const EVENT_TICK: Duration = Duration::from_millis(200);
 const WEATHER_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const SEARCH_PAGE_SIZE: u32 = 12;
 const MAX_LOG_LINES: usize = 64;
 
 pub(crate) async fn run_interactive(client: &EngineClient, _cli: &Cli) -> Result<()> {
-    let mut terminal = TerminalGuard::new()?;
     let mut app = TuiApp::load(client).await?;
-    app.refresh_weather_or_log(client, false).await;
+    let mut terminal = TerminalGuard::new()?;
     let mut events = client.subscribe_events();
-
-    let (search_append_tx, mut search_append_rx) = mpsc::channel::<SearchAppend>(32);
-
-    loop {
-        app.drain_events(&mut events);
-        while let Ok(append) = search_append_rx.try_recv() {
-            app.apply_search_append(append);
-        }
-        app.refresh_weather_if_due(client).await.ok();
-        terminal.draw(|frame| draw(frame, &mut app))?;
-        if event::poll(EVENT_TICK)? {
-            let Event::Key(key) = event::read()? else {
-                continue;
-            };
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            // Ctrl+C 等同 q:触发 TUI 退出(foreground engine 由 main.rs 发 shutdown RPC)。
-            if key.code == KeyCode::Char('c')
-                && key
-                    .modifiers
-                    .contains(crossterm::event::KeyModifiers::CONTROL)
-            {
-                break;
-            }
-            if app.handle_key(client, key.code, &search_append_tx).await? {
-                break;
-            }
-        }
+    let (input, mut input_events) = TerminalInput::spawn();
+    let (mut effects, mut effect_results) = EffectRunner::new(client.clone());
+    if let Some(effect) = app.request_selected_weather(false) {
+        effects.dispatch(effect);
     }
-    Ok(())
-}
+    let mut tick = tokio::time::interval(EVENT_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut exiting = false;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InputMode {
-    Normal,
-    Manage,
-    ManageMove,
-    ManageAddSearch,
-    ManageBrowseSearch,
-    About,
-}
+    let run_result = async {
+        while !exiting {
+            terminal.draw(|frame| view::render(frame, &mut app))?;
+            let pending_effects = tokio::select! {
+                input = input_events.recv() => match input {
+                    Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                        let (exit, effects) = app.reduce_key(key);
+                        exiting = exit;
+                        effects
+                    }
+                    Some(Ok(_)) => Vec::new(),
+                    Some(Err(error)) => {
+                        return Err(anyhow::anyhow!("terminal input failed: {error}"));
+                    }
+                    None => return Err(anyhow::anyhow!("terminal input task stopped")),
+                },
+                result = effect_results.recv() => match result {
+                    Some(result) => app.apply_effect_result(result),
+                    None => return Err(anyhow::anyhow!("TUI effect result channel stopped")),
+                },
+                event = events.recv() => {
+                    match event {
+                        Ok(event) => app.apply_engine_event(event),
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            app.push_log(format!("engine events lagged by {skipped}"));
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            return Err(anyhow::anyhow!("engine event stream closed"));
+                        }
+                    }
+                    Vec::new()
+                },
+                _ = tick.tick() => app.tick(),
+            };
+            for effect in pending_effects {
+                effects.dispatch(effect);
+            }
+            effects.reap_completed();
+        }
+        Ok(())
+    }
+    .await;
 
-/// Normal 模式下 Tab 切换的主界面面板焦点。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PanelFocus {
-    Stations,
-    Current,
-    Forecast,
-    Alert,
+    input.stop().await;
+    effects.shutdown().await;
+    run_result
 }
 
 impl PanelFocus {
@@ -117,19 +135,16 @@ impl PanelFocus {
     }
 }
 
-/// 后台分页搜索追加任务回传给主循环的消息。
-struct SearchAppend {
-    generation: u64,
-    stations: Vec<StationRef>,
-    has_more: bool,
-    next_offset: u32,
-    finished: bool,
+struct PendingConfig {
+    token: u64,
+    message: String,
+    select_name: Option<String>,
 }
 
 struct TuiApp {
     config: weather_schema::AppConfig,
     stations: Vec<ConfiguredStation>,
-    selected_station: usize,
+    selected_station: Option<usize>,
     snapshot: Option<WeatherSnapshot>,
     mode: InputMode,
     focus: PanelFocus,
@@ -138,17 +153,15 @@ struct TuiApp {
     logs: VecDeque<String>,
     last_weather_refresh: Option<Instant>,
     manage_selected: usize,
-    manage_move_from: Option<usize>,
-    hidden_stations: HashMap<String, bool>,
+    move_draft: Option<MoveDraft>,
+    hidden_stations: HashSet<String>,
     preview_snapshot: Option<WeatherSnapshot>,
-    search_query: String,
-    search_results: Vec<StationRef>,
-    selected_result: usize,
-    search_has_more: bool,
-    search_next_offset: u32,
-    search_loading: bool,
-    search_generation: u64,
+    search: SearchState,
     about_status: Option<EngineStatus>,
+    weather_token: u64,
+    weather_pending: bool,
+    config_token: u64,
+    pending_config: Option<PendingConfig>,
 }
 
 impl TuiApp {
@@ -157,7 +170,7 @@ impl TuiApp {
         Self {
             config: weather_schema::AppConfig::default(),
             stations: Vec::new(),
-            selected_station: 0,
+            selected_station: None,
             snapshot: None,
             mode: InputMode::Normal,
             focus: PanelFocus::Stations,
@@ -166,35 +179,27 @@ impl TuiApp {
             logs: VecDeque::from(["ready".to_string()]),
             last_weather_refresh: None,
             manage_selected: 0,
-            manage_move_from: None,
-            hidden_stations: HashMap::new(),
+            move_draft: None,
+            hidden_stations: HashSet::new(),
             preview_snapshot: None,
-            search_query: String::new(),
-            search_results: Vec::new(),
-            selected_result: 0,
-            search_has_more: false,
-            search_next_offset: 0,
-            search_loading: false,
-            search_generation: 0,
+            search: SearchState::default(),
             about_status: None,
+            weather_token: 0,
+            weather_pending: false,
+            config_token: 0,
+            pending_config: None,
         }
     }
 
     async fn load(client: &EngineClient) -> Result<Self> {
         let config = client.get_config(false).await?.config.unwrap_or_default();
-        let stations = config
-            .stations
-            .iter()
-            .map(|s| ConfiguredStation {
-                name: s.name.clone(),
-                enabled: s.enabled,
-            })
-            .collect::<Vec<_>>();
+        let stations = configured_stations(&config);
         let about_status = client.status().await.ok();
+        let selected_station = normalize_station_selection(&stations, &HashSet::new(), None);
         Ok(Self {
             config,
             stations,
-            selected_station: 0,
+            selected_station,
             snapshot: None,
             mode: InputMode::Normal,
             focus: PanelFocus::Stations,
@@ -203,41 +208,42 @@ impl TuiApp {
             logs: VecDeque::from(["ready".to_string()]),
             last_weather_refresh: None,
             manage_selected: 0,
-            manage_move_from: None,
-            hidden_stations: HashMap::new(),
+            move_draft: None,
+            hidden_stations: HashSet::new(),
             preview_snapshot: None,
-            search_query: String::new(),
-            search_results: Vec::new(),
-            selected_result: 0,
-            search_has_more: false,
-            search_next_offset: 0,
-            search_loading: false,
-            search_generation: 0,
+            search: SearchState::default(),
             about_status,
+            weather_token: 0,
+            weather_pending: false,
+            config_token: 0,
+            pending_config: None,
         })
     }
 
-    async fn handle_key(
-        &mut self,
-        client: &EngineClient,
-        code: KeyCode,
-        search_append_tx: &mpsc::Sender<SearchAppend>,
-    ) -> Result<bool> {
+    fn reduce_key(&mut self, key: KeyEvent) -> (bool, Vec<Effect>) {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return (true, Vec::new());
+        }
         match self.mode {
-            InputMode::Normal => self.handle_normal_key(client, code).await,
-            InputMode::Manage => self.handle_manage_key(client, code).await,
-            InputMode::ManageMove => self.handle_move_key(client, code).await,
+            InputMode::Normal => self.handle_normal_key(key.code),
+            InputMode::Manage => self.handle_manage_key(key.code),
+            InputMode::ManageMove => self.handle_move_key(key.code),
             InputMode::ManageAddSearch | InputMode::ManageBrowseSearch => {
-                self.handle_search_key(client, code, search_append_tx).await
+                self.handle_search_key(key)
             }
-            InputMode::About => self.handle_about_key(client, code).await,
+            InputMode::About => self.handle_about_key(key.code),
         }
     }
 
-    async fn handle_normal_key(&mut self, client: &EngineClient, code: KeyCode) -> Result<bool> {
+    fn handle_normal_key(&mut self, code: KeyCode) -> (bool, Vec<Effect>) {
+        let mut effects = Vec::new();
         match code {
-            KeyCode::Char('q') => return Ok(true),
-            KeyCode::Char('r') => self.refresh_weather_or_log(client, true).await,
+            KeyCode::Char('q') => return (true, effects),
+            KeyCode::Char('r') => {
+                if let Some(effect) = self.request_selected_weather(true) {
+                    effects.push(effect);
+                }
+            }
             KeyCode::Tab => {
                 self.focus = self.focus.next(self);
                 self.push_log(format!("focus: {:?}", self.focus));
@@ -249,8 +255,10 @@ impl TuiApp {
             }
             KeyCode::Char('j') | KeyCode::Down => match self.focus {
                 PanelFocus::Stations => {
-                    if self.select_station(1) {
-                        self.refresh_weather_or_log(client, false).await;
+                    if self.select_station(1)
+                        && let Some(effect) = self.request_selected_weather(false)
+                    {
+                        effects.push(effect);
                     }
                 }
                 PanelFocus::Forecast => {
@@ -263,8 +271,10 @@ impl TuiApp {
             },
             KeyCode::Char('k') | KeyCode::Up => match self.focus {
                 PanelFocus::Stations => {
-                    if self.select_station(-1) {
-                        self.refresh_weather_or_log(client, false).await;
+                    if self.select_station(-1)
+                        && let Some(effect) = self.request_selected_weather(false)
+                    {
+                        effects.push(effect);
                     }
                 }
                 PanelFocus::Forecast => {
@@ -285,44 +295,42 @@ impl TuiApp {
                 self.mode = InputMode::Manage;
                 self.manage_selected = self
                     .selected_station
+                    .unwrap_or_default()
                     .min(self.config.stations.len().saturating_sub(1));
                 self.push_log("manage mode");
             }
             KeyCode::Char('?') => {
-                if let Err(err) = self.refresh_about(client).await {
-                    self.push_log(format!("about refresh failed: {err}"));
-                }
                 self.mode = InputMode::About;
+                effects.push(Effect::LoadAbout);
             }
             _ => {}
         }
-        Ok(false)
+        (false, effects)
     }
 
-    async fn handle_about_key(&mut self, client: &EngineClient, code: KeyCode) -> Result<bool> {
+    fn handle_about_key(&mut self, code: KeyCode) -> (bool, Vec<Effect>) {
         match code {
-            KeyCode::Char('r') => {
-                if let Err(err) = self.refresh_about(client).await {
-                    self.push_log(format!("about refresh failed: {err}"));
-                }
-            }
+            KeyCode::Char('r') => return (false, vec![Effect::LoadAbout]),
             _ => {
                 self.mode = InputMode::Normal;
             }
         }
-        Ok(false)
+        (false, Vec::new())
     }
 
-    async fn refresh_about(&mut self, client: &EngineClient) -> Result<()> {
-        self.about_status = Some(client.status().await?);
-        Ok(())
-    }
-
-    async fn handle_manage_key(&mut self, client: &EngineClient, code: KeyCode) -> Result<bool> {
+    fn handle_manage_key(&mut self, code: KeyCode) -> (bool, Vec<Effect>) {
+        let mut effects = Vec::new();
         match code {
             KeyCode::Esc => {
                 self.mode = InputMode::Normal;
+                let previous = self.selected_station;
+                self.normalize_selected_station();
                 self.push_log("manage closed");
+                if self.selected_station != previous
+                    && let Some(effect) = self.request_selected_weather(false)
+                {
+                    effects.push(effect);
+                }
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 self.manage_selected =
@@ -332,28 +340,47 @@ impl TuiApp {
                 self.manage_selected =
                     moved_index(self.manage_selected, self.config.stations.len(), -1);
             }
-            KeyCode::Char(' ') => self.toggle_selected(client).await?,
-            KeyCode::Char('d') => self.delete_selected(client).await?,
+            KeyCode::Char(' ') => {
+                if let Some(effect) = self.toggle_selected() {
+                    effects.push(effect);
+                }
+            }
+            KeyCode::Char('d') => {
+                if let Some(effect) = self.delete_selected() {
+                    effects.push(effect);
+                }
+            }
             KeyCode::Char('a') => self.enter_search(InputMode::ManageAddSearch),
             KeyCode::Char('s') => self.enter_search(InputMode::ManageBrowseSearch),
             KeyCode::Char('M') => {
-                if !self.config.stations.is_empty() {
-                    self.manage_move_from = Some(self.manage_selected);
+                if self.pending_config.is_some() {
+                    self.push_log("configuration update already in progress");
+                    return (false, effects);
+                }
+                if let Some(draft) = MoveDraft::new(&self.config.stations, self.manage_selected) {
+                    self.move_draft = Some(draft);
                     self.mode = InputMode::ManageMove;
                     self.push_log("move mode: j/k to move, Enter to confirm");
                 }
             }
             KeyCode::Char('h') => {
                 let Some(station) = self.config.stations.get(self.manage_selected) else {
-                    return Ok(false);
+                    return (false, effects);
                 };
                 let name = station.name.clone();
-                let hidden = self.hidden_stations.get(&name).copied().unwrap_or(false);
-                let new_hidden = !hidden;
-                if new_hidden {
-                    self.hidden_stations.insert(name.clone(), true);
-                } else {
+                let previous = self.selected_station;
+                let new_hidden = if self.hidden_stations.contains(&name) {
                     self.hidden_stations.remove(&name);
+                    false
+                } else {
+                    self.hidden_stations.insert(name.clone());
+                    true
+                };
+                self.normalize_selected_station();
+                if self.selected_station != previous
+                    && let Some(effect) = self.request_selected_weather(false)
+                {
+                    effects.push(effect);
                 }
                 self.push_log(if new_hidden {
                     format!("hid {name}")
@@ -363,112 +390,120 @@ impl TuiApp {
             }
             _ => {}
         }
-        Ok(false)
+        (false, effects)
     }
 
-    async fn handle_move_key(&mut self, client: &EngineClient, code: KeyCode) -> Result<bool> {
-        let Some(from) = self.manage_move_from else {
+    fn handle_move_key(&mut self, code: KeyCode) -> (bool, Vec<Effect>) {
+        let Some(draft) = self.move_draft.as_mut() else {
             self.mode = InputMode::Manage;
-            return Ok(false);
+            return (false, Vec::new());
         };
         match code {
             KeyCode::Esc => {
-                self.manage_move_from = None;
+                self.manage_selected = draft.origin;
+                self.move_draft = None;
                 self.mode = InputMode::Manage;
                 self.push_log("move cancelled");
             }
             KeyCode::Enter => {
-                let _ = from;
+                let selected_name = draft
+                    .stations
+                    .get(draft.selected)
+                    .map(|station| station.name.clone());
+                let mut candidate = self.config.clone();
+                candidate.stations = draft.stations.clone();
+                self.manage_selected = draft.selected;
+                self.move_draft = None;
                 self.mode = InputMode::Manage;
-                self.persist_stations_order(client).await?;
-                self.push_log("move confirmed");
+                let effect = self.begin_config_update(
+                    candidate,
+                    "move confirmed".to_string(),
+                    selected_name,
+                );
+                return (false, effect.into_iter().collect());
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                self.swap_move_target(from, 1);
+                draft.move_by(1);
+                self.manage_selected = draft.selected;
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.swap_move_target(from, -1);
+                draft.move_by(-1);
+                self.manage_selected = draft.selected;
             }
             _ => {}
         }
-        Ok(false)
+        (false, Vec::new())
     }
 
-    async fn handle_search_key(
-        &mut self,
-        client: &EngineClient,
-        code: KeyCode,
-        search_append_tx: &mpsc::Sender<SearchAppend>,
-    ) -> Result<bool> {
-        match code {
-            KeyCode::Esc => {
+    fn handle_search_key(&mut self, key: KeyEvent) -> (bool, Vec<Effect>) {
+        let intent = self.search.handle_key(key);
+        match intent {
+            SearchIntent::Exit => {
                 self.exit_search_to_manage();
+                (false, vec![Effect::CancelSearch])
             }
-            KeyCode::Enter => {
-                self.search_first_page(client).await?;
-                self.spawn_remaining_pages(client.clone(), search_append_tx.clone());
+            SearchIntent::Submit => {
+                let (token, query) = self.search.start();
+                self.preview_snapshot = None;
+                (false, vec![Effect::Search { token, query }])
             }
-            KeyCode::Backspace => {
-                self.search_query.pop();
+            SearchIntent::QueryChanged => {
+                self.preview_snapshot = None;
+                (false, vec![Effect::CancelSearch])
             }
-            KeyCode::Char('a') if !self.search_results.is_empty() => {
+            SearchIntent::Action => {
+                let Some(station) = self.search.selected_result().cloned() else {
+                    self.push_log("no selected search result");
+                    return (false, Vec::new());
+                };
                 if self.mode == InputMode::ManageAddSearch {
-                    self.add_selected_result(client).await?;
+                    let effect = self.add_selected_result(station);
+                    let mut effects = vec![Effect::CancelSearch];
+                    effects.extend(effect);
+                    (false, effects)
                 } else {
-                    self.preview_selected(client).await?;
+                    (
+                        false,
+                        vec![Effect::Preview {
+                            token: self.search.token(),
+                            station,
+                        }],
+                    )
                 }
             }
-            KeyCode::Down => self.select_result(1),
-            KeyCode::Up => self.select_result(-1),
-            KeyCode::Char(ch) => self.search_query.push(ch),
-            _ => {}
+            SearchIntent::None => (false, Vec::new()),
         }
-        Ok(false)
     }
 
     fn enter_search(&mut self, mode: InputMode) {
         self.mode = mode;
-        self.search_query.clear();
-        self.search_results.clear();
-        self.selected_result = 0;
-        self.search_has_more = false;
-        self.search_next_offset = 0;
-        self.search_loading = false;
-        self.search_generation = self.search_generation.wrapping_add(1);
+        self.search.enter();
         self.preview_snapshot = None;
         self.push_log(match mode {
-            InputMode::ManageAddSearch => "add search: type query, Enter to search, a to add",
+            InputMode::ManageAddSearch => "add search: type query, Enter to search, Ctrl+A to add",
             InputMode::ManageBrowseSearch => {
-                "browse search: type query, Enter to search, a to preview"
+                "browse search: type query, Enter to search, Ctrl+A to preview"
             }
             _ => "",
         });
     }
 
     fn exit_search_to_manage(&mut self) {
+        self.search.cancel_and_clear();
         self.mode = InputMode::Manage;
         self.preview_snapshot = None;
         self.push_log("search closed");
     }
 
     fn select_station(&mut self, delta: isize) -> bool {
-        let len = self.stations.len();
-        if len == 0 {
-            return false;
-        }
-        let original = self.selected_station.min(len - 1);
-        let mut next = original;
-        for _ in 0..len {
-            next = moved_index(next, len, delta);
-            if next == original {
-                break;
-            }
-            let name = &self.stations[next].name;
-            if !self.hidden_stations.get(name).copied().unwrap_or(false) {
-                break;
-            }
-        }
-        if next == original {
+        self.normalize_selected_station();
+        let next = move_station_selection(
+            &self.stations,
+            &self.hidden_stations,
+            self.selected_station,
+            delta,
+        );
+        if next == self.selected_station {
             return false;
         }
         self.selected_station = next;
@@ -494,304 +529,264 @@ impl TuiApp {
             .min(len - 1);
     }
 
-    fn select_result(&mut self, delta: isize) {
-        self.selected_result = moved_index(self.selected_result, self.search_results.len(), delta);
-    }
-
-    async fn refresh_weather(&mut self, client: &EngineClient, refresh: bool) -> Result<()> {
-        let Some(station) = self.stations.get(self.selected_station) else {
-            self.push_log("no configured stations");
-            return Ok(());
-        };
-        let name = station.name.clone();
-        let resp = client
-            .request::<ResolveStationUuidRequest, ResolveStationUuidResponse>(
-                RpcKind::ResolveStationUuid,
-                ResolveStationUuidRequest { name: name.clone() },
-            )
-            .await?;
-        let unified_uuid = resp.unified_uuid;
-        let snapshot = client
-            .request::<GetWeatherRequest, WeatherSnapshot>(
-                RpcKind::GetWeather,
-                GetWeatherRequest {
-                    unified_uuid,
-                    refresh,
-                    include_debug: false,
-                },
-            )
-            .await?;
-        self.snapshot = Some(snapshot);
-        if self.focus.hidden(self) {
-            self.focus = PanelFocus::Stations;
-        }
-        self.last_weather_refresh = Some(Instant::now());
-        self.push_log(format!("loaded {name}"));
-        Ok(())
-    }
-
-    async fn refresh_weather_or_log(&mut self, client: &EngineClient, refresh: bool) {
-        if let Err(err) = self.refresh_weather(client, refresh).await {
-            self.last_weather_refresh = Some(Instant::now());
-            self.record_weather_refresh_error(err);
-        }
-    }
-
     fn record_weather_refresh_error(&mut self, err: impl std::fmt::Display) {
         self.push_log(format!("refresh failed: {err}"));
     }
 
-    async fn toggle_selected(&mut self, client: &EngineClient) -> Result<()> {
-        let Some(station) = self.config.stations.get_mut(self.manage_selected) else {
-            return Ok(());
-        };
-        station.enabled = !station.enabled;
-        let new_enabled = station.enabled;
+    fn toggle_selected(&mut self) -> Option<Effect> {
+        let station = self.config.stations.get(self.manage_selected)?;
+        let mut candidate = self.config.clone();
+        candidate.stations[self.manage_selected].enabled = !station.enabled;
+        let new_enabled = !station.enabled;
         let name = station.name.clone();
-        self.apply_update_config(client).await?;
-        self.push_log(format!(
-            "{} {name}",
-            if new_enabled { "enabled" } else { "disabled" }
-        ));
-        Ok(())
+        self.begin_config_update(
+            candidate,
+            format!(
+                "{} {name}",
+                if new_enabled { "enabled" } else { "disabled" }
+            ),
+            Some(name),
+        )
     }
 
-    async fn delete_selected(&mut self, client: &EngineClient) -> Result<()> {
+    fn delete_selected(&mut self) -> Option<Effect> {
         if self.config.stations.is_empty() {
-            return Ok(());
+            return None;
         }
-        let name = self
-            .config
+        let mut candidate = self.config.clone();
+        let name = candidate.stations.remove(self.manage_selected).name;
+        let select_name = candidate
             .stations
-            .get(self.manage_selected)
-            .map(|s| s.name.clone())
-            .unwrap_or_default();
-        self.config.stations.remove(self.manage_selected);
-        if self.manage_selected >= self.config.stations.len() {
-            self.manage_selected = self.config.stations.len().saturating_sub(1);
-        }
-        self.apply_update_config(client).await?;
-        self.push_log(format!("removed {name}"));
-        Ok(())
+            .get(
+                self.manage_selected
+                    .min(candidate.stations.len().saturating_sub(1)),
+            )
+            .map(|station| station.name.clone());
+        self.begin_config_update(candidate, format!("removed {name}"), select_name)
     }
 
-    async fn add_selected_result(&mut self, client: &EngineClient) -> Result<()> {
-        let Some(station) = self.search_results.get(self.selected_result) else {
-            self.push_log("no selected search result");
-            return Ok(());
-        };
+    fn add_selected_result(&mut self, station: StationRef) -> Option<Effect> {
         let name = station.name.clone();
-        let already = self.config.stations.iter().any(|s| s.name == name);
-        if already {
-            if let Some(existing) = self.config.stations.iter_mut().find(|s| s.name == name) {
+        let mut candidate = self.config.clone();
+        let already = candidate.stations.iter().any(|item| item.name == name);
+        let message = if already {
+            if let Some(existing) = candidate.stations.iter_mut().find(|item| item.name == name) {
                 existing.enabled = true;
             }
-            self.apply_update_config(client).await?;
-            self.push_log(format!("enabled existing {name}"));
+            format!("enabled existing {name}")
         } else {
-            self.config.stations.push(StationConfig {
+            candidate.stations.push(StationConfig {
                 name: name.clone(),
                 enabled: true,
             });
-            self.apply_update_config(client).await?;
-            self.manage_selected = self.config.stations.len() - 1;
-            self.push_log(format!("added {name}"));
-        }
+            format!("added {name}")
+        };
         self.exit_search_to_manage();
-        Ok(())
+        self.begin_config_update(candidate, message, Some(name))
     }
 
-    async fn preview_selected(&mut self, client: &EngineClient) -> Result<()> {
-        let Some(station) = self.search_results.get(self.selected_result) else {
-            return Ok(());
-        };
-        let unified_uuid = if station.unified_uuid.is_empty() {
-            client
-                .resolve_station_uuid(&station.name)
-                .await?
-                .unified_uuid
-        } else {
-            station.unified_uuid.clone()
-        };
-        match client
-            .request::<GetWeatherRequest, WeatherSnapshot>(
-                RpcKind::GetWeather,
-                GetWeatherRequest {
-                    unified_uuid,
-                    refresh: false,
-                    include_debug: false,
-                },
-            )
-            .await
-        {
-            Ok(snapshot) => {
-                self.preview_snapshot = Some(snapshot);
-                self.push_log(format!("preview {}", station.name));
-            }
-            Err(err) => {
-                self.push_log(format!("preview failed: {err}"));
-            }
+    fn begin_config_update(
+        &mut self,
+        config: AppConfig,
+        message: String,
+        select_name: Option<String>,
+    ) -> Option<Effect> {
+        if self.pending_config.is_some() {
+            self.push_log("configuration update already in progress");
+            return None;
         }
-        Ok(())
-    }
-
-    fn swap_move_target(&mut self, from: usize, delta: isize) {
-        let len = self.config.stations.len();
-        if len < 2 {
-            return;
-        }
-        let to = moved_index(self.manage_selected, len, delta);
-        if to == self.manage_selected {
-            return;
-        }
-        self.config.stations.swap(self.manage_selected, to);
-        self.manage_selected = to;
-        let _ = from;
-    }
-
-    async fn persist_stations_order(&mut self, client: &EngineClient) -> Result<()> {
-        self.manage_move_from = None;
-        self.apply_update_config(client).await?;
-        Ok(())
-    }
-
-    /// 把本地 `self.config` 下发给 engine,用返回的最终值回填本地状态。
-    async fn apply_update_config(&mut self, client: &EngineClient) -> Result<()> {
-        let resp = client.update_config(self.config.clone()).await?;
-        self.config = resp.config.unwrap_or_default();
-        self.stations = self
-            .config
-            .stations
-            .iter()
-            .map(|s| ConfiguredStation {
-                name: s.name.clone(),
-                enabled: s.enabled,
-            })
-            .collect();
-        if self.selected_station >= self.stations.len() {
-            self.selected_station = self.stations.len().saturating_sub(1);
-        }
-        if self.manage_selected >= self.config.stations.len() {
-            self.manage_selected = self.config.stations.len().saturating_sub(1);
-        }
-        Ok(())
-    }
-
-    /// 第 1 页已同步加载。若有更多页，spawn 后台任务依次请求并通过 channel 回传。
-    fn spawn_remaining_pages(
-        &self,
-        client: EngineClient,
-        search_append_tx: mpsc::Sender<SearchAppend>,
-    ) {
-        if !self.search_has_more {
-            return;
-        }
-        let query = self.search_query.clone();
-        let mut next_offset = self.search_next_offset;
-        let generation = self.search_generation;
-        tokio::spawn(async move {
-            loop {
-                let result = client
-                    .request::<FuzzyMatchStationsRequest, FuzzyMatchStationsResponse>(
-                        RpcKind::FuzzyMatchStations,
-                        FuzzyMatchStationsRequest {
-                            query: query.clone(),
-                            province: None,
-                            page_offset: next_offset,
-                            page_size: SEARCH_PAGE_SIZE,
-                        },
-                    )
-                    .await;
-                let Ok(resp) = result else {
-                    let _ = search_append_tx
-                        .send(SearchAppend {
-                            generation,
-                            stations: Vec::new(),
-                            has_more: false,
-                            next_offset,
-                            finished: true,
-                        })
-                        .await;
-                    return;
-                };
-                let has_more = resp.has_more;
-                next_offset = resp.next_offset;
-                let finished = !has_more;
-                if search_append_tx
-                    .send(SearchAppend {
-                        generation,
-                        stations: resp.stations,
-                        has_more,
-                        next_offset,
-                        finished,
-                    })
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-                if finished {
-                    return;
-                }
-            }
+        self.config_token = self
+            .config_token
+            .checked_add(1)
+            .expect("TUI config token exhausted");
+        let token = self.config_token;
+        self.pending_config = Some(PendingConfig {
+            token,
+            message,
+            select_name,
         });
+        Some(Effect::UpdateConfig {
+            token,
+            config: Box::new(config),
+        })
     }
 
-    async fn search_first_page(&mut self, client: &EngineClient) -> Result<()> {
-        self.search_generation = self.search_generation.wrapping_add(1);
-        self.search_results.clear();
-        self.selected_result = 0;
-        self.search_next_offset = 0;
-        self.search_has_more = false;
-        self.search_loading = true;
-        self.search_next_page(client).await?;
-        Ok(())
+    fn request_selected_weather(&mut self, refresh: bool) -> Option<Effect> {
+        self.normalize_selected_station();
+        let Some(index) = self.selected_station else {
+            self.snapshot = None;
+            self.weather_pending = false;
+            self.last_weather_refresh = Some(Instant::now());
+            self.push_log("no enabled visible stations");
+            return None;
+        };
+        let name = self.stations.get(index)?.name.clone();
+        self.weather_token = self
+            .weather_token
+            .checked_add(1)
+            .expect("TUI weather token exhausted");
+        self.weather_pending = true;
+        Some(Effect::LoadWeather {
+            token: self.weather_token,
+            name,
+            unified_uuid: None,
+            refresh,
+        })
     }
 
-    async fn search_next_page(&mut self, client: &EngineClient) -> Result<()> {
-        let results = client
-            .request::<FuzzyMatchStationsRequest, FuzzyMatchStationsResponse>(
-                RpcKind::FuzzyMatchStations,
-                FuzzyMatchStationsRequest {
-                    query: self.search_query.clone(),
-                    province: None,
-                    page_offset: self.search_next_offset,
-                    page_size: SEARCH_PAGE_SIZE,
-                },
-            )
-            .await?;
-        append_unique_stations(&mut self.search_results, results.stations);
-        self.search_has_more = results.has_more;
-        self.search_next_offset = results.next_offset;
-        if self.selected_result >= self.search_results.len() && !self.search_results.is_empty() {
-            self.selected_result = self.search_results.len() - 1;
-        }
-        Ok(())
-    }
-
-    fn apply_search_append(&mut self, append: SearchAppend) {
-        if append.generation != self.search_generation {
-            return;
-        }
-        append_unique_stations(&mut self.search_results, append.stations);
-        self.search_has_more = append.has_more;
-        self.search_next_offset = append.next_offset;
-        if self.selected_result >= self.search_results.len() && !self.search_results.is_empty() {
-            self.selected_result = self.search_results.len() - 1;
-        }
-        if append.finished {
-            self.search_loading = false;
-        }
-    }
-
-    async fn refresh_weather_if_due(&mut self, client: &EngineClient) -> Result<()> {
+    fn tick(&mut self) -> Vec<Effect> {
         let due = self
             .last_weather_refresh
             .is_none_or(|last| last.elapsed() >= WEATHER_REFRESH_INTERVAL);
-        if due {
-            self.refresh_weather_or_log(client, false).await;
+        if due
+            && !self.weather_pending
+            && let Some(effect) = self.request_selected_weather(false)
+        {
+            return vec![effect];
         }
-        Ok(())
+        Vec::new()
+    }
+
+    fn normalize_selected_station(&mut self) {
+        self.selected_station = normalize_station_selection(
+            &self.stations,
+            &self.hidden_stations,
+            self.selected_station,
+        );
+    }
+
+    fn apply_effect_result(&mut self, result: EffectResult) -> Vec<Effect> {
+        match result {
+            EffectResult::SearchPage(page) => {
+                self.search.apply_page(page);
+            }
+            EffectResult::SearchFailed { token, message } => {
+                if self.search.apply_error(token, message.clone()) {
+                    self.push_log(format!("search failed: {message}"));
+                }
+            }
+            EffectResult::Weather {
+                token,
+                name,
+                result,
+            } => {
+                if token != self.weather_token {
+                    return Vec::new();
+                }
+                self.weather_pending = false;
+                self.last_weather_refresh = Some(Instant::now());
+                match result {
+                    Ok(snapshot) => {
+                        self.snapshot = Some(snapshot);
+                        if self.focus.hidden(self) {
+                            self.focus = PanelFocus::Stations;
+                        }
+                        self.push_log(format!("loaded {name}"));
+                    }
+                    Err(error) => self.record_weather_refresh_error(error),
+                }
+            }
+            EffectResult::Preview {
+                token,
+                station_name,
+                result,
+            } => {
+                let selected_matches = self
+                    .search
+                    .selected_result()
+                    .is_some_and(|station| station.name == station_name);
+                if token == self.search.token()
+                    && self.mode == InputMode::ManageBrowseSearch
+                    && selected_matches
+                {
+                    match result {
+                        Ok(snapshot) => {
+                            self.preview_snapshot = Some(snapshot);
+                            self.push_log(format!("preview {station_name}"));
+                        }
+                        Err(error) => self.push_log(format!("preview failed: {error}")),
+                    }
+                }
+            }
+            EffectResult::Config { token, result } => {
+                let Some(pending) = self.pending_config.take() else {
+                    return Vec::new();
+                };
+                if token != pending.token {
+                    self.pending_config = Some(pending);
+                    return Vec::new();
+                }
+                match result {
+                    Ok(config) => {
+                        let old_selected_name = self
+                            .selected_station
+                            .and_then(|index| self.stations.get(index))
+                            .map(|station| station.name.clone());
+                        self.config = config;
+                        self.stations = configured_stations(&self.config);
+                        self.hidden_stations.retain(|name| {
+                            self.stations.iter().any(|station| station.name == *name)
+                        });
+                        let preferred = old_selected_name.as_ref().and_then(|name| {
+                            self.stations
+                                .iter()
+                                .position(|station| station.name == *name)
+                        });
+                        self.selected_station = normalize_station_selection(
+                            &self.stations,
+                            &self.hidden_stations,
+                            preferred,
+                        );
+                        if let Some(name) = pending.select_name {
+                            self.manage_selected = self
+                                .config
+                                .stations
+                                .iter()
+                                .position(|station| station.name == name)
+                                .unwrap_or_else(|| self.config.stations.len().saturating_sub(1));
+                        } else {
+                            self.manage_selected = self
+                                .manage_selected
+                                .min(self.config.stations.len().saturating_sub(1));
+                        }
+                        self.push_log(pending.message);
+                        let selected_name = self
+                            .selected_station
+                            .and_then(|index| self.stations.get(index))
+                            .map(|station| station.name.clone());
+                        if selected_name != old_selected_name
+                            && let Some(effect) = self.request_selected_weather(false)
+                        {
+                            return vec![effect];
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(name) = pending.select_name {
+                            self.manage_selected = self
+                                .config
+                                .stations
+                                .iter()
+                                .position(|station| station.name == name)
+                                .unwrap_or_else(|| {
+                                    self.manage_selected
+                                        .min(self.config.stations.len().saturating_sub(1))
+                                });
+                        } else {
+                            self.manage_selected = self
+                                .manage_selected
+                                .min(self.config.stations.len().saturating_sub(1));
+                        }
+                        self.push_log(format!("configuration update failed: {error}"));
+                    }
+                }
+            }
+            EffectResult::About(result) => match result {
+                Ok(status) => self.about_status = Some(status),
+                Err(error) => self.push_log(format!("about refresh failed: {error}")),
+            },
+            EffectResult::TaskFailed(error) => self.push_log(error),
+        }
+        Vec::new()
     }
 
     fn push_log(&mut self, message: impl Into<String>) {
@@ -819,7 +814,8 @@ impl TuiApp {
             return format!("{name}({unified_uuid})");
         }
         if let Some(station) = self
-            .search_results
+            .search
+            .results
             .iter()
             .find(|station| station.unified_uuid == unified_uuid)
         {
@@ -837,85 +833,76 @@ impl TuiApp {
     }
 
     /// 消费订阅通道中的全部事件，按 topic 更新本地状态。
+    #[cfg(test)]
     fn drain_events(&mut self, events: &mut broadcast::Receiver<EngineEvent>) {
         while let Ok(event) = events.try_recv() {
-            let kind = event.envelope.kind;
-            let payload = event.envelope.payload;
-            match kind {
-                kind if kind == EventKind::WeatherSnapshot as i32 => {
-                    if let Ok(decoded) = WeatherSnapshotEvent::decode(payload.as_slice()) {
-                        let incoming_uuid = decoded
-                            .snapshot
-                            .as_ref()
-                            .and_then(|s| s.station.as_ref())
-                            .map(|s| s.unified_uuid.clone());
-                        let current_uuid = self
-                            .snapshot
-                            .as_ref()
-                            .and_then(|s| s.station.as_ref())
-                            .map(|s| s.unified_uuid.clone());
-                        if incoming_uuid.as_deref().is_some_and(|u| !u.is_empty())
-                            && incoming_uuid == current_uuid
-                        {
-                            self.snapshot = decoded.snapshot;
-                            self.last_weather_refresh = Some(Instant::now());
-                        }
+            self.apply_engine_event(event);
+        }
+    }
+
+    fn apply_engine_event(&mut self, event: EngineEvent) {
+        let kind = event.envelope.kind;
+        let payload = event.envelope.payload;
+        match kind {
+            kind if kind == EventKind::WeatherSnapshot as i32 => {
+                if let Ok(decoded) = WeatherSnapshotEvent::decode(payload.as_slice()) {
+                    let incoming_uuid = decoded
+                        .snapshot
+                        .as_ref()
+                        .and_then(|s| s.station.as_ref())
+                        .map(|s| s.unified_uuid.clone());
+                    let current_uuid = self
+                        .snapshot
+                        .as_ref()
+                        .and_then(|s| s.station.as_ref())
+                        .map(|s| s.unified_uuid.clone());
+                    if incoming_uuid.as_deref().is_some_and(|u| !u.is_empty())
+                        && incoming_uuid == current_uuid
+                    {
+                        self.snapshot = decoded.snapshot;
+                        self.last_weather_refresh = Some(Instant::now());
                     }
                 }
-                kind if kind == EventKind::EngineStatus as i32 => {
-                    if let Ok(status) = EngineStatus::decode(payload.as_slice()) {
-                        self.push_log(format!("engine {} ready={}", status.mode, status.ready));
-                    }
-                }
-                kind if kind == EventKind::FetchLog as i32 => {
-                    if let Ok(log) = FetchLogEvent::decode(payload.as_slice()) {
-                        let station = self.log_station_label(&log.unified_uuid.unwrap_or_default());
-                        let state = if log.ok { "ok" } else { "fail" };
-                        self.push_log(format!(
-                            "{} {station} {state}: {}",
-                            event.topic, log.endpoint
-                        ));
-                    }
-                }
-                kind if kind == EventKind::Refresh as i32 => {
-                    if let Ok(refresh) = RefreshEvent::decode(payload.as_slice()) {
-                        let station =
-                            self.log_station_label(&refresh.unified_uuid.unwrap_or_default());
-                        if refresh.started {
-                            self.push_log(format!("{} {station} started", event.topic));
-                        } else if refresh.completed {
-                            self.push_log(format!("{} {station} completed", event.topic));
-                        }
-                    }
-                }
-                _ => {}
             }
+            kind if kind == EventKind::EngineStatus as i32 => {
+                if let Ok(status) = EngineStatus::decode(payload.as_slice()) {
+                    self.push_log(format!("engine {} ready={}", status.mode, status.ready));
+                }
+            }
+            kind if kind == EventKind::FetchLog as i32 => {
+                if let Ok(log) = FetchLogEvent::decode(payload.as_slice()) {
+                    let station = self.log_station_label(&log.unified_uuid.unwrap_or_default());
+                    let state = if log.ok { "ok" } else { "fail" };
+                    self.push_log(format!(
+                        "{} {station} {state}: {}",
+                        event.topic, log.endpoint
+                    ));
+                }
+            }
+            kind if kind == EventKind::Refresh as i32 => {
+                if let Ok(refresh) = RefreshEvent::decode(payload.as_slice()) {
+                    let station = self.log_station_label(&refresh.unified_uuid.unwrap_or_default());
+                    if refresh.started {
+                        self.push_log(format!("{} {station} started", event.topic));
+                    } else if refresh.completed {
+                        self.push_log(format!("{} {station} completed", event.topic));
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
 
-fn moved_index(current: usize, len: usize, delta: isize) -> usize {
-    if len == 0 {
-        return 0;
-    }
-    current.saturating_add_signed(delta).min(len - 1)
-}
-
-fn append_unique_stations(target: &mut Vec<StationRef>, source: Vec<StationRef>) {
-    for station in source {
-        let duplicate = target.iter().any(|item| {
-            if !item.unified_uuid.is_empty() && !station.unified_uuid.is_empty() {
-                item.unified_uuid == station.unified_uuid
-            } else {
-                item.name == station.name
-                    && item.province == station.province
-                    && item.city == station.city
-            }
-        });
-        if !duplicate {
-            target.push(station);
-        }
-    }
+fn configured_stations(config: &AppConfig) -> Vec<ConfiguredStation> {
+    config
+        .stations
+        .iter()
+        .map(|station| ConfiguredStation {
+            name: station.name.clone(),
+            enabled: station.enabled,
+        })
+        .collect()
 }
 
 fn draw(frame: &mut Frame<'_>, app: &mut TuiApp) {
@@ -1033,7 +1020,7 @@ fn draw_stations(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .stations
         .iter()
         .enumerate()
-        .filter(|(_, s)| !app.hidden_stations.get(&s.name).copied().unwrap_or(false))
+        .filter(|(_, station)| !app.hidden_stations.contains(&station.name))
         .collect();
     if visible.is_empty() {
         frame.render_widget(
@@ -1056,10 +1043,9 @@ fn draw_stations(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     // selected_station 是原 config 索引；转换为可见列表中的位置。
     let visible_pos = visible
         .iter()
-        .position(|(index, _)| *index == app.selected_station)
-        .unwrap_or(0);
+        .position(|(index, _)| Some(*index) == app.selected_station);
     let mut state = ListState::default();
-    state.select(Some(visible_pos));
+    state.select(visible_pos);
     frame.render_stateful_widget(
         List::new(items)
             .block(focused_block("Stations", app.focus, PanelFocus::Stations))
@@ -1350,11 +1336,11 @@ fn draw_key_hints(frame: &mut Frame<'_>, area: Rect, mode: InputMode, focus: Pan
             Line::from("Esc cancel"),
         ],
         InputMode::ManageAddSearch => vec![
-            Line::from("Enter search   Up/Down select   a add"),
+            Line::from("Enter search   Up/Down select   Ctrl+A add"),
             Line::from("Esc back   type to edit query"),
         ],
         InputMode::ManageBrowseSearch => vec![
-            Line::from("Enter search   Up/Down select   a preview"),
+            Line::from("Enter search   Up/Down select   Ctrl+A preview"),
             Line::from("Esc back   type to edit query"),
         ],
         InputMode::About => vec![
@@ -1389,25 +1375,27 @@ fn draw_logs(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 fn draw_manage(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     frame.render_widget(Clear, area);
-    let title = if app.manage_move_from.is_some() {
+    let title = if app.move_draft.is_some() {
         "Manage Stations [moving]"
     } else {
         "Manage Stations"
     };
-    let items = app
-        .config
-        .stations
+    let stations = app
+        .move_draft
+        .as_ref()
+        .map(|draft| draft.stations.as_slice())
+        .unwrap_or(&app.config.stations);
+    let items = stations
         .iter()
         .enumerate()
         .map(|(index, station)| {
             let marker = if station.enabled { "[x]" } else { "[ ]" };
-            let hidden = app
-                .hidden_stations
-                .get(&station.name)
-                .copied()
-                .unwrap_or(false);
+            let hidden = app.hidden_stations.contains(&station.name);
             let hide_tag = if hidden { " (hidden)" } else { "" };
-            let moving = app.manage_move_from.is_some_and(|f| f == index);
+            let moving = app
+                .move_draft
+                .as_ref()
+                .is_some_and(|draft| draft.selected == index);
             let prefix = if moving { ">>" } else { "  " };
             ListItem::new(format!(
                 "{prefix}{:>2}. {marker} {}{hide_tag}",
@@ -1436,7 +1424,7 @@ fn draw_search(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         InputMode::ManageBrowseSearch => "[Browse]",
         _ => "",
     };
-    let loading_label = if app.search_loading {
+    let loading_label = if app.search.status == SearchStatus::Loading {
         " loading…"
     } else {
         ""
@@ -1463,23 +1451,24 @@ fn draw_search(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .split(area);
 
     frame.render_widget(
-        Paragraph::new(app.search_query.clone()).block(
+        Paragraph::new(app.search.query.clone()).block(
             Block::default().borders(Borders::ALL).title(format!(
                 "Search {mode_label} (page {}{loading_label})",
-                app.search_next_offset / SEARCH_PAGE_SIZE
+                app.search.next_offset / SEARCH_PAGE_SIZE
             )),
         ),
         chunks[0],
     );
 
     let items = app
-        .search_results
+        .search
+        .results
         .iter()
         .map(|station| ListItem::new(station.name.clone()))
         .collect::<Vec<_>>();
     let mut state = ListState::default();
     if !items.is_empty() {
-        state.select(Some(app.selected_result));
+        state.select(Some(app.search.selected));
     }
     frame.render_stateful_widget(
         List::new(items)
@@ -1494,9 +1483,14 @@ fn draw_search(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             draw_current(frame, chunks[2], Some(snap), PanelFocus::Alert);
         }
     } else {
-        let hint = match app.mode {
-            InputMode::ManageAddSearch => "Enter search | Up/Down select | a add | Esc back",
-            InputMode::ManageBrowseSearch => "Enter search | Up/Down select | a preview | Esc back",
+        let hint = match (&app.search.status, app.mode) {
+            (SearchStatus::Failed(error), _) => error.as_str(),
+            (_, InputMode::ManageAddSearch) => {
+                "Enter search | Up/Down select | Ctrl+A add | Esc back"
+            }
+            (_, InputMode::ManageBrowseSearch) => {
+                "Enter search | Up/Down select | Ctrl+A preview | Esc back"
+            }
             _ => "",
         };
         frame.render_widget(Paragraph::new(hint), chunks[2]);
@@ -1933,6 +1927,72 @@ mod tests {
                 "refresh failed: WEATHER: table upstream_fetch_log has no column named unified_uuid"
             )
         );
+    }
+
+    #[test]
+    fn failed_move_restores_authoritative_order_and_selection() {
+        let mut app = TuiApp::empty_for_test();
+        app.config.stations = vec![
+            StationConfig {
+                name: "a".to_string(),
+                enabled: true,
+            },
+            StationConfig {
+                name: "b".to_string(),
+                enabled: true,
+            },
+        ];
+        app.stations = configured_stations(&app.config);
+        app.manage_selected = 0;
+        app.move_draft = MoveDraft::new(&app.config.stations, 0);
+        app.move_draft.as_mut().unwrap().move_by(1);
+        app.manage_selected = 1;
+        app.mode = InputMode::ManageMove;
+
+        let (_, effects) = app.handle_move_key(KeyCode::Enter);
+        let Effect::UpdateConfig { token, config } = effects.into_iter().next().unwrap() else {
+            panic!("move confirmation must request a config update");
+        };
+        assert_eq!(config.stations[0].name, "b");
+        assert_eq!(app.config.stations[0].name, "a");
+
+        app.apply_effect_result(EffectResult::Config {
+            token,
+            result: Err("injected".to_string()),
+        });
+
+        assert_eq!(app.config.stations[0].name, "a");
+        assert_eq!(app.config.stations[1].name, "b");
+        assert_eq!(app.manage_selected, 0);
+    }
+
+    #[test]
+    fn cancelling_move_discards_the_draft_without_touching_config() {
+        let mut app = TuiApp::empty_for_test();
+        app.config.stations = vec![
+            StationConfig {
+                name: "a".to_string(),
+                enabled: true,
+            },
+            StationConfig {
+                name: "b".to_string(),
+                enabled: true,
+            },
+        ];
+        app.manage_selected = 0;
+        app.move_draft = MoveDraft::new(&app.config.stations, 0);
+        app.move_draft.as_mut().unwrap().move_by(1);
+        app.manage_selected = 1;
+        app.mode = InputMode::ManageMove;
+
+        let (_, effects) = app.handle_move_key(KeyCode::Esc);
+
+        assert!(effects.is_empty());
+        assert!(app.move_draft.is_none());
+        assert_eq!(app.mode, InputMode::Manage);
+        assert_eq!(app.manage_selected, 0);
+        assert_eq!(app.config.stations[0].name, "a");
+        assert_eq!(app.config.stations[1].name, "b");
     }
 
     #[test]
