@@ -3,13 +3,13 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use weather_configure::{
     AppConfig, ComponentKind, ComponentRegistry, ConfigState, ensure_config_file, load_or_default,
     normalize_config_stations, validate, write_config_atomic,
 };
 use weather_db::{DatabasePaths, DbActor};
-use weather_updater::NmcUpdater;
+use weather_updater::{WeatherProvider, create_weather_provider};
 
 use crate::{
     lifecycle::EngineControl,
@@ -31,7 +31,7 @@ pub(crate) struct Engine {
     pub(crate) config: ConfigState,
     pub(crate) config_commit: Arc<tokio::sync::Mutex<()>>,
     pub(crate) db: DbActor,
-    pub(crate) updater: NmcUpdater,
+    pub(crate) provider: Arc<dyn WeatherProvider>,
     pub(crate) weather_singleflight: WeatherSingleflight,
     pub(crate) sink: EventSink,
     pub(crate) control: EngineControl,
@@ -49,6 +49,24 @@ pub async fn run_engine(config_path: PathBuf, mode: String) -> Result<EngineExit
 
 impl EngineRuntime {
     pub async fn start(config_path: PathBuf) -> Result<Self> {
+        Self::start_with_provider_factory(config_path, create_weather_provider).await
+    }
+
+    pub async fn start_with_provider(
+        config_path: PathBuf,
+        provider: Arc<dyn WeatherProvider>,
+    ) -> Result<Self> {
+        Self::start_with_provider_factory(config_path, move |config| {
+            validate_injected_provider(config, provider.as_ref())?;
+            Ok(provider)
+        })
+        .await
+    }
+
+    async fn start_with_provider_factory<F>(config_path: PathBuf, factory: F) -> Result<Self>
+    where
+        F: FnOnce(&weather_configure::UpdaterConfig) -> Result<Arc<dyn WeatherProvider>>,
+    {
         let config_path = absolute_config_path(config_path)?;
         ensure_config_file(&config_path)?;
         let components = ComponentRegistry::for_config_path(&config_path)?;
@@ -68,7 +86,7 @@ impl EngineRuntime {
         // Construct all stable fallible dependencies before taking the DB lock
         // or starting its worker. A constructor error must not leave an
         // asynchronously reaped worker temporarily holding the lock.
-        let updater = NmcUpdater::new(&config.updater)?;
+        let provider = factory(&config.updater)?;
         // Bind the lock to the canonical DB path and ignore db.lock_path (kept
         // only for TOML compatibility). Lexical and symlink aliases converge;
         // hard-link aliases are not supported by suffix-derived sidecars.
@@ -94,7 +112,7 @@ impl EngineRuntime {
                 config: config_state,
                 config_commit: Arc::new(tokio::sync::Mutex::new(())),
                 db,
-                updater,
+                provider,
                 weather_singleflight: WeatherSingleflight::default(),
                 sink,
                 control: EngineControl::new(),
@@ -107,6 +125,23 @@ impl EngineRuntime {
         let ipc = self.engine.config.get().ipc;
         run_engine_sockets(self.engine, ipc.rpc_endpoint, ipc.pub_endpoint, mode).await
     }
+}
+
+fn validate_injected_provider(
+    config: &weather_configure::UpdaterConfig,
+    provider: &dyn WeatherProvider,
+) -> Result<()> {
+    let provider_name = provider.provider_name();
+    if provider_name.trim().is_empty() {
+        bail!("injected weather provider name must not be empty");
+    }
+    if provider_name != config.default_provider {
+        bail!(
+            "injected weather provider `{provider_name}` does not match updater.default_provider `{}`",
+            config.default_provider
+        );
+    }
+    Ok(())
 }
 
 fn recover_pending_timezone(
@@ -138,10 +173,217 @@ fn absolute_config_path(path: PathBuf) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use anyhow::bail;
     use weather_configure::{AppConfig, StationConfig, load_from_path, write_config_atomic};
+    use weather_schema::{
+        DebugPayload, ListCitiesRequest, ListCitiesResponse, ListProvincesRequest,
+        ListProvincesResponse, ResponseStatus, RpcKind, RpcRequest, SCHEMA_VERSION,
+        WeatherSnapshot, decode_message, encode_message,
+    };
+    use weather_updater::{ProviderCity, ProviderFuture, ProviderProvince, WeatherProvider};
 
     use super::*;
+
+    struct ScriptedProvider {
+        name: String,
+        calls: AtomicUsize,
+    }
+
+    impl ScriptedProvider {
+        fn new(name: impl Into<String>) -> Self {
+            Self {
+                name: name.into(),
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl WeatherProvider for ScriptedProvider {
+        fn provider_name(&self) -> &str {
+            &self.name
+        }
+
+        fn provinces(&self) -> ProviderFuture<'_, Vec<ProviderProvince>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {
+                Ok(vec![ProviderProvince {
+                    provider_code: "P1".to_string(),
+                    name: "province".to_string(),
+                    url: "/province".to_string(),
+                }])
+            })
+        }
+
+        fn cities<'a>(
+            &'a self,
+            provider_province_code: &'a str,
+        ) -> ProviderFuture<'a, Vec<ProviderCity>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                Ok(vec![ProviderCity {
+                    provider_code: "S1".to_string(),
+                    provider_province_code: provider_province_code.to_string(),
+                    province: "province".to_string(),
+                    city: "city".to_string(),
+                    url: "/city".to_string(),
+                }])
+            })
+        }
+
+        fn weather<'a>(
+            &'a self,
+            _provider_station_id: &'a str,
+            include_debug: bool,
+        ) -> ProviderFuture<'a, WeatherSnapshot> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                Ok(WeatherSnapshot {
+                    debug: include_debug.then(|| DebugPayload {
+                        provider: "scripted".to_string(),
+                        operation: "weather".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn injected_provider_drives_engine_and_is_shared_by_clones() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("weather.toml");
+        let mut config = AppConfig::default();
+        config.db.path = directory.path().join("weather.db").display().to_string();
+        config.updater.default_provider = "scripted".to_string();
+        config.updater.provider[0].name = "scripted".to_string();
+        write_config_atomic(&config_path, &config).unwrap();
+        let scripted = Arc::new(ScriptedProvider::new("scripted"));
+        let provider: Arc<dyn WeatherProvider> = scripted.clone();
+
+        let runtime = EngineRuntime::start_with_provider(config_path, provider.clone())
+            .await
+            .unwrap();
+        let cloned_engine = runtime.engine.clone();
+
+        assert!(Arc::ptr_eq(&provider, &cloned_engine.provider));
+        assert_eq!(cloned_engine.provider.provider_name(), "scripted");
+        let provinces_response = cloned_engine
+            .handle_rpc_request(
+                RpcRequest {
+                    schema_version: SCHEMA_VERSION.to_string(),
+                    request_id: "provinces".to_string(),
+                    kind: RpcKind::ListProvinces as i32,
+                    payload: encode_message(&ListProvincesRequest {
+                        page_offset: 0,
+                        page_size: 10,
+                    }),
+                    ..Default::default()
+                },
+                "test",
+                "rpc",
+                "pub",
+            )
+            .await;
+        assert_eq!(
+            provinces_response.status,
+            ResponseStatus::Ok as i32,
+            "{:?}",
+            provinces_response.error
+        );
+        assert_eq!(
+            decode_message::<ListProvincesResponse>(&provinces_response.payload)
+                .unwrap()
+                .provinces[0]
+                .name,
+            "province"
+        );
+        let cities_response = cloned_engine
+            .handle_rpc_request(
+                RpcRequest {
+                    schema_version: SCHEMA_VERSION.to_string(),
+                    request_id: "cities".to_string(),
+                    kind: RpcKind::ListCities as i32,
+                    payload: encode_message(&ListCitiesRequest {
+                        province: "province".to_string(),
+                        page_offset: 0,
+                        page_size: 10,
+                    }),
+                    ..Default::default()
+                },
+                "test",
+                "rpc",
+                "pub",
+            )
+            .await;
+        assert_eq!(
+            cities_response.status,
+            ResponseStatus::Ok as i32,
+            "{:?}",
+            cities_response.error
+        );
+        assert_eq!(
+            decode_message::<ListCitiesResponse>(&cities_response.payload)
+                .unwrap()
+                .cities[0]
+                .city,
+            "city"
+        );
+        assert!(
+            cloned_engine
+                .provider
+                .weather("S1", true)
+                .await
+                .unwrap()
+                .debug
+                .is_some()
+        );
+        assert_eq!(scripted.calls.load(Ordering::Relaxed), 3);
+        runtime.engine.db.shutdown().await.unwrap();
+    }
+
+    async fn assert_injected_provider_is_rejected(provider_name: &str, expected_error: &str) {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("weather.toml");
+        let db_path = directory.path().join("weather.db");
+        let db_lock = DatabasePaths::canonicalized(&db_path).unwrap().lock;
+        let mut config = AppConfig::default();
+        config.db.path = db_path.display().to_string();
+        config.updater.default_provider = "scripted".to_string();
+        config.updater.provider[0].name = "scripted".to_string();
+        write_config_atomic(&config_path, &config).unwrap();
+        let provider: Arc<dyn WeatherProvider> = Arc::new(ScriptedProvider::new(provider_name));
+
+        let error = EngineRuntime::start_with_provider(config_path, provider)
+            .await
+            .err()
+            .expect("invalid injected provider unexpectedly started")
+            .to_string();
+
+        assert!(error.contains(expected_error), "{error}");
+        assert!(!db_path.exists());
+        let lock = LockGuard::exclusive(db_lock).unwrap();
+        drop(lock);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn injected_provider_rejects_an_empty_name_before_database_startup() {
+        assert_injected_provider_is_rejected("  ", "name must not be empty").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn injected_provider_rejects_a_mismatched_name_before_database_startup() {
+        assert_injected_provider_is_rejected(
+            "other",
+            "does not match updater.default_provider `scripted`",
+        )
+        .await;
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn startup_normalizes_config_before_exposing_live_state() {

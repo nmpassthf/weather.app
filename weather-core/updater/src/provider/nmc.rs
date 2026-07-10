@@ -10,7 +10,7 @@ use weather_utils::JsonHttpClient;
 use crate::catalog::{ProviderCity, ProviderProvince};
 use crate::util::{canonical_station_name, clean, clean_num};
 
-use super::{FetchOptions, WeatherProvider};
+use super::{ProviderFuture, WeatherProvider};
 
 const USER_AGENT: &str = "weather.app/0.1";
 const WEATHER_PATH: &str = "rest/weather";
@@ -37,67 +37,70 @@ impl NmcProvider {
 }
 
 impl WeatherProvider for NmcProvider {
-    fn name(&self) -> &str {
+    fn provider_name(&self) -> &str {
         &self.name
     }
 
-    async fn provinces(&self) -> Result<Vec<ProviderProvince>> {
-        let rows: Vec<RawProvince> = self.http.get_json("rest/province/all", &[]).await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+    fn provinces(&self) -> ProviderFuture<'_, Vec<ProviderProvince>> {
+        Box::pin(async move {
+            let rows: Vec<RawProvince> = self.http.get_json("rest/province/all", &[]).await?;
+            Ok(rows.into_iter().map(Into::into).collect())
+        })
     }
 
-    async fn cities(&self, provider_province_code: &str) -> Result<Vec<ProviderCity>> {
-        let rows: Vec<RawCity> = self
-            .http
-            .get_json(&format!("rest/province/{provider_province_code}"), &[])
-            .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| {
-                let mut city: ProviderCity = row.into();
-                city.provider_province_code = provider_province_code.to_string();
-                city
-            })
-            .collect())
+    fn cities<'a>(
+        &'a self,
+        provider_province_code: &'a str,
+    ) -> ProviderFuture<'a, Vec<ProviderCity>> {
+        Box::pin(async move {
+            let rows: Vec<RawCity> = self
+                .http
+                .get_json(&format!("rest/province/{provider_province_code}"), &[])
+                .await?;
+            Ok(rows
+                .into_iter()
+                .map(|row| {
+                    let mut city: ProviderCity = row.into();
+                    city.provider_province_code = provider_province_code.to_string();
+                    city
+                })
+                .collect())
+        })
     }
 
-    async fn weather(
-        &self,
-        provider_station_id: &str,
-        options: FetchOptions,
-    ) -> Result<WeatherSnapshot> {
-        let query = [("stationid", provider_station_id)];
-        let endpoint = self.http.url_for(WEATHER_PATH, &query)?.to_string();
-        let raw_value: Value = self.http.get_json(WEATHER_PATH, &query).await?;
-        let raw_json = options.include_debug.then(|| raw_value.to_string());
-        let env: RawEnvelope<RawWeatherData> = serde_json::from_value(raw_value)
-            .with_context(|| format!("failed to decode NMC weather response from {endpoint}"))?;
-        if env.code != 0 {
-            return Err(anyhow!(
-                "NMC weather API returned code {}: {}",
-                env.code,
-                env.msg
-            ));
-        }
-        let mut snapshot = env.data.into_snapshot();
-        if options.include_debug {
-            snapshot.debug = Some(DebugPayload {
-                provider: self.name().to_string(),
-                operation: "weather".to_string(),
-                endpoint,
-                raw_json: raw_json.unwrap_or_default(),
-                warnings: Vec::new(),
-            });
-        }
-        Ok(snapshot)
-    }
-
-    async fn position(&self, provider_station_id: &str) -> Result<StationRef> {
-        let position: RawStation = self
-            .http
-            .get_json("rest/position", &[("stationid", provider_station_id)])
-            .await?;
-        Ok(position.into())
+    fn weather<'a>(
+        &'a self,
+        provider_station_id: &'a str,
+        include_debug: bool,
+    ) -> ProviderFuture<'a, WeatherSnapshot> {
+        Box::pin(async move {
+            let query = [("stationid", provider_station_id)];
+            let endpoint = self.http.url_for(WEATHER_PATH, &query)?.to_string();
+            let raw_value: Value = self.http.get_json(WEATHER_PATH, &query).await?;
+            let raw_json = include_debug.then(|| raw_value.to_string());
+            let env: RawEnvelope<RawWeatherData> =
+                serde_json::from_value(raw_value).with_context(|| {
+                    format!("failed to decode NMC weather response from {endpoint}")
+                })?;
+            if env.code != 0 {
+                return Err(anyhow!(
+                    "NMC weather API returned code {}: {}",
+                    env.code,
+                    env.msg
+                ));
+            }
+            let mut snapshot = env.data.into_snapshot();
+            if include_debug {
+                snapshot.debug = Some(DebugPayload {
+                    provider: self.provider_name().to_string(),
+                    operation: "weather".to_string(),
+                    endpoint,
+                    raw_json: raw_json.unwrap_or_default(),
+                    warnings: Vec::new(),
+                });
+            }
+            Ok(snapshot)
+        })
     }
 }
 
@@ -909,19 +912,11 @@ mod tests {
         })
         .expect("provider");
 
-        let without_debug = provider
-            .weather("MjXfi", FetchOptions::default())
-            .await
-            .expect("weather");
+        let without_debug = provider.weather("MjXfi", false).await.expect("weather");
         assert!(without_debug.debug.is_none());
 
         let with_debug = provider
-            .weather(
-                "MjXfi",
-                FetchOptions {
-                    include_debug: true,
-                },
-            )
+            .weather("MjXfi", true)
             .await
             .expect("weather with debug");
         let debug = with_debug.debug.expect("debug payload");

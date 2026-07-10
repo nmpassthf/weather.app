@@ -112,8 +112,8 @@ impl Engine {
     ) -> Result<WeatherSnapshot> {
         let uuid = station.unified_uuid.clone();
         match self
-            .updater
-            .weather_with_debug(&station.provider_station_id, include_debug)
+            .provider
+            .weather(&station.provider_station_id, include_debug)
             .await
         {
             Ok(mut snapshot) => {
@@ -204,7 +204,7 @@ impl Engine {
         if let Some(station) = self
             .db
             .get_provider_station_by_uuid(
-                self.updater.provider_name().to_string(),
+                self.provider.provider_name().to_string(),
                 unified_uuid.to_string(),
             )
             .await?
@@ -224,7 +224,7 @@ impl Engine {
         if let Some(mut station) = self
             .db
             .get_provider_station_by_name(
-                self.updater.provider_name().to_string(),
+                self.provider.provider_name().to_string(),
                 name.to_string(),
             )
             .await?

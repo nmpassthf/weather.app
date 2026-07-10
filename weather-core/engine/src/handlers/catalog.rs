@@ -52,12 +52,12 @@ impl Engine {
     }
 
     pub(super) async fn provider_provinces(&self) -> Result<Vec<ProviderProvince>> {
-        let provider = self.updater.provider_name();
+        let provider = self.provider.provider_name();
         if let Some(cache) = self.db.get_provider_provinces(provider).await? {
             return Ok(cache.items);
         }
         let provinces = self
-            .updater
+            .provider
             .provinces()
             .await?
             .into_iter()
@@ -125,7 +125,7 @@ impl Engine {
 
     pub(super) async fn resolve_provider_province_code(&self, province: &str) -> Result<String> {
         let _ = self.provider_provinces().await?;
-        let provider = self.updater.provider_name();
+        let provider = self.provider.provider_name();
         self.db
             .resolve_provider_province_code(provider, province)
             .await
@@ -135,7 +135,7 @@ impl Engine {
         &self,
         provider_province_code: &str,
     ) -> Result<Vec<ProviderCity>> {
-        let provider = self.updater.provider_name();
+        let provider = self.provider.provider_name();
         if let Some(cache) = self
             .db
             .get_provider_cities(provider, provider_province_code)
@@ -144,7 +144,7 @@ impl Engine {
             return Ok(cache.items);
         }
         let cities = self
-            .updater
+            .provider
             .cities(provider_province_code)
             .await?
             .into_iter()

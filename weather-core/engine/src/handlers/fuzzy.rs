@@ -103,7 +103,7 @@ impl Engine {
             .iter()
             .map(|city| {
                 city_to_provider_station(
-                    self.updater.provider_name(),
+                    self.provider.provider_name(),
                     &city.provider_province_code,
                     city,
                 )
@@ -188,7 +188,7 @@ impl Engine {
                 .await?
             {
                 let station = city_to_provider_station(
-                    self.updater.provider_name(),
+                    self.provider.provider_name(),
                     &province.provider_code,
                     &city,
                 );
