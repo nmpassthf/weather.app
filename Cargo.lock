@@ -3011,6 +3011,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "weather-build-support"
+version = "0.1.0"
+
+[[package]]
 name = "weather-configure"
 version = "0.1.0"
 dependencies = [
@@ -3072,6 +3076,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "weather-build-support",
  "weather-configure",
  "weather-db",
  "weather-manifest",
@@ -3122,6 +3127,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "weather-build-support",
  "weather-schema",
  "zeromq",
 ]

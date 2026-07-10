@@ -23,3 +23,6 @@ zeromq.workspace = true
 rusqlite.workspace = true
 tempfile.workspace = true
 toml.workspace = true
+
+[build-dependencies]
+weather-build-support = { path = "../../weather-build-support" }
