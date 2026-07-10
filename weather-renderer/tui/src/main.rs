@@ -9,7 +9,7 @@ mod util;
 
 use std::ffi::OsString;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 use crate::{
@@ -37,17 +37,23 @@ async fn main() -> Result<()> {
         .unwrap_or(probe.pub_endpoint.clone());
     let hmac_key = resolve_hmac_key(&cli)?;
     if matches!(cli.command, Some(CommandKind::Kill)) {
-        if matches!(probe.state, DaemonProbeState::NotRunning) {
-            println!("engine is not running");
-            return Ok(());
+        match probe.state {
+            DaemonProbeState::NotRunning => {
+                println!("engine is not running");
+                return Ok(());
+            }
+            DaemonProbeState::Running => {}
+            state => bail!(probe_state_error(state, probe.message.as_deref())),
         }
         let client = EngineClient::connect(rpc_endpoint, pub_endpoint, hmac_key).await?;
         let _: weather_schema::Empty = client.shutdown().await?;
         println!("engine shutdown accepted");
         return Ok(());
     }
-    if matches!(probe.state, DaemonProbeState::NotRunning) {
-        foreground = Some(daemon.start_foreground()?);
+    match probe.state {
+        DaemonProbeState::NotRunning => foreground = Some(daemon.start_foreground()?),
+        DaemonProbeState::Running => {}
+        state => bail!(probe_state_error(state, probe.message.as_deref())),
     }
     let client = EngineClient::connect(rpc_endpoint, pub_endpoint, hmac_key)
         .await
@@ -63,6 +69,20 @@ async fn main() -> Result<()> {
     }
     drop(foreground);
     result
+}
+
+fn probe_state_error(state: DaemonProbeState, message: Option<&str>) -> String {
+    let state = match state {
+        DaemonProbeState::NotRunning => "not_running",
+        DaemonProbeState::Starting => "starting",
+        DaemonProbeState::Running => "running",
+        DaemonProbeState::Unhealthy => "unhealthy",
+        DaemonProbeState::EndpointConflict => "endpoint_conflict",
+    };
+    match message {
+        Some(message) => format!("engine probe reported {state}: {message}"),
+        None => format!("engine probe reported {state}"),
+    }
 }
 
 fn resolve_hmac_key(cli: &Cli) -> Result<Option<[u8; 32]>> {

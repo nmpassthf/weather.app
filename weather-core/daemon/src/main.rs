@@ -43,9 +43,6 @@ async fn main() -> Result<()> {
                 all,
             } => uninstall_service(backend, with_data || all, with_bin || all),
         },
-        Command::Status => {
-            println!("weather-daemon status is exposed through engine ZMQ GET_ENGINE_STATUS");
-            Ok(())
-        }
+        Command::Status { config, verbose } => probe(config, verbose).await,
     }
 }

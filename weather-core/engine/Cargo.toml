@@ -9,6 +9,7 @@ chrono.workspace = true
 chrono-tz.workspace = true
 fs2.workspace = true
 prost.workspace = true
+same-file.workspace = true
 tokio.workspace = true
 toml.workspace = true
 weather-configure = { path = "../conf" }

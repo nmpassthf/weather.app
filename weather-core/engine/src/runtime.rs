@@ -80,7 +80,7 @@ impl EngineRuntime {
             .unwrap_or_else(|| PathBuf::from("."));
         let engine_lock_path = resolve_relative(&base_dir, &config.engine.lock_path)?;
         components.record(ComponentKind::Lock, &engine_lock_path)?;
-        let _engine_lock = LockGuard::exclusive(engine_lock_path)?;
+        let _engine_lock = LockGuard::engine(engine_lock_path)?;
         if normalize_config_stations(&mut config) {
             validate(&config)?;
             write_config_atomic(&config_path, &config)?;

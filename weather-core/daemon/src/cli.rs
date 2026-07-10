@@ -23,7 +23,12 @@ pub(crate) enum Command {
         #[arg(long)]
         verbose: bool,
     },
-    Status,
+    Status {
+        #[arg(long, short = 'c')]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        verbose: bool,
+    },
     Service {
         #[command(subcommand)]
         command: ServiceCommand,
@@ -173,5 +178,25 @@ mod tests {
             panic!("expected reinstall command");
         };
         assert!(no_modification_service);
+    }
+
+    #[test]
+    fn parses_status_probe_options() {
+        let cli = Cli::parse_from([
+            "weather-daemon",
+            "status",
+            "--config",
+            "/tmp/weather.toml",
+            "--verbose",
+        ]);
+
+        let Command::Status { config, verbose } = cli.command else {
+            panic!("expected status command");
+        };
+        assert_eq!(
+            config.as_deref(),
+            Some(std::path::Path::new("/tmp/weather.toml"))
+        );
+        assert!(verbose);
     }
 }
