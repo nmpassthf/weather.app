@@ -3,12 +3,12 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use weather_configure::{
     AppConfig, ComponentKind, ComponentRegistry, ConfigState, ensure_config_file, load_or_default,
     normalize_config_stations, validate, write_config_atomic,
 };
-use weather_db::DbActor;
+use weather_db::{DatabasePaths, DbActor};
 use weather_updater::NmcUpdater;
 
 use crate::{
@@ -40,7 +40,6 @@ pub(crate) struct Engine {
 pub struct EngineRuntime {
     engine: Engine,
     _engine_lock: LockGuard,
-    _db_lock: LockGuard,
 }
 
 pub async fn run_engine(config_path: PathBuf, mode: String) -> Result<EngineExit> {
@@ -66,19 +65,27 @@ impl EngineRuntime {
             validate(&config)?;
             write_config_atomic(&config_path, &config)?;
         }
-        // db.lock 绑定 db.path:固定为 `<db.path 绝对>.lock`,忽略 config 里的 db.lock_path
-        // (该字段保留只为向后兼容旧 toml)。这样不同 config 指向同一 db 文件时用同一把锁,
-        // 避免绕过锁导致跨进程并发写。
-        let db_path = resolve_relative(&base_dir, &config.db.path)?;
-        let db_lock_path = db_path.with_extension("db.lock");
-        components.record(ComponentKind::Db, &db_path)?;
-        components.record(ComponentKind::Db, db_path.with_extension("db-wal"))?;
-        components.record(ComponentKind::Db, db_path.with_extension("db-shm"))?;
-        components.record(ComponentKind::Lock, &db_lock_path)?;
-        let _db_lock = LockGuard::exclusive(db_lock_path)?;
-        recover_pending_timezone(&db_path, &config_path, &mut config)?;
-        let db = DbActor::start(db_path, config.db.timezone.clone())?;
+        // Construct all stable fallible dependencies before taking the DB lock
+        // or starting its worker. A constructor error must not leave an
+        // asynchronously reaped worker temporarily holding the lock.
         let updater = NmcUpdater::new(&config.updater)?;
+        // Bind the lock to the canonical DB path and ignore db.lock_path (kept
+        // only for TOML compatibility). Lexical and symlink aliases converge;
+        // hard-link aliases are not supported by suffix-derived sidecars.
+        let db_path = resolve_relative(&base_dir, &config.db.path)?;
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create database directory {}", parent.display())
+            })?;
+        }
+        let db_paths = DatabasePaths::canonicalized(db_path)?;
+        components.record(ComponentKind::Db, &db_paths.data)?;
+        components.record(ComponentKind::Db, &db_paths.wal)?;
+        components.record(ComponentKind::Db, &db_paths.shm)?;
+        components.record(ComponentKind::Lock, &db_paths.lock)?;
+        let db_lock = LockGuard::exclusive(db_paths.lock.clone())?;
+        recover_pending_timezone(&db_paths.data, &config_path, &mut config)?;
+        let db = DbActor::start_with_lease(db_paths.data, config.db.timezone.clone(), db_lock)?;
         let config_state = ConfigState::new(config);
         let (sink, _) = tokio::sync::broadcast::channel(256);
         Ok(Self {
@@ -93,7 +100,6 @@ impl EngineRuntime {
                 control: EngineControl::new(),
             },
             _engine_lock,
-            _db_lock,
         })
     }
 
@@ -238,6 +244,139 @@ mod tests {
             Some("Asia/Shanghai")
         );
         assert_eq!(DbActor::inspect_pending_timezone(&db_path).unwrap(), None);
+        runtime.engine.db.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_registers_exact_database_component_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("weather.toml");
+        let data = directory.path().join("cache.sqlite3");
+        let paths = DatabasePaths::canonicalized(&data).unwrap();
+        let mut config = AppConfig::default();
+        config.db.path = data.display().to_string();
+        write_config_atomic(&config_path, &config).unwrap();
+
+        let runtime = EngineRuntime::start(config_path.clone()).await.unwrap();
+        runtime.engine.db.shutdown().await.unwrap();
+        let entries = ComponentRegistry::for_config_path(&config_path)
+            .unwrap()
+            .list()
+            .unwrap();
+        let mut database_entries = entries
+            .iter()
+            .filter(|entry| entry.kind == ComponentKind::Db)
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+        database_entries.sort();
+        let mut expected = vec![paths.data, paths.wal, paths.shm];
+        expected.sort();
+
+        assert_eq!(database_entries, expected);
+        assert!(
+            entries
+                .iter()
+                .any(|entry| { entry.kind == ComponentKind::Lock && entry.path == paths.lock })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_recovery_waits_until_after_database_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("weather.toml");
+        let data = directory.path().join("weather.db");
+        let paths = DatabasePaths::canonicalized(&data).unwrap();
+        let mut config = AppConfig::default();
+        config.db.path = data.display().to_string();
+        config.db.timezone = "UTC".to_string();
+        write_config_atomic(&config_path, &config).unwrap();
+
+        let db = DbActor::start(data, "UTC".to_string()).unwrap();
+        db.migrate_timezone_bundle(
+            "UTC".to_string(),
+            "Asia/Shanghai".to_string(),
+            || bail!("injected config persistence failure"),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        db.shutdown().await.unwrap();
+
+        let blocker = LockGuard::exclusive(paths.lock).unwrap();
+        assert!(EngineRuntime::start(config_path.clone()).await.is_err());
+        assert_eq!(load_from_path(&config_path).unwrap().db.timezone, "UTC");
+        drop(blocker);
+
+        let runtime = EngineRuntime::start(config_path.clone()).await.unwrap();
+        assert_eq!(runtime.engine.config.get().db.timezone, "Asia/Shanghai");
+        assert_eq!(
+            load_from_path(&config_path).unwrap().db.timezone,
+            "Asia/Shanghai"
+        );
+        runtime.engine.db.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn database_lock_lease_outlives_runtime_until_worker_join() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("weather.toml");
+        let data = directory.path().join("weather.db");
+        let lock = DatabasePaths::canonicalized(&data).unwrap().lock;
+        let mut config = AppConfig::default();
+        config.db.path = data.display().to_string();
+        write_config_atomic(&config_path, &config).unwrap();
+
+        let runtime = EngineRuntime::start(config_path).await.unwrap();
+        let db = runtime.engine.db.clone();
+        drop(runtime);
+        assert!(LockGuard::exclusive(lock.clone()).is_err());
+
+        db.shutdown().await.unwrap();
+        let reacquired = LockGuard::exclusive(lock).unwrap();
+        drop(reacquired);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn updater_construction_failure_never_takes_database_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("weather.toml");
+        let data = directory.path().join("weather.db");
+        let lock = DatabasePaths::canonicalized(&data).unwrap().lock;
+        let mut config = AppConfig::default();
+        config.db.path = data.display().to_string();
+        config.updater.default_provider = "unsupported".to_string();
+        config.updater.provider[0].name = "unsupported".to_string();
+        write_config_atomic(&config_path, &config).unwrap();
+
+        let error = EngineRuntime::start(config_path)
+            .await
+            .err()
+            .expect("unsupported updater unexpectedly started")
+            .to_string();
+        assert!(error.contains("unsupported updater provider"), "{error}");
+        assert!(!data.exists());
+
+        let reacquired = LockGuard::exclusive(lock).unwrap();
+        drop(reacquired);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_creates_and_canonicalizes_missing_database_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("weather.toml");
+        let data = directory
+            .path()
+            .join("nested")
+            .join("database")
+            .join("weather.db");
+        let mut config = AppConfig::default();
+        config.db.path = data.display().to_string();
+        write_config_atomic(&config_path, &config).unwrap();
+
+        let runtime = EngineRuntime::start(config_path).await.unwrap();
+        let paths = DatabasePaths::canonicalized(&data).unwrap();
+        assert_eq!(paths.data, std::fs::canonicalize(&data).unwrap());
+        assert!(paths.lock.exists());
         runtime.engine.db.shutdown().await.unwrap();
     }
 }
