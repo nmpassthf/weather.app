@@ -38,9 +38,11 @@ async fn run_direct(cli: &Cli, endpoints: Endpoints, hmac_key: Option<[u8; 32]>)
         .await
         .context("failed to connect engine")?;
     if matches!(cli.command.as_ref(), Some(CommandKind::Kill)) {
-        let _: weather_schema::Empty = client.shutdown().await?;
-        println!("engine shutdown accepted");
-        return Ok(());
+        let result = client.shutdown().await.map(|_: weather_schema::Empty| {
+            println!("engine shutdown accepted");
+        });
+        client.close().await;
+        return result;
     }
     run_session(&client, cli, EngineOwnership::Direct).await
 }
@@ -63,9 +65,11 @@ async fn run_managed(cli: &Cli, hmac_key: Option<[u8; 32]>) -> Result<()> {
             hmac_key,
         )
         .await?;
-        let _: weather_schema::Empty = client.shutdown().await?;
-        println!("engine shutdown accepted");
-        return Ok(());
+        let result = client.shutdown().await.map(|_: weather_schema::Empty| {
+            println!("engine shutdown accepted");
+        });
+        client.close().await;
+        return result;
     }
     let ready = daemon.ensure_ready(probe).await?;
     let client =
@@ -88,6 +92,7 @@ async fn run_session(client: &EngineClient, cli: &Cli, ownership: EngineOwnershi
         }
         drop(foreground);
     }
+    client.close().await;
     result
 }
 
