@@ -11,13 +11,10 @@ mod terminal;
 mod tui;
 mod util;
 
-use std::ffi::OsString;
-
 use anyhow::{Context, Result, bail};
-use clap::Parser;
 
 use crate::{
-    cli::{Cli, CommandKind, OutputFormat},
+    cli::{Cli, OutputFormat, parse_cli},
     client::EngineClient,
     command::run_command,
     connection::{ConnectionPlan, Endpoints, connection_plan},
@@ -27,7 +24,7 @@ use crate::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse_from(normalized_args());
+    let cli = parse_cli();
     let plan = connection_plan(&cli)?;
     let hmac_key = resolve_hmac_key(&cli)?;
     match plan {
@@ -40,7 +37,7 @@ async fn run_direct(cli: &Cli, endpoints: Endpoints, hmac_key: Option<[u8; 32]>)
     let client = EngineClient::connect(endpoints.rpc, endpoints.publisher, hmac_key)
         .await
         .context("failed to connect engine")?;
-    if matches!(cli.command.as_ref(), Some(CommandKind::Kill)) {
+    if cli.stops_engine() {
         let result = client.shutdown().await.map(|_: weather_schema::Empty| {
             println!("engine shutdown accepted");
         });
@@ -53,7 +50,7 @@ async fn run_direct(cli: &Cli, endpoints: Endpoints, hmac_key: Option<[u8; 32]>)
 async fn run_managed(cli: &Cli, hmac_key: Option<[u8; 32]>) -> Result<()> {
     let daemon = DaemonSupervisor::from_cli(cli)?;
     let probe = daemon.probe().await?;
-    if matches!(cli.command.as_ref(), Some(CommandKind::Kill)) {
+    if cli.stops_engine() {
         match probe.state {
             DaemonProbeState::NotRunning => {
                 println!("engine is not running");
@@ -129,21 +126,5 @@ fn resolve_hmac_key(cli: &Cli) -> Result<Option<[u8; 32]>> {
 }
 
 fn should_start_tui(cli: &Cli) -> bool {
-    cli.command.is_none()
-        && !cli.core_get_default_config
-        && !cli.core_get_config
-        && !cli.core_restart_engine
-        && matches!(cli.format, OutputFormat::Tui)
-}
-
-fn normalized_args() -> Vec<OsString> {
-    std::env::args_os()
-        .map(|arg| match arg.to_str() {
-            Some("-core-dump-default-config") => OsString::from("--core-get-default-config"),
-            Some("-core-show-current-config") => OsString::from("--core-get-config"),
-            Some("-core-show-currnet-config") => OsString::from("--core-get-config"),
-            Some("-core-restart-engine") => OsString::from("--core-restart-engine"),
-            _ => arg,
-        })
-        .collect()
+    !cli.has_action() && matches!(cli.format, OutputFormat::Tui)
 }

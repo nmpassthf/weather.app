@@ -3,7 +3,10 @@ use serde::Serialize;
 use weather_schema::*;
 
 use crate::{
-    cli::{Cli, CommandKind, OutputFormat, StationsCommand},
+    cli::{
+        Cli, CommandKind, ConfigCommand, EngineCommand, OutputFormat, StationAddArgs,
+        StationFilterArgs, StationSearchArgs, StationsCommand,
+    },
     client::{EngineClient, require_config},
     render::{
         render_configured_stations, render_search_results, render_station_candidates,
@@ -18,27 +21,21 @@ struct StationChangeOutput {
     stations: Vec<ConfiguredStation>,
 }
 
+struct StationUpsertOutput {
+    station_name: String,
+    already_configured: bool,
+    config: AppConfig,
+}
+
 pub(crate) async fn run_command(client: &EngineClient, cli: &Cli) -> Result<()> {
     if cli.core_get_default_config {
-        let resp = client.get_config(true).await?;
-        let config = require_config(resp.config, "get-default-config")?;
-        let toml = toml::to_string_pretty(&config)
-            .map_err(|e| anyhow::anyhow!("failed to serialize config: {e}"))?;
-        print!("{toml}");
-        return Ok(());
+        return print_config(client, true).await;
     }
     if cli.core_get_config {
-        let resp = client.get_config(false).await?;
-        let config = require_config(resp.config, "get-config")?;
-        let toml = toml::to_string_pretty(&config)
-            .map_err(|e| anyhow::anyhow!("failed to serialize config: {e}"))?;
-        print!("{toml}");
-        return Ok(());
+        return print_config(client, false).await;
     }
     if cli.core_restart_engine {
-        let _: Empty = client.request(RpcKind::RestartEngine, Empty {}).await?;
-        println!("engine restart accepted");
-        return Ok(());
+        return restart_engine(client).await;
     }
 
     match &cli.command {
@@ -47,38 +44,31 @@ pub(crate) async fn run_command(client: &EngineClient, cli: &Cli) -> Result<()> 
                 fetch_weather(client, address.as_ref(), *refresh, cli.include_debug).await?;
             output(cli.format, &snapshot, || render_weather(&snapshot))
         }
-        Some(CommandKind::Search {
-            query,
-            province,
-            city,
-            station,
-            limit,
-            write,
-        }) => {
-            let results =
-                execute_search(client, query.as_ref(), province, city, station, *limit).await?;
-            if *write {
-                write_search_result_to_config(client, &results).await?;
+        Some(CommandKind::Search(args)) => {
+            let results = search_stations(client, &args.search).await?;
+            if args.write {
+                upsert_search_result(client, &results, "名称.N").await?;
             }
             output(cli.format, &results, || render_search_results(&results))
         }
-        Some(CommandKind::Add {
-            name,
-            province,
-            city,
-            station,
-            limit,
-        }) => {
-            let results =
-                execute_search(client, Some(name), province, city, station, *limit).await?;
-            write_search_result_to_config(client, &results).await?;
+        Some(CommandKind::Add(args)) => {
+            let results = search_station_to_add(client, args).await?;
+            upsert_search_result(client, &results, "名称.N").await?;
             output(cli.format, &results, || render_search_results(&results))
         }
         Some(CommandKind::Stations { command }) => run_stations_command(client, cli, command).await,
-        Some(CommandKind::Status) => {
-            let status = client.status().await?;
-            output(cli.format, &status, || render_status(&status))
-        }
+        Some(CommandKind::Config { command }) => match command {
+            ConfigCommand::Show => print_config(client, false).await,
+            ConfigCommand::Defaults => print_config(client, true).await,
+        },
+        Some(CommandKind::Engine { command }) => match command {
+            EngineCommand::Status => output_engine_status(client, cli.format).await,
+            EngineCommand::Restart => restart_engine(client).await,
+            EngineCommand::Stop => {
+                unreachable!("engine stop is handled before engine auto-start")
+            }
+        },
+        Some(CommandKind::Status) => output_engine_status(client, cli.format).await,
         Some(CommandKind::Kill) => unreachable!("kill is handled before engine auto-start"),
         None => run_weather(client, cli).await,
     }
@@ -96,43 +86,19 @@ async fn run_stations_command(
                 render_configured_stations(&resp.stations)
             })
         }
-        StationsCommand::Search {
-            query,
-            province,
-            city,
-            station,
-            limit,
-        } => {
-            let results =
-                execute_search(client, query.as_ref(), province, city, station, *limit).await?;
+        StationsCommand::Search(args) => {
+            let results = search_stations(client, args).await?;
             output(cli.format, &results, || render_search_results(&results))
         }
-        StationsCommand::Add {
-            name,
-            province,
-            city,
-            station,
-            limit,
-        } => {
-            let results =
-                execute_search(client, Some(name), province, city, station, *limit).await?;
-            if results.stations.len() != 1 {
-                bail!(
-                    "命中 {} 个站点目标，请使用 `stations add 名称.N` 指定要写入的目标。\n{}",
-                    results.stations.len(),
-                    render_station_candidates(&results)
-                );
-            }
-            let station_name = results.stations[0].name.clone();
-            let mut config = current_config(client).await?;
-            let already = upsert_station(&mut config, station_name.clone());
-            let updated = update_config(client, config).await?;
-            let message = if already {
-                format!("已启用已有站点 `{station_name}`")
+        StationsCommand::Add(args) => {
+            let results = search_station_to_add(client, args).await?;
+            let change = upsert_search_result(client, &results, "stations add 名称.N").await?;
+            let message = if change.already_configured {
+                format!("已启用已有站点 `{}`", change.station_name)
             } else {
-                format!("已添加站点 `{station_name}`")
+                format!("已添加站点 `{}`", change.station_name)
             };
-            output_station_change(cli.format, message, &updated.stations)
+            output_station_change(cli.format, message, &change.config.stations)
         }
         StationsCommand::Remove { selector } => {
             let mut config = current_config(client).await?;
@@ -184,23 +150,89 @@ async fn set_station_state(
     )
 }
 
-/// 把搜索唯一命中结果写入 config（启用已有或新增）。
-async fn write_search_result_to_config(
+async fn print_config(client: &EngineClient, defaults: bool) -> Result<()> {
+    let operation = if defaults {
+        "get-default-config"
+    } else {
+        "get-config"
+    };
+    let response = client.get_config(defaults).await?;
+    let config = require_config(response.config, operation)?;
+    let toml = toml::to_string_pretty(&config)
+        .map_err(|error| anyhow::anyhow!("failed to serialize config: {error}"))?;
+    print!("{toml}");
+    Ok(())
+}
+
+async fn restart_engine(client: &EngineClient) -> Result<()> {
+    let _: Empty = client.request(RpcKind::RestartEngine, Empty {}).await?;
+    println!("engine restart accepted");
+    Ok(())
+}
+
+async fn output_engine_status(client: &EngineClient, format: OutputFormat) -> Result<()> {
+    let status = client.status().await?;
+    output(format, &status, || render_status(&status))
+}
+
+async fn search_stations(
+    client: &EngineClient,
+    args: &StationSearchArgs,
+) -> Result<FuzzyMatchStationsResponse> {
+    search_with_filters(client, args.query.as_ref(), &args.filters).await
+}
+
+async fn search_station_to_add(
+    client: &EngineClient,
+    args: &StationAddArgs,
+) -> Result<FuzzyMatchStationsResponse> {
+    search_with_filters(client, Some(&args.name), &args.filters).await
+}
+
+async fn search_with_filters(
+    client: &EngineClient,
+    query: Option<&String>,
+    filters: &StationFilterArgs,
+) -> Result<FuzzyMatchStationsResponse> {
+    execute_search(
+        client,
+        query,
+        &filters.province,
+        &filters.city,
+        &filters.station,
+        filters.limit,
+    )
+    .await
+}
+
+async fn upsert_search_result(
     client: &EngineClient,
     results: &FuzzyMatchStationsResponse,
-) -> Result<()> {
+    selector_hint: &str,
+) -> Result<StationUpsertOutput> {
+    let station_name = unique_station_name(results, selector_hint)?;
+    let mut config = current_config(client).await?;
+    let already_configured = upsert_station(&mut config, station_name.clone());
+    let config = update_config(client, config).await?;
+    Ok(StationUpsertOutput {
+        station_name,
+        already_configured,
+        config,
+    })
+}
+
+fn unique_station_name(
+    results: &FuzzyMatchStationsResponse,
+    selector_hint: &str,
+) -> Result<String> {
     if results.stations.len() != 1 {
         bail!(
-            "命中 {} 个站点目标，请使用 `名称.N` 指定要写入的目标。\n{}",
+            "命中 {} 个站点目标，请使用 `{selector_hint}` 指定要写入的目标。\n{}",
             results.stations.len(),
             render_station_candidates(results)
         );
     }
-    let station_name = results.stations[0].name.clone();
-    let mut config = current_config(client).await?;
-    upsert_station(&mut config, station_name);
-    update_config(client, config).await?;
-    Ok(())
+    Ok(results.stations[0].name.clone())
 }
 
 async fn current_config(client: &EngineClient) -> Result<AppConfig> {
@@ -465,5 +497,22 @@ mod tests {
                 enabled: false,
             }]
         );
+    }
+
+    #[test]
+    fn station_selector_errors_preserve_canonical_and_compatibility_hints() {
+        let results = FuzzyMatchStationsResponse::default();
+
+        let compatibility = unique_station_name(&results, "名称.N")
+            .unwrap_err()
+            .to_string();
+        let canonical = unique_station_name(&results, "stations add 名称.N")
+            .unwrap_err()
+            .to_string();
+
+        assert!(compatibility.contains("请使用 `名称.N` 指定要写入的目标"));
+        assert!(canonical.contains("请使用 `stations add 名称.N` 指定要写入的目标"));
+        assert!(compatibility.ends_with("未命中可写入的站点目标。"));
+        assert!(canonical.ends_with("未命中可写入的站点目标。"));
     }
 }

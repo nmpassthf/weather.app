@@ -5,7 +5,7 @@ use weather_schema::{DEFAULT_ZMQ_PUB_ENDPOINT, DEFAULT_ZMQ_RPC_ENDPOINT};
 
 use crate::types::{AppConfig, ProviderConfig, StationConfig};
 
-/// 序列化默认配置为 TOML，用于初始化配置文件或 `--core-dump-default-config`。
+/// 序列化默认配置为 TOML，用于初始化配置文件或 `weather-tui config defaults`。
 ///
 /// # 示例
 ///
