@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 pub(crate) struct Cli {
     #[arg(long, value_enum, default_value_t = OutputFormat::Tui, global = true)]
     pub(crate) format: OutputFormat,
-    #[arg(long, global = true)]
+    #[arg(long, global = true, conflicts_with = "rpc_endpoint")]
     pub(crate) endpoint: Option<String>,
     #[arg(long, global = true)]
     pub(crate) rpc_endpoint: Option<String>,
@@ -158,5 +158,22 @@ mod tests {
                 .unwrap();
 
         assert!(parsed.include_debug);
+    }
+
+    #[test]
+    fn legacy_and_canonical_rpc_endpoints_conflict() {
+        let error = Cli::try_parse_from([
+            "weather-tui",
+            "--endpoint",
+            "tcp://127.0.0.1:41001",
+            "--rpc-endpoint",
+            "tcp://127.0.0.1:41002",
+            "status",
+        ])
+        .unwrap_err();
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("--endpoint"));
+        assert!(rendered.contains("--rpc-endpoint"));
     }
 }

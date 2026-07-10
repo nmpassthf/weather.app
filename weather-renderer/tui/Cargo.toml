@@ -17,6 +17,9 @@ weather-configure = { path = "../../weather-core/conf" }
 weather-schema = { path = "../../weather-schema" }
 zeromq.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [[bin]]
 name = "weather-tui"
 path = "src/main.rs"

@@ -1,6 +1,7 @@
 mod cli;
 mod client;
 mod command;
+mod connection;
 mod daemon;
 mod render;
 mod search;
@@ -16,6 +17,7 @@ use crate::{
     cli::{Cli, CommandKind, OutputFormat},
     client::EngineClient,
     command::run_command,
+    connection::{ConnectionPlan, Endpoints, connection_plan},
     daemon::{DaemonProbeState, DaemonSupervisor},
     tui::run_interactive,
 };
@@ -23,20 +25,31 @@ use crate::{
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse_from(normalized_args());
-    let mut foreground = None;
-    let daemon = DaemonSupervisor::from_cli(&cli)?;
-    let probe = daemon.probe()?;
-    let rpc_endpoint = cli
-        .rpc_endpoint
-        .clone()
-        .or_else(|| cli.endpoint.clone())
-        .unwrap_or(probe.rpc_endpoint.clone());
-    let pub_endpoint = cli
-        .pub_endpoint
-        .clone()
-        .unwrap_or(probe.pub_endpoint.clone());
+    let plan = connection_plan(&cli)?;
     let hmac_key = resolve_hmac_key(&cli)?;
-    if matches!(cli.command, Some(CommandKind::Kill)) {
+    match plan {
+        ConnectionPlan::Direct(endpoints) => run_direct(&cli, endpoints, hmac_key).await,
+        ConnectionPlan::Managed => run_managed(&cli, hmac_key).await,
+    }
+}
+
+async fn run_direct(cli: &Cli, endpoints: Endpoints, hmac_key: Option<[u8; 32]>) -> Result<()> {
+    let client = EngineClient::connect(endpoints.rpc, endpoints.publisher, hmac_key)
+        .await
+        .context("failed to connect engine")?;
+    if matches!(cli.command.as_ref(), Some(CommandKind::Kill)) {
+        let _: weather_schema::Empty = client.shutdown().await?;
+        println!("engine shutdown accepted");
+        return Ok(());
+    }
+    run_connected(&client, cli).await
+}
+
+async fn run_managed(cli: &Cli, hmac_key: Option<[u8; 32]>) -> Result<()> {
+    let mut foreground = None;
+    let daemon = DaemonSupervisor::from_cli(cli)?;
+    let probe = daemon.probe()?;
+    if matches!(cli.command.as_ref(), Some(CommandKind::Kill)) {
         match probe.state {
             DaemonProbeState::NotRunning => {
                 println!("engine is not running");
@@ -45,7 +58,12 @@ async fn main() -> Result<()> {
             DaemonProbeState::Running => {}
             state => bail!(probe_state_error(state, probe.message.as_deref())),
         }
-        let client = EngineClient::connect(rpc_endpoint, pub_endpoint, hmac_key).await?;
+        let client = EngineClient::connect(
+            probe.rpc_endpoint.clone(),
+            probe.pub_endpoint.clone(),
+            hmac_key,
+        )
+        .await?;
         let _: weather_schema::Empty = client.shutdown().await?;
         println!("engine shutdown accepted");
         return Ok(());
@@ -55,20 +73,24 @@ async fn main() -> Result<()> {
         DaemonProbeState::Running => {}
         state => bail!(probe_state_error(state, probe.message.as_deref())),
     }
-    let client = EngineClient::connect(rpc_endpoint, pub_endpoint, hmac_key)
+    let client = EngineClient::connect(probe.rpc_endpoint, probe.pub_endpoint, hmac_key)
         .await
         .context("failed to connect engine")?;
 
-    let result = if should_start_tui(&cli) {
-        run_interactive(&client, &cli).await
-    } else {
-        run_command(&client, &cli).await
-    };
+    let result = run_connected(&client, cli).await;
     if foreground.is_some() {
         let _ = client.shutdown().await;
     }
     drop(foreground);
     result
+}
+
+async fn run_connected(client: &EngineClient, cli: &Cli) -> Result<()> {
+    if should_start_tui(cli) {
+        run_interactive(client, cli).await
+    } else {
+        run_command(client, cli).await
+    }
 }
 
 fn probe_state_error(state: DaemonProbeState, message: Option<&str>) -> String {
