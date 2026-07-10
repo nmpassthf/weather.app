@@ -3,10 +3,16 @@ use std::{path::Path, path::PathBuf};
 use anyhow::{Context, Result};
 use weather_configure::{AppConfig, ComponentKind, ComponentRegistry, ConfigState};
 
-use crate::station::normalize_station_name;
+use crate::{lifecycle::Cancellation, station::normalize_station_name};
 
-pub(crate) fn spawn_config_normalizer(config_path: PathBuf, state: ConfigState) {
-    ConfigNormalizer::new(config_path, state).spawn();
+pub(crate) async fn run_config_normalizer(
+    config_path: PathBuf,
+    state: ConfigState,
+    cancellation: Cancellation,
+) -> Result<()> {
+    ConfigNormalizer::new(config_path, state)
+        .run(cancellation)
+        .await
 }
 
 struct ConfigNormalizer {
@@ -19,17 +25,19 @@ impl ConfigNormalizer {
         Self { config_path, state }
     }
 
-    fn spawn(self) {
-        tokio::spawn(async move {
-            self.run().await;
-        });
-    }
-
-    async fn run(self) {
+    async fn run(self, cancellation: Cancellation) -> Result<()> {
         self.normalize_and_apply().await;
         let mut rx = self.state.subscribe();
-        while rx.changed().await.is_ok() {
-            self.normalize_and_apply().await;
+        loop {
+            tokio::select! {
+                _ = cancellation.cancelled() => return Ok(()),
+                changed = rx.changed() => {
+                    if changed.is_err() {
+                        anyhow::bail!("config watch channel closed unexpectedly");
+                    }
+                    self.normalize_and_apply().await;
+                }
+            }
         }
     }
 

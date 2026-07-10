@@ -1,5 +1,3 @@
-use std::sync::atomic::Ordering;
-
 use weather_schema::*;
 
 use crate::runtime::Engine;
@@ -55,13 +53,7 @@ impl Engine {
             RpcKind::GetWeather => self.handle_get_weather(&request).await,
             RpcKind::FuzzyMatchStations => self.handle_fuzzy(&request).await,
             RpcKind::TriggerRefresh => self.handle_trigger_refresh(&request).await,
-            RpcKind::RestartEngine => {
-                self.restart.store(true, Ordering::SeqCst);
-                self.stop.store(true, Ordering::SeqCst);
-                self.accepted(&request.request_id, Empty {})
-            }
-            RpcKind::Shutdown => {
-                self.stop.store(true, Ordering::SeqCst);
+            RpcKind::RestartEngine | RpcKind::Shutdown => {
                 self.accepted(&request.request_id, Empty {})
             }
             RpcKind::Unspecified => Self::rpc_error_response(

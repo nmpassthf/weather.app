@@ -1,8 +1,11 @@
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
@@ -12,7 +15,8 @@ pub(crate) fn now_ms() -> i64 {
 }
 
 pub(crate) fn request_id() -> String {
-    format!("{}-{}", std::process::id(), now_ms())
+    let sequence = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{}-{sequence}", std::process::id(), now_ms())
 }
 
 /// 把 `unix_ms` 在 `timezone`（IANA 名，如 `Asia/Shanghai`）下格式化为 `YYYY-MM-DD`。
@@ -61,6 +65,8 @@ fn local_date(unix_ms: i64, tz: chrono_tz::Tz) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     #[test]
@@ -87,5 +93,12 @@ mod tests {
 
         assert_eq!(date, "2026-06-23");
         assert_eq!(wait, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn generated_ids_are_unique_within_the_same_process() {
+        let ids = (0..10_000).map(|_| request_id()).collect::<HashSet<_>>();
+
+        assert_eq!(ids.len(), 10_000);
     }
 }

@@ -3,6 +3,7 @@ use weather_db::{ProviderCity, ProviderProvince};
 use weather_schema::*;
 
 use crate::{
+    limits::{DEFAULT_FUZZY_PAGE_SIZE, normalize_pagination},
     runtime::Engine,
     station::{
         canonical_station_name, city_to_provider_station, push_matching_provinces, station_names,
@@ -19,19 +20,25 @@ impl Engine {
                 decoded.unwrap_err().to_string(),
             );
         };
-        match self.fuzzy(req).await {
+        let (offset, page_size) =
+            match normalize_pagination(req.page_offset, req.page_size, DEFAULT_FUZZY_PAGE_SIZE) {
+                Ok(page) => page,
+                Err(err) => {
+                    return Self::rpc_error_response(&request.request_id, "BAD_REQUEST", err);
+                }
+            };
+        match self.fuzzy(req, offset, page_size).await {
             Ok(resp) => self.ok(&request.request_id, resp),
             Err(err) => Self::rpc_error_response(&request.request_id, "FUZZY", err.to_string()),
         }
     }
 
-    async fn fuzzy(&self, req: FuzzyMatchStationsRequest) -> Result<FuzzyMatchStationsResponse> {
-        let page_size = if req.page_size == 0 {
-            10
-        } else {
-            req.page_size as usize
-        };
-        let offset = req.page_offset as usize;
+    async fn fuzzy(
+        &self,
+        req: FuzzyMatchStationsRequest,
+        offset: usize,
+        page_size: usize,
+    ) -> Result<FuzzyMatchStationsResponse> {
         let scan_limit = offset.saturating_add(page_size).saturating_add(1);
         let query = req.query;
         let matching_provider_provinces = self

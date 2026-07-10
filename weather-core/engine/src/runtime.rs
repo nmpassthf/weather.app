@@ -1,7 +1,4 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::{Arc, atomic::AtomicBool},
-};
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use weather_configure::{
@@ -11,7 +8,7 @@ use weather_db::DbActor;
 use weather_updater::NmcUpdater;
 
 use crate::{
-    config_normalizer::spawn_config_normalizer,
+    lifecycle::EngineControl,
     lock::LockGuard,
     lock::resolve_relative,
     server::{EventSink, run_engine_sockets},
@@ -32,8 +29,7 @@ pub(crate) struct Engine {
     pub(crate) updater: NmcUpdater,
     pub(crate) weather_singleflight: WeatherSingleflight,
     pub(crate) sink: EventSink,
-    pub(crate) stop: Arc<AtomicBool>,
-    pub(crate) restart: Arc<AtomicBool>,
+    pub(crate) control: EngineControl,
 }
 
 pub struct EngineRuntime {
@@ -74,7 +70,6 @@ impl EngineRuntime {
         let db = DbActor::start(db_path, config.db.timezone.clone())?;
         let updater = NmcUpdater::new(&config.updater)?;
         let config_state = ConfigState::new(config);
-        spawn_config_normalizer(config_path.clone(), config_state.clone());
         let (sink, _) = tokio::sync::broadcast::channel(256);
         Ok(Self {
             engine: Engine {
@@ -84,8 +79,7 @@ impl EngineRuntime {
                 updater,
                 weather_singleflight: WeatherSingleflight::default(),
                 sink,
-                stop: Arc::new(AtomicBool::new(false)),
-                restart: Arc::new(AtomicBool::new(false)),
+                control: EngineControl::new(),
             },
             _engine_lock,
             _db_lock,

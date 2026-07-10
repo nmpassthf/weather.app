@@ -2,7 +2,11 @@ use anyhow::Result;
 use weather_db::{ProviderCity, ProviderProvince};
 use weather_schema::*;
 
-use crate::{handlers::response::paginate, runtime::Engine};
+use crate::{
+    handlers::response::paginate,
+    limits::{DEFAULT_PAGE_SIZE, normalize_pagination},
+    runtime::Engine,
+};
 
 impl Engine {
     pub(super) async fn handle_list_provinces(&self, request: &RpcRequest) -> RpcResponse {
@@ -14,10 +18,15 @@ impl Engine {
                 decoded.unwrap_err().to_string(),
             );
         };
+        let (offset, page_size) =
+            match normalize_pagination(req.page_offset, req.page_size, DEFAULT_PAGE_SIZE) {
+                Ok(page) => page,
+                Err(err) => {
+                    return Self::rpc_error_response(&request.request_id, "BAD_REQUEST", err);
+                }
+            };
         match self.list_provinces().await {
             Ok(provinces) => {
-                let page_size = normalize_page_size(req.page_size);
-                let offset = req.page_offset as usize;
                 let (provinces, has_more, next_offset) =
                     paginate(&provinces, offset, page_size, |slice| slice.to_vec());
                 self.ok(
@@ -71,10 +80,15 @@ impl Engine {
                 decoded.unwrap_err().to_string(),
             );
         };
+        let (offset, page_size) =
+            match normalize_pagination(req.page_offset, req.page_size, DEFAULT_PAGE_SIZE) {
+                Ok(page) => page,
+                Err(err) => {
+                    return Self::rpc_error_response(&request.request_id, "BAD_REQUEST", err);
+                }
+            };
         match self.list_cities(&req.province).await {
             Ok(cities) => {
-                let page_size = normalize_page_size(req.page_size);
-                let offset = req.page_offset as usize;
                 let (cities, has_more, next_offset) =
                     paginate(&cities, offset, page_size, |slice| slice.to_vec());
                 self.ok(
@@ -164,8 +178,14 @@ impl Engine {
                 decoded.unwrap_err().to_string(),
             );
         };
-        let page_size = normalize_page_size(req.page_size);
-        let page = self.configured_stations_page(req.page_offset as usize, page_size);
+        let (offset, page_size) =
+            match normalize_pagination(req.page_offset, req.page_size, DEFAULT_PAGE_SIZE) {
+                Ok(page) => page,
+                Err(err) => {
+                    return Self::rpc_error_response(&request.request_id, "BAD_REQUEST", err);
+                }
+            };
+        let page = self.configured_stations_page(offset, page_size);
         self.ok(&request.request_id, page)
     }
 }
@@ -185,26 +205,5 @@ fn db_provider_city(city: weather_updater::ProviderCity) -> ProviderCity {
         province: city.province,
         city: city.city,
         url: city.url,
-    }
-}
-
-/// 将客户端传入的 `page_size` 归一化：0 视为默认 32。
-pub(crate) fn normalize_page_size(raw: u32) -> usize {
-    if raw == 0 { 32 } else { raw as usize }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn zero_page_size_defaults_to_32() {
-        assert_eq!(normalize_page_size(0), 32);
-    }
-
-    #[test]
-    fn nonzero_page_size_passes_through() {
-        assert_eq!(normalize_page_size(1), 1);
-        assert_eq!(normalize_page_size(100), 100);
     }
 }

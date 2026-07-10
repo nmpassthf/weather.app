@@ -1,7 +1,9 @@
 use weather_schema::*;
 
 use crate::{
-    handlers::catalog::normalize_page_size, handlers::response::paginate, runtime::Engine,
+    handlers::response::paginate,
+    limits::{DEFAULT_PAGE_SIZE, normalize_pagination, validate_batch_size},
+    runtime::Engine,
 };
 
 impl Engine {
@@ -14,15 +16,23 @@ impl Engine {
                 decoded.unwrap_err().to_string(),
             );
         };
-        let mut pages = Vec::with_capacity(req.queries.len());
+        if let Err(err) = validate_batch_size(req.queries.len()) {
+            return Self::rpc_error_response(&request.request_id, "BAD_REQUEST", err);
+        }
+        let mut queries = Vec::with_capacity(req.queries.len());
         for query in req.queries {
-            let page = self
-                .fetch_region_page(
-                    &query.province,
-                    query.page_offset as usize,
-                    normalize_page_size(query.page_size),
-                )
-                .await;
+            let (offset, page_size) =
+                match normalize_pagination(query.page_offset, query.page_size, DEFAULT_PAGE_SIZE) {
+                    Ok(page) => page,
+                    Err(err) => {
+                        return Self::rpc_error_response(&request.request_id, "BAD_REQUEST", err);
+                    }
+                };
+            queries.push((query.province, offset, page_size));
+        }
+        let mut pages = Vec::with_capacity(queries.len());
+        for (province, offset, page_size) in queries {
+            let page = self.fetch_region_page(&province, offset, page_size).await;
             pages.push(page);
         }
         self.ok(&request.request_id, BatchListRegionsResponse { pages })

@@ -9,6 +9,8 @@ use weather_schema::GetWeatherRequest;
 
 use crate::{
     handlers::RefreshTerminal,
+    lifecycle::Cancellation,
+    limits::MAX_CONCURRENT_REFRESHES,
     runtime::Engine,
     time::{local_date_and_next_change, now_ms},
 };
@@ -25,13 +27,12 @@ struct StationSchedule {
 }
 
 /// Runs one wakeable scheduler for every configured station. Fetch jobs are
-/// short-lived members of the scheduler's JoinSet, so aborting the returned
-/// handle also aborts all in-flight jobs instead of detaching permanent tasks.
-pub(crate) fn spawn_refresh_loop(engine: Engine) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(run_refresh_scheduler(engine))
-}
-
-async fn run_refresh_scheduler(engine: Engine) {
+/// short-lived members of the scheduler's JoinSet and are always drained on
+/// cancellation.
+pub(crate) async fn run_refresh_loop(
+    engine: Engine,
+    cancellation: Cancellation,
+) -> anyhow::Result<()> {
     let mut config_rx = engine.config.subscribe();
     let initial = engine.config.get();
     let mut station_order = enabled_stations(&initial);
@@ -46,7 +47,7 @@ async fn run_refresh_scheduler(engine: Engine) {
     let mut jobs = JoinSet::new();
     let mut job_names = HashMap::<Id, String>::new();
 
-    loop {
+    let result = loop {
         let config = engine.config.get();
         let now = Instant::now();
         let (current_date, date_wait) =
@@ -74,13 +75,14 @@ async fn run_refresh_scheduler(engine: Engine) {
             ttl,
         );
 
-        let scheduler_wait = next_scheduler_wait(&schedules, now);
-        let wait = scheduler_wait.min(date_wait);
+        let scheduler_wait = next_scheduler_wait(&schedules, now, jobs.len());
+        let wait = scheduler_wait.min(date_wait).min(FALLBACK_WAKE);
         let has_jobs = !jobs.is_empty();
         tokio::select! {
+            _ = cancellation.cancelled() => break Ok(()),
             changed = config_rx.changed() => {
                 if changed.is_err() {
-                    break;
+                    break Err(anyhow::anyhow!("refresh config watch closed unexpectedly"));
                 }
                 let config = config_rx.borrow_and_update().clone();
                 station_order = enabled_stations(&config);
@@ -115,10 +117,11 @@ async fn run_refresh_scheduler(engine: Engine) {
             }
             _ = tokio::time::sleep(wait) => {}
         }
-    }
+    };
 
     jobs.abort_all();
     while jobs.join_next().await.is_some() {}
+    result
 }
 
 fn enabled_stations(config: &AppConfig) -> Vec<String> {
@@ -191,7 +194,30 @@ fn dispatch_due(
     now: Instant,
     ttl: Duration,
 ) {
+    let available = MAX_CONCURRENT_REFRESHES.saturating_sub(jobs.len());
+    let claimed = claim_due_stations(station_order, schedules, now, ttl, available);
+    for name in claimed {
+        let engine = engine.clone();
+        let job_name = name.clone();
+        let handle = jobs.spawn(async move {
+            refresh_one(&engine, &job_name).await;
+        });
+        job_names.insert(handle.id(), name);
+    }
+}
+
+fn claim_due_stations(
+    station_order: &[String],
+    schedules: &mut HashMap<String, StationSchedule>,
+    now: Instant,
+    ttl: Duration,
+    available: usize,
+) -> Vec<String> {
+    let mut claimed = Vec::with_capacity(available.min(station_order.len()));
     for name in station_order {
+        if claimed.len() >= available {
+            break;
+        }
         let Some(schedule) = schedules.get_mut(name) else {
             continue;
         };
@@ -202,13 +228,9 @@ fn dispatch_due(
         schedule.in_flight = true;
         schedule.date_refresh_pending = false;
         schedule.next_due = deadline(now, ttl);
-        let engine = engine.clone();
-        let job_name = name.clone();
-        let handle = jobs.spawn(async move {
-            refresh_one(&engine, &job_name).await;
-        });
-        job_names.insert(handle.id(), name.clone());
+        claimed.push(name.clone());
     }
+    claimed
 }
 
 fn finish_job(
@@ -228,7 +250,14 @@ fn finish_job(
     }
 }
 
-fn next_scheduler_wait(schedules: &HashMap<String, StationSchedule>, now: Instant) -> Duration {
+fn next_scheduler_wait(
+    schedules: &HashMap<String, StationSchedule>,
+    now: Instant,
+    active_jobs: usize,
+) -> Duration {
+    if active_jobs >= MAX_CONCURRENT_REFRESHES {
+        return FALLBACK_WAKE;
+    }
     schedules
         .values()
         .filter(|schedule| !schedule.in_flight)
@@ -369,5 +398,41 @@ mod tests {
         assert!(!schedules["A"].in_flight);
         assert_eq!(schedules["A"].next_due, completed);
         assert!(schedules["A"].date_refresh_pending);
+    }
+
+    #[test]
+    fn due_refreshes_are_claimed_up_to_concurrency_limit() {
+        let now = Instant::now();
+        let names = (0..(MAX_CONCURRENT_REFRESHES + 3))
+            .map(|index| format!("station-{index}"))
+            .collect::<Vec<_>>();
+        let mut schedules = HashMap::new();
+        reconcile_schedules(&mut schedules, &names, now, Duration::from_secs(60));
+        for schedule in schedules.values_mut() {
+            schedule.next_due = now;
+        }
+
+        let claimed = claim_due_stations(
+            &names,
+            &mut schedules,
+            now,
+            Duration::from_secs(60),
+            MAX_CONCURRENT_REFRESHES,
+        );
+
+        assert_eq!(claimed.len(), MAX_CONCURRENT_REFRESHES);
+        assert!(claimed.iter().all(|name| schedules[name].in_flight));
+        for name in names.iter().skip(MAX_CONCURRENT_REFRESHES) {
+            assert!(!schedules[name].in_flight);
+            assert_eq!(schedules[name].next_due, now);
+        }
+        assert_eq!(
+            next_scheduler_wait(&schedules, now, MAX_CONCURRENT_REFRESHES),
+            FALLBACK_WAKE
+        );
+        assert_eq!(
+            next_scheduler_wait(&schedules, now, MAX_CONCURRENT_REFRESHES - 1),
+            Duration::ZERO
+        );
     }
 }
