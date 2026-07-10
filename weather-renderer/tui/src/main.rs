@@ -3,6 +3,7 @@ mod client;
 mod command;
 mod connection;
 mod daemon;
+mod pagination;
 mod render;
 mod search;
 mod tui;

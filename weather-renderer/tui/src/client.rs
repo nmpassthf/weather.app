@@ -4,6 +4,7 @@ mod session;
 
 use std::{
     collections::VecDeque,
+    future::Future,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -25,7 +26,7 @@ use self::{
     pending::{PendingLease, PendingRegistry, RegisterError},
     session::{ClientSession, SessionTaskResult},
 };
-use crate::util::now_ms;
+use crate::{pagination::PageCursor, util::now_ms};
 
 const ENGINE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const RPC_SEND_QUEUE: usize = 64;
@@ -150,6 +151,11 @@ impl EngineClient {
         .await
     }
 
+    pub(crate) async fn all_configured_stations(&self) -> Result<ListConfiguredStationsResponse> {
+        collect_configured_stations(|offset, page_size| self.configured_stations(offset, page_size))
+            .await
+    }
+
     /// 查询规范化站点名对应的 unified UUID，用于 GET_WEATHER 请求与 payload 过滤。
     pub(crate) async fn resolve_station_uuid(
         &self,
@@ -233,6 +239,29 @@ impl EngineClient {
             bail!("{}: {}", err.code, err.message);
         }
         Ok(Resp::decode(response.payload.as_slice())?)
+    }
+}
+
+async fn collect_configured_stations<Fetch, FetchFuture>(
+    mut fetch: Fetch,
+) -> Result<ListConfiguredStationsResponse>
+where
+    Fetch: FnMut(u32, u32) -> FetchFuture,
+    FetchFuture: Future<Output = Result<ListConfiguredStationsResponse>>,
+{
+    let mut cursor = PageCursor::default();
+    let mut combined = ListConfiguredStationsResponse::default();
+    loop {
+        let (offset, page_size) = cursor.request(MAX_RPC_PAGE_SIZE)?;
+        let mut page = fetch(offset, page_size).await?;
+        let has_more = page.has_more;
+        let next_offset = page.next_offset;
+        combined.stations.append(&mut page.stations);
+        combined.has_more = has_more;
+        combined.next_offset = next_offset;
+        if !cursor.advance(has_more, next_offset)? {
+            return Ok(combined);
+        }
     }
 }
 
@@ -333,11 +362,71 @@ async fn run_event_receiver(
 
 #[cfg(test)]
 mod tests {
-    use std::future::pending as never;
+    use std::{cell::RefCell, future::pending as never};
 
     use tokio::{sync::oneshot, time::advance};
 
     use super::*;
+
+    fn configured_station(index: usize) -> ConfiguredStation {
+        ConfiguredStation {
+            name: format!("station-{index}"),
+            enabled: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_station_collection_pages_all_257_entries() {
+        let pages = RefCell::new(VecDeque::from([
+            ListConfiguredStationsResponse {
+                stations: (0..256).map(configured_station).collect(),
+                has_more: true,
+                next_offset: 256,
+            },
+            ListConfiguredStationsResponse {
+                stations: vec![configured_station(256)],
+                has_more: false,
+                next_offset: 257,
+            },
+        ]));
+        let requests = RefCell::new(Vec::new());
+
+        let response = collect_configured_stations(|offset, page_size| {
+            requests.borrow_mut().push((offset, page_size));
+            std::future::ready(Ok(pages.borrow_mut().pop_front().unwrap()))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(response.stations.len(), 257);
+        assert_eq!(response.stations[0].name, "station-0");
+        assert_eq!(response.stations[256].name, "station-256");
+        assert!(!response.has_more);
+        assert_eq!(response.next_offset, 257);
+        assert_eq!(
+            requests.into_inner(),
+            vec![(0, MAX_RPC_PAGE_SIZE), (256, MAX_RPC_PAGE_SIZE)]
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_station_collection_honors_early_end() {
+        let requests = RefCell::new(Vec::new());
+
+        let response = collect_configured_stations(|offset, page_size| {
+            requests.borrow_mut().push((offset, page_size));
+            std::future::ready(Ok(ListConfiguredStationsResponse {
+                stations: vec![configured_station(0)],
+                has_more: false,
+                next_offset: 1,
+            }))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(response.stations.len(), 1);
+        assert_eq!(requests.into_inner(), vec![(0, MAX_RPC_PAGE_SIZE)]);
+    }
 
     struct DropNotice(Option<oneshot::Sender<()>>);
 

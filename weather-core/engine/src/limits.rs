@@ -1,9 +1,9 @@
+use weather_schema::{MAX_RPC_PAGE_OFFSET, MAX_RPC_PAGE_SIZE};
+
 pub(crate) const MAX_RPC_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_CONCURRENT_REQUESTS: usize = 64;
 pub(crate) const MAX_CONCURRENT_REFRESHES: usize = 4;
 pub(crate) const MAX_CONCURRENT_CATALOG_FETCHES: usize = 8;
-pub(crate) const MAX_PAGE_SIZE: u32 = 256;
-pub(crate) const MAX_PAGE_OFFSET: u32 = 100_000;
 pub(crate) const MAX_BATCH_QUERIES: usize = 64;
 pub(crate) const DEFAULT_PAGE_SIZE: u32 = 32;
 pub(crate) const DEFAULT_FUZZY_PAGE_SIZE: u32 = 10;
@@ -13,9 +13,9 @@ pub(crate) fn normalize_pagination(
     page_size: u32,
     default_page_size: u32,
 ) -> Result<(usize, usize), String> {
-    if offset > MAX_PAGE_OFFSET {
+    if offset > MAX_RPC_PAGE_OFFSET {
         return Err(format!(
-            "page_offset {offset} exceeds maximum {MAX_PAGE_OFFSET}"
+            "page_offset {offset} exceeds maximum {MAX_RPC_PAGE_OFFSET}"
         ));
     }
     let page_size = if page_size == 0 {
@@ -23,9 +23,9 @@ pub(crate) fn normalize_pagination(
     } else {
         page_size
     };
-    if page_size > MAX_PAGE_SIZE {
+    if page_size > MAX_RPC_PAGE_SIZE {
         return Err(format!(
-            "page_size {page_size} exceeds maximum {MAX_PAGE_SIZE}"
+            "page_size {page_size} exceeds maximum {MAX_RPC_PAGE_SIZE}"
         ));
     }
     Ok((offset as usize, page_size as usize))
@@ -48,19 +48,19 @@ mod tests {
     #[test]
     fn pagination_applies_default_and_accepts_bounds() {
         assert_eq!(
-            normalize_pagination(MAX_PAGE_OFFSET, 0, DEFAULT_PAGE_SIZE),
-            Ok((MAX_PAGE_OFFSET as usize, DEFAULT_PAGE_SIZE as usize))
+            normalize_pagination(MAX_RPC_PAGE_OFFSET, 0, DEFAULT_PAGE_SIZE),
+            Ok((MAX_RPC_PAGE_OFFSET as usize, DEFAULT_PAGE_SIZE as usize))
         );
         assert_eq!(
-            normalize_pagination(0, MAX_PAGE_SIZE, DEFAULT_PAGE_SIZE),
-            Ok((0, MAX_PAGE_SIZE as usize))
+            normalize_pagination(0, MAX_RPC_PAGE_SIZE, DEFAULT_PAGE_SIZE),
+            Ok((0, MAX_RPC_PAGE_SIZE as usize))
         );
     }
 
     #[test]
     fn pagination_rejects_oversized_values() {
-        assert!(normalize_pagination(MAX_PAGE_OFFSET + 1, 1, DEFAULT_PAGE_SIZE).is_err());
-        assert!(normalize_pagination(0, MAX_PAGE_SIZE + 1, DEFAULT_PAGE_SIZE).is_err());
+        assert!(normalize_pagination(MAX_RPC_PAGE_OFFSET + 1, 1, DEFAULT_PAGE_SIZE).is_err());
+        assert!(normalize_pagination(0, MAX_RPC_PAGE_SIZE + 1, DEFAULT_PAGE_SIZE).is_err());
     }
 
     #[test]

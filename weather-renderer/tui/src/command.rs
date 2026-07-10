@@ -91,7 +91,7 @@ async fn run_stations_command(
 ) -> Result<()> {
     match command {
         StationsCommand::List => {
-            let resp = client.configured_stations(0, 1024).await?;
+            let resp = client.all_configured_stations().await?;
             output(cli.format, &resp, || {
                 render_configured_stations(&resp.stations)
             })
