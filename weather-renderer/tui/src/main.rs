@@ -4,6 +4,7 @@ mod command;
 mod connection;
 mod daemon;
 mod pagination;
+mod presentation;
 mod render;
 mod search;
 mod terminal;
