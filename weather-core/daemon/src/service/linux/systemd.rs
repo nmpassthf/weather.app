@@ -22,6 +22,7 @@ pub(crate) fn install(
     config_override: Option<PathBuf>,
     manage_service: bool,
 ) -> Result<()> {
+    require_linux()?;
     if manage_service {
         let mut runner = ProcessCommandRunner;
         let mut logger = StdoutLogger;
@@ -49,9 +50,7 @@ pub(crate) fn reinstall(
     config_override: Option<PathBuf>,
     manage_service: bool,
 ) -> Result<()> {
-    if cfg!(not(unix)) {
-        bail!("systemd backend requires unix");
-    }
+    require_linux()?;
     let unit_path = systemd_unit_path(system)?;
     let installed = unit_path.exists();
     if !installed {
@@ -89,6 +88,7 @@ pub(crate) fn reinstall(
 }
 
 pub(crate) fn uninstall(with_data: bool, with_bin: bool) -> Result<()> {
+    require_linux()?;
     let mut runner = ProcessCommandRunner;
     let mut logger = StdoutLogger;
     uninstall_with(with_data, with_bin, &mut runner, &mut logger)
@@ -117,9 +117,7 @@ fn install_unit(
     base: &Path,
     output_mode: InstallOutputMode,
 ) -> Result<()> {
-    if cfg!(not(unix)) {
-        bail!("systemd backend requires unix");
-    }
+    require_linux()?;
     let unit_dir = if system {
         PathBuf::from("/etc/systemd/system")
     } else {
@@ -321,6 +319,13 @@ fn systemd_unit_path(system: bool) -> Result<PathBuf> {
     } else {
         user_unit_path()
     }
+}
+
+fn require_linux() -> Result<()> {
+    if !cfg!(target_os = "linux") {
+        bail!("systemd service backend is supported only on Linux");
+    }
+    Ok(())
 }
 
 trait CommandRunner {

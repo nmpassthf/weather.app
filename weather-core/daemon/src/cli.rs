@@ -41,35 +41,35 @@ pub(crate) enum Command {
 pub(crate) enum ServiceCommand {
     /// 安装服务。默认 user 模式(base=~/.weather),--system 装 /opt/weather(需 root)。
     Install {
-        /// 服务后端:systemd(Unix)/ windows(Win)。
+        /// 服务后端：systemd 仅支持 Linux；windows 保留为明确的 unsupported 选项。
         backend: ServiceBackend,
         /// 显式 system 模式。默认 user。
         #[arg(long)]
         system: bool,
-        /// 覆盖 base path(默认 user: ~/.weather,system: /opt/weather 或 Win Program Files)。
+        /// 覆盖 base path（默认 user: ~/.weather，system: /opt/weather）。
         #[arg(long)]
         path: Option<PathBuf>,
         /// 指定 config 路径(默认 <base>/config/weather.toml)。
         #[arg(long, short = 'c')]
         config: Option<PathBuf>,
-        /// 只安装文件/unit,不直接修改系统服务状态；打印需要手动执行的 next steps。
+        /// 只安装文件/unit，不修改 systemd 状态；不能启用未实现的 Windows SCM backend。
         #[arg(long)]
         no_modification_service: bool,
     },
     /// 重新安装已存在的服务，并重载/启动 systemd unit。
     Reinstall {
-        /// 服务后端:systemd(Unix)/ windows(Win)。
+        /// 服务后端：systemd 仅支持 Linux；windows 保留为明确的 unsupported 选项。
         backend: ServiceBackend,
         /// 显式 system 模式。默认 user。
         #[arg(long)]
         system: bool,
-        /// 覆盖 base path(默认 user: ~/.weather,system: /opt/weather 或 Win Program Files)。
+        /// 覆盖 base path（默认 user: ~/.weather，system: /opt/weather）。
         #[arg(long)]
         path: Option<PathBuf>,
         /// 指定 config 路径(默认 <base>/config/weather.toml)。
         #[arg(long, short = 'c')]
         config: Option<PathBuf>,
-        /// 只重新安装文件/unit,不直接修改系统服务状态；打印需要手动执行的 next steps。
+        /// 只重新安装文件/unit，不修改 systemd 状态；不能启用未实现的 Windows SCM backend。
         #[arg(long)]
         no_modification_service: bool,
     },
@@ -88,9 +88,11 @@ pub(crate) enum ServiceCommand {
     },
 }
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, Copy, ValueEnum)]
 pub(crate) enum ServiceBackend {
+    /// Linux systemd user/system service。
     Systemd,
+    /// 当前不支持：weather-daemon 尚未实现 Windows SCM dispatcher。
     Windows,
 }
 

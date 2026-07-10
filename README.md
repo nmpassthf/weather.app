@@ -64,6 +64,10 @@ weather-tui --core-restart-engine
 
 ## Service Installation
 
+Service management currently supports systemd on Linux only. The `windows`
+backend name is retained so unsupported SCM operations fail with a clear error;
+`weather-daemon` does not yet implement a Windows SCM service dispatcher.
+
 Install the daemon as a user service:
 
 ```sh
@@ -96,7 +100,9 @@ weather-daemon service remove systemd --all
 ```
 
 Use `--no-modification-service` when you want the installer to write files and
-print next steps without starting or modifying the service state.
+print next steps without starting or modifying the systemd service state. This
+flag does not enable the unsupported Windows SCM backend; Windows service
+commands fail before writing installation files.
 
 ## Build
 
