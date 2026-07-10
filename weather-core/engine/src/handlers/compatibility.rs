@@ -1,3 +1,5 @@
+//! Wire-compatible adapters for v1 RPCs superseded by simpler client flows.
+
 use weather_schema::*;
 
 use crate::{
@@ -32,13 +34,15 @@ impl Engine {
         }
         let mut pages = Vec::with_capacity(queries.len());
         for (province, offset, page_size) in queries {
-            let page = self.fetch_region_page(&province, offset, page_size).await;
-            pages.push(page);
+            pages.push(
+                self.fetch_legacy_region_page(&province, offset, page_size)
+                    .await,
+            );
         }
         self.ok(&request.request_id, BatchListRegionsResponse { pages })
     }
 
-    async fn fetch_region_page(
+    async fn fetch_legacy_region_page(
         &self,
         province: &str,
         offset: usize,
@@ -64,5 +68,28 @@ impl Engine {
                 error: Some(err.to_string()),
             },
         }
+    }
+
+    pub(super) async fn handle_resolve_station_uuid(&self, request: &RpcRequest) -> RpcResponse {
+        let decoded = decode_message::<ResolveStationUuidRequest>(&request.payload);
+        let Ok(req) = decoded else {
+            return Self::rpc_error_response(
+                &request.request_id,
+                "BAD_REQUEST",
+                decoded.unwrap_err().to_string(),
+            );
+        };
+        let unified_uuid = unified_station_uuid(&req.name);
+        self.ok(
+            &request.request_id,
+            ResolveStationUuidResponse {
+                name: req.name,
+                unified_uuid,
+            },
+        )
+    }
+
+    pub(super) async fn handle_trigger_refresh(&self, request: &RpcRequest) -> RpcResponse {
+        self.handle_weather_request(request, true).await
     }
 }

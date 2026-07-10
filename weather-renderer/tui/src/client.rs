@@ -163,20 +163,6 @@ impl EngineClient {
             .await
     }
 
-    /// 查询规范化站点名对应的 unified UUID，用于 GET_WEATHER 请求与 payload 过滤。
-    pub(crate) async fn resolve_station_uuid(
-        &self,
-        name: &str,
-    ) -> Result<ResolveStationUuidResponse> {
-        self.request(
-            RpcKind::ResolveStationUuid,
-            ResolveStationUuidRequest {
-                name: name.to_string(),
-            },
-        )
-        .await
-    }
-
     /// 拉取 engine 当前 config（`defaults=true` 拿默认模板）。
     pub(crate) async fn get_config(&self, defaults: bool) -> Result<GetConfigResponse> {
         self.request(RpcKind::GetConfig, GetConfigRequest { defaults })

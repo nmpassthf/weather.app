@@ -297,10 +297,7 @@ async fn fetch_weather(
     let unified_uuid = if let Some(address) = address {
         let station = resolve_address(client, address).await?;
         if station.unified_uuid.is_empty() {
-            client
-                .resolve_station_uuid(&station.name)
-                .await?
-                .unified_uuid
+            unified_station_uuid(&station.name)
         } else {
             station.unified_uuid
         }

@@ -261,7 +261,7 @@ async fn load_weather(
 ) -> anyhow::Result<WeatherSnapshot> {
     let unified_uuid = match unified_uuid {
         Some(uuid) if !uuid.is_empty() => uuid,
-        _ => client.resolve_station_uuid(name).await?.unified_uuid,
+        _ => unified_station_uuid(name),
     };
     client
         .request::<GetWeatherRequest, WeatherSnapshot>(

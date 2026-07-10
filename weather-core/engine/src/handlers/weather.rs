@@ -9,24 +9,14 @@ use crate::{
 
 impl Engine {
     pub(super) async fn handle_get_weather(&self, request: &RpcRequest) -> RpcResponse {
-        let decoded = decode_message::<GetWeatherRequest>(&request.payload);
-        let Ok(req) = decoded else {
-            return Self::rpc_error_response(
-                &request.request_id,
-                "BAD_REQUEST",
-                decoded.unwrap_err().to_string(),
-            );
-        };
-        match self.get_weather_internal(req).await {
-            Ok(snapshot) => {
-                self.publish_snapshot(&snapshot);
-                self.ok(&request.request_id, snapshot)
-            }
-            Err(err) => Self::rpc_error_response(&request.request_id, "WEATHER", err.to_string()),
-        }
+        self.handle_weather_request(request, false).await
     }
 
-    pub(super) async fn handle_trigger_refresh(&self, request: &RpcRequest) -> RpcResponse {
+    pub(super) async fn handle_weather_request(
+        &self,
+        request: &RpcRequest,
+        force_refresh: bool,
+    ) -> RpcResponse {
         let decoded = decode_message::<GetWeatherRequest>(&request.payload);
         let Ok(mut req) = decoded else {
             return Self::rpc_error_response(
@@ -35,7 +25,9 @@ impl Engine {
                 decoded.unwrap_err().to_string(),
             );
         };
-        req.refresh = true;
+        if force_refresh {
+            req.refresh = true;
+        }
         match self.get_weather_internal(req).await {
             Ok(snapshot) => {
                 self.publish_snapshot(&snapshot);

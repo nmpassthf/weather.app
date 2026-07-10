@@ -116,4 +116,31 @@ mod tests {
         assert_eq!(decoded.db.unwrap().lock_path, "legacy.lock");
         assert_eq!(decoded.daemon.unwrap().service_backend, "legacy");
     }
+
+    #[test]
+    fn rpc_kind_v1_numbers_are_frozen() {
+        let expected = [
+            (RpcKind::Unspecified, 0),
+            (RpcKind::Ping, 1),
+            (RpcKind::GetEngineStatus, 2),
+            (RpcKind::GetWeather, 10),
+            (RpcKind::ListProvinces, 11),
+            (RpcKind::ListCities, 12),
+            (RpcKind::FuzzyMatchStations, 13),
+            (RpcKind::ListConfiguredStations, 14),
+            (RpcKind::BatchListRegions, 15),
+            (RpcKind::ResolveStationUuid, 16),
+            (RpcKind::MigrateDbTimezone, 17),
+            (RpcKind::GetConfig, 18),
+            (RpcKind::UpdateConfig, 19),
+            (RpcKind::TriggerRefresh, 30),
+            (RpcKind::RestartEngine, 40),
+            (RpcKind::Shutdown, 41),
+        ];
+
+        for (kind, number) in expected {
+            assert_eq!(kind as i32, number, "wire number changed for {kind:?}");
+            assert_eq!(RpcKind::try_from(number), Ok(kind));
+        }
+    }
 }

@@ -52,11 +52,14 @@ enum RpcKind {
   LIST_CITIES = 12;
   FUZZY_MATCH_STATIONS = 13;
   LIST_CONFIGURED_STATIONS = 14;
+  // Legacy compatibility operations. New clients use paged LIST_CITIES and
+  // derive unified station UUIDs locally.
   BATCH_LIST_REGIONS = 15;
   RESOLVE_STATION_UUID = 16;
   MIGRATE_DB_TIMEZONE = 17;
   GET_CONFIG = 18;
   UPDATE_CONFIG = 19;
+  // Legacy alias for GET_WEATHER with refresh=true.
   TRIGGER_REFRESH = 30;
   RESTART_ENGINE = 40;
   SHUTDOWN = 41;
