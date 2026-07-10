@@ -24,7 +24,7 @@ impl Engine {
     pub(crate) fn publish_event(&self, topic: &str, kind: EventKind, payload: Vec<u8>) {
         let mut envelope = EventEnvelope {
             schema_version: SCHEMA_VERSION.to_string(),
-            event_id: crate::time::request_id(),
+            event_id: correlation_id("engine-event"),
             kind: kind as i32,
             timestamp_unix_ms: now_ms(),
             hmac_sha256: Vec::new(),
@@ -53,7 +53,7 @@ impl Engine {
         let payload = status.encode_to_vec();
         let mut envelope = EventEnvelope {
             schema_version: SCHEMA_VERSION.to_string(),
-            event_id: crate::time::request_id(),
+            event_id: correlation_id("engine-event"),
             kind: EventKind::EngineStatus as i32,
             timestamp_unix_ms: now_ms(),
             hmac_sha256: Vec::new(),

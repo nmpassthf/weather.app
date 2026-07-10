@@ -16,7 +16,7 @@ use zeromq::{DealerSocket, RepSocket, Socket, SocketRecv, SocketSend, ZmqMessage
 
 use crate::{
     path::{absolute_config_path, normalize_path, resolve_relative},
-    time::{now_ms, request_id},
+    time::now_ms,
 };
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -212,7 +212,7 @@ async fn rpc_endpoint_status(
     }
     let mut envelope = RpcRequest {
         schema_version: SCHEMA_VERSION.to_string(),
-        request_id: request_id(),
+        request_id: correlation_id("daemon-request"),
         kind: RpcKind::GetEngineStatus as i32,
         timestamp_unix_ms: now_ms(),
         hmac_sha256: Vec::new(),

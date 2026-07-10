@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use prost::Message;
@@ -7,10 +11,24 @@ use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use weather_schema::*;
 use zeromq::{Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
 
-use crate::util::{now_ms, request_id};
+use crate::util::now_ms;
 
 const ENGINE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const RPC_SEND_QUEUE: usize = 64;
+
+fn insert_pending_if_vacant(
+    pending: &mut HashMap<String, oneshot::Sender<RpcResponse>>,
+    request_id: String,
+    sender: oneshot::Sender<RpcResponse>,
+) -> bool {
+    match pending.entry(request_id) {
+        Entry::Vacant(entry) => {
+            entry.insert(sender);
+            true
+        }
+        Entry::Occupied(_) => false,
+    }
+}
 
 /// 引擎客户端：DEALER 走 RPC，SUB 订阅 PUB 事件。
 #[derive(Clone)]
@@ -177,20 +195,29 @@ impl EngineClient {
         Req: Message,
         Resp: Message + Default,
     {
-        let request_id = request_id();
-        let mut envelope = RpcRequest {
-            schema_version: SCHEMA_VERSION.to_string(),
-            request_id: request_id.clone(),
-            kind: kind as i32,
-            timestamp_unix_ms: now_ms(),
-            hmac_sha256: Vec::new(),
-            payload: payload.encode_to_vec(),
+        let payload = payload.encode_to_vec();
+        let (request_id, envelope, rx) = loop {
+            let request_id = correlation_id("tui-request");
+            let mut envelope = RpcRequest {
+                schema_version: SCHEMA_VERSION.to_string(),
+                request_id: request_id.clone(),
+                kind: kind as i32,
+                timestamp_unix_ms: now_ms(),
+                hmac_sha256: Vec::new(),
+                payload: payload.clone(),
+            };
+            if let Some(key) = self.hmac_key {
+                envelope.hmac_sha256 = weather_schema::rpc_request_hmac(&envelope, &key)?;
+            }
+            let (tx, rx) = oneshot::channel();
+            let inserted = {
+                let mut pending = self.pending.lock().await;
+                insert_pending_if_vacant(&mut pending, request_id.clone(), tx)
+            };
+            if inserted {
+                break (request_id, envelope, rx);
+            }
         };
-        if let Some(key) = self.hmac_key {
-            envelope.hmac_sha256 = weather_schema::rpc_request_hmac(&envelope, &key)?;
-        }
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(request_id.clone(), tx);
         if tokio::time::timeout(
             ENGINE_REQUEST_TIMEOUT,
             self.rpc_send.send(envelope.encode_to_vec()),
@@ -215,5 +242,41 @@ impl EngineClient {
             bail!("{}: {}", err.code, err.message);
         }
         Ok(Resp::decode(response.payload.as_slice())?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_collision_does_not_replace_the_active_request() {
+        let mut pending = HashMap::new();
+        let (first_tx, first_rx) = oneshot::channel();
+        let (second_tx, second_rx) = oneshot::channel();
+
+        assert!(insert_pending_if_vacant(
+            &mut pending,
+            "same-request".to_string(),
+            first_tx,
+        ));
+        assert!(!insert_pending_if_vacant(
+            &mut pending,
+            "same-request".to_string(),
+            second_tx,
+        ));
+        assert_eq!(pending.len(), 1);
+
+        pending
+            .remove("same-request")
+            .expect("first request must remain registered")
+            .send(RpcResponse {
+                request_id: "same-request".to_string(),
+                ..Default::default()
+            })
+            .expect("first receiver must remain active");
+
+        assert_eq!(first_rx.blocking_recv().unwrap().request_id, "same-request");
+        assert!(second_rx.blocking_recv().is_err());
     }
 }
