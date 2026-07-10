@@ -99,6 +99,13 @@ weather-daemon service remove systemd
 weather-daemon service remove systemd --all
 ```
 
+Pass the same scope and path overrides when removing a custom installation:
+
+```sh
+weather-daemon service remove systemd --system --path /custom/weather \
+  --config /custom/weather/weather.toml --all
+```
+
 Use `--no-modification-service` when you want the installer to write files and
 print next steps without starting or modifying the systemd service state. This
 flag does not enable the unsupported Windows SCM backend; Windows service

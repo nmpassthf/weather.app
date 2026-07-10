@@ -42,10 +42,13 @@ async fn main() -> Result<()> {
             } => reinstall_service(backend, system, path, config, !no_modification_service),
             ServiceCommand::Remove {
                 backend,
+                system,
+                path,
+                config,
                 with_data,
                 with_bin,
                 all,
-            } => uninstall_service(backend, with_data || all, with_bin || all),
+            } => uninstall_service(backend, system, path, config, with_data, with_bin, all),
         },
         Command::Status { config, verbose } => probe(config, verbose).await,
     }

@@ -27,12 +27,23 @@ pub(crate) fn install_service(
 /// 卸载服务:停服务 + 删 unit/服务定义 + 可选删 data/bin。
 pub(crate) fn uninstall_service(
     backend: ServiceBackend,
+    system: bool,
+    path_override: Option<PathBuf>,
+    config_override: Option<PathBuf>,
     with_data: bool,
     with_bin: bool,
+    all: bool,
 ) -> Result<()> {
     validate_service_backend(backend)?;
     match backend {
-        ServiceBackend::Systemd => linux::systemd::uninstall(with_data, with_bin)?,
+        ServiceBackend::Systemd => linux::systemd::uninstall(
+            system,
+            path_override,
+            config_override,
+            with_data || all,
+            with_bin || all,
+            all,
+        )?,
         ServiceBackend::Windows => return unsupported_windows_backend(),
     }
     Ok(())
@@ -178,7 +189,16 @@ mod tests {
 
     #[test]
     fn windows_remove_is_explicitly_rejected() {
-        let err = uninstall_service(ServiceBackend::Windows, false, false).unwrap_err();
+        let err = uninstall_service(
+            ServiceBackend::Windows,
+            false,
+            None,
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
 
         assert!(err.to_string().contains("SCM service dispatcher"));
     }

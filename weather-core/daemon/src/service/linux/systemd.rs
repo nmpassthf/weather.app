@@ -6,7 +6,10 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-use crate::service::helper::{cleanup_base, install_service_files, service_name};
+use crate::service::helper::{
+    ServiceCleanupOptions, ServiceLayout, cleanup_service_layout, install_service_files,
+    service_name,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InstallOutputMode {
@@ -23,24 +26,18 @@ pub(crate) fn install(
     manage_service: bool,
 ) -> Result<()> {
     require_linux()?;
+    let layout = ServiceLayout::resolve(system, path_override, config_override)?;
     if manage_service {
         let mut runner = ProcessCommandRunner;
         let mut logger = StdoutLogger;
         install_service_with_activation(
-            system,
-            path_override,
-            config_override,
+            &layout,
             InstallOutputMode::Install,
             &mut runner,
             &mut logger,
         )
     } else {
-        install_files_and_unit(
-            system,
-            path_override,
-            config_override,
-            InstallOutputMode::ManualInstall,
-        )
+        install_files_and_unit(&layout, InstallOutputMode::ManualInstall)
     }
 }
 
@@ -51,8 +48,11 @@ pub(crate) fn reinstall(
     manage_service: bool,
 ) -> Result<()> {
     require_linux()?;
+    let layout = ServiceLayout::resolve(system, path_override, config_override)?;
     let unit_path = systemd_unit_path(system)?;
-    let installed = unit_path.exists();
+    let installed = unit_path
+        .try_exists()
+        .with_context(|| format!("inspect systemd unit {}", unit_path.display()))?;
     if !installed {
         bail!(
             "{} systemd service is not installed; run service install first",
@@ -60,12 +60,7 @@ pub(crate) fn reinstall(
         );
     }
     if !manage_service {
-        return install_files_and_unit(
-            system,
-            path_override,
-            config_override,
-            InstallOutputMode::ManualReinstall,
-        );
+        return install_files_and_unit(&layout, InstallOutputMode::ManualReinstall);
     }
     let mut runner = ProcessCommandRunner;
     let mut logger = StdoutLogger;
@@ -73,52 +68,51 @@ pub(crate) fn reinstall(
         system,
         true,
         |runner, logger| {
-            install_service_with_activation(
-                system,
-                path_override,
-                config_override,
-                InstallOutputMode::Reinstall,
-                runner,
-                logger,
-            )
+            install_service_with_activation(&layout, InstallOutputMode::Reinstall, runner, logger)
         },
         &mut runner,
         &mut logger,
     )
 }
 
-pub(crate) fn uninstall(with_data: bool, with_bin: bool) -> Result<()> {
-    require_linux()?;
-    let mut runner = ProcessCommandRunner;
-    let mut logger = StdoutLogger;
-    uninstall_with(with_data, with_bin, &mut runner, &mut logger)
-}
-
-fn install_files_and_unit(
+pub(crate) fn uninstall(
     system: bool,
     path_override: Option<PathBuf>,
     config_override: Option<PathBuf>,
-    output_mode: InstallOutputMode,
+    with_data: bool,
+    with_bin: bool,
+    all: bool,
 ) -> Result<()> {
-    let files = install_service_files(system, path_override, config_override)?;
-    install_unit(
-        system,
-        &files.bin_exe,
-        &files.config_path,
-        &files.base,
-        output_mode,
+    require_linux()?;
+    let layout = ServiceLayout::resolve(system, path_override, config_override)?;
+    let unit_path = systemd_unit_path(system)?;
+    let mut runner = ProcessCommandRunner;
+    let mut logger = StdoutLogger;
+    uninstall_with(
+        &layout,
+        &unit_path,
+        ServiceCleanupOptions {
+            with_data,
+            with_bin,
+            remove_registry: all,
+        },
+        &mut runner,
+        &mut logger,
     )
 }
 
+fn install_files_and_unit(layout: &ServiceLayout, output_mode: InstallOutputMode) -> Result<()> {
+    let files = install_service_files(layout)?;
+    install_unit(layout, &files.bin_exe, output_mode)
+}
+
 fn install_unit(
-    system: bool,
+    layout: &ServiceLayout,
     bin_exe: &Path,
-    config_path: &Path,
-    base: &Path,
     output_mode: InstallOutputMode,
 ) -> Result<()> {
     require_linux()?;
-    let unit_dir = if system {
+    let unit_dir = if layout.system {
         PathBuf::from("/etc/systemd/system")
     } else {
         let home = std::env::var_os("HOME").context("HOME is not set")?;
@@ -127,13 +121,13 @@ fn install_unit(
     fs::create_dir_all(&unit_dir)?;
     let unit_path = unit_dir.join(format!("{}.service", service_name()));
     let escaped_exe = shell_escape(&bin_exe.display().to_string());
-    let escaped_config = shell_escape(&config_path.display().to_string());
-    let wanted_by = if system {
+    let escaped_config = shell_escape(&layout.config_path.display().to_string());
+    let wanted_by = if layout.system {
         "multi-user.target"
     } else {
         "default.target"
     };
-    let user_section = if system {
+    let user_section = if layout.system {
         "\nUser=root\nGroup=root"
     } else {
         ""
@@ -159,12 +153,12 @@ WantedBy={wanted_by}
     );
     fs::write(&unit_path, unit)?;
     println!("installed unit: {}", unit_path.display());
-    println!("config: {}", config_path.display());
-    println!("base:   {}", base.display());
+    println!("config: {}", layout.config_path.display());
+    println!("base:   {}", layout.base.display());
     let bin_dir = bin_exe
         .parent()
         .context("installed binary has no parent directory")?;
-    for line in install_next_step_lines(system, bin_dir, output_mode) {
+    for line in install_next_step_lines(layout.system, bin_dir, output_mode) {
         println!("{line}");
     }
     Ok(())
@@ -237,15 +231,13 @@ fn install_next_step_lines(
 }
 
 fn install_service_with_activation(
-    system: bool,
-    path_override: Option<PathBuf>,
-    config_override: Option<PathBuf>,
+    layout: &ServiceLayout,
     output_mode: InstallOutputMode,
     runner: &mut (impl CommandRunner + ?Sized),
     logger: &mut (impl ServiceLogger + ?Sized),
 ) -> Result<()> {
-    install_files_and_unit(system, path_override, config_override, output_mode)?;
-    activate_service(system, runner, logger)
+    install_files_and_unit(layout, output_mode)?;
+    activate_service(layout.system, runner, logger)
 }
 
 fn activate_service(
@@ -271,21 +263,19 @@ fn reinstall_with(
             service_name()
         );
     }
-    run_optional_systemctl(runner, logger, system, &["stop", service_name()]);
+    require_systemctl(runner, logger, system, &["stop", service_name()])?;
     install(runner, logger)
 }
 
 fn uninstall_with(
-    with_data: bool,
-    with_bin: bool,
+    layout: &ServiceLayout,
+    unit_path: &Path,
+    cleanup_options: ServiceCleanupOptions,
     runner: &mut (impl CommandRunner + ?Sized),
     logger: &mut (impl ServiceLogger + ?Sized),
 ) -> Result<()> {
-    let user_unit = user_unit_path()?;
-    let system_unit = PathBuf::from(format!("/etc/systemd/system/{}.service", service_name()));
-    remove_unit(false, &user_unit, runner, logger)?;
-    remove_unit(true, &system_unit, runner, logger)?;
-    cleanup_base(with_data, with_bin)
+    remove_unit(layout.system, unit_path, runner, logger)?;
+    cleanup_service_layout(layout, cleanup_options)
 }
 
 fn remove_unit(
@@ -294,13 +284,22 @@ fn remove_unit(
     runner: &mut (impl CommandRunner + ?Sized),
     logger: &mut (impl ServiceLogger + ?Sized),
 ) -> Result<()> {
-    if !unit_path.exists() {
+    if !unit_path
+        .try_exists()
+        .with_context(|| format!("inspect systemd unit {}", unit_path.display()))?
+    {
         return Ok(());
     }
-    run_optional_systemctl(runner, logger, system, &["stop", service_name()]);
-    run_optional_systemctl(runner, logger, system, &["disable", service_name()]);
-    fs::remove_file(unit_path)?;
-    println!("removed unit: {}", unit_path.display());
+    require_systemctl(runner, logger, system, &["stop", service_name()])?;
+    require_systemctl(runner, logger, system, &["disable", service_name()])?;
+    match fs::remove_file(unit_path) {
+        Ok(()) => println!("removed unit: {}", unit_path.display()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("remove systemd unit {}", unit_path.display()));
+        }
+    }
     require_systemctl(runner, logger, system, &["daemon-reload"])?;
     Ok(())
 }
@@ -377,20 +376,6 @@ fn run_systemctl(
 ) -> Result<bool> {
     let full_args = systemctl_args(system, args);
     runner.status("systemctl", &full_args)
-}
-
-fn run_optional_systemctl(
-    runner: &mut (impl CommandRunner + ?Sized),
-    logger: &mut (impl ServiceLogger + ?Sized),
-    system: bool,
-    args: &[&str],
-) {
-    let command = systemctl_display(system, args);
-    match run_systemctl(runner, system, args) {
-        Ok(true) => logger.log(&format!("{command}: ok")),
-        Ok(false) => logger.log(&format!("{command}: failed (ignored)")),
-        Err(err) => logger.log(&format!("{command}: failed ({err}) (ignored)")),
-    }
 }
 
 fn require_systemctl(
@@ -519,6 +504,32 @@ mod tests {
     }
 
     #[test]
+    fn reinstall_stop_failure_prevents_install() {
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let stop = format!("systemctl --user stop {}", service_name());
+        let mut runner = RecordingCommandRunner::fail_on(events.clone(), stop.clone());
+        let mut logger = RecordingLogger::default();
+        let installed = std::cell::Cell::new(false);
+
+        let err = reinstall_with(
+            false,
+            true,
+            |_, _| {
+                installed.set(true);
+                Ok(())
+            },
+            &mut runner,
+            &mut logger,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains(&format!("{stop} failed")));
+        assert!(!installed.get());
+        assert_eq!(events.borrow().as_slice(), std::slice::from_ref(&stop));
+        assert_eq!(logger.messages, vec![format!("{stop}: failed")]);
+    }
+
+    #[test]
     fn install_service_reloads_enables_and_starts() {
         let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let mut runner = RecordingCommandRunner::new(events.clone());
@@ -575,6 +586,176 @@ mod tests {
     }
 
     #[test]
+    fn remove_unit_stop_failure_preserves_the_unit() {
+        let base = unique_test_dir("remove-stop-failure");
+        fs::create_dir_all(&base).unwrap();
+        let unit = base.join("weather.service");
+        fs::write(&unit, b"unit").unwrap();
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let stop = format!("systemctl --user stop {}", service_name());
+        let mut runner = RecordingCommandRunner::fail_on(events.clone(), stop.clone());
+        let mut logger = RecordingLogger::default();
+
+        let err = remove_unit(false, &unit, &mut runner, &mut logger).unwrap_err();
+
+        assert!(err.to_string().contains(&format!("{stop} failed")));
+        assert!(unit.exists());
+        assert_eq!(events.borrow().as_slice(), &[stop]);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn remove_unit_disable_failure_preserves_the_unit() {
+        let base = unique_test_dir("remove-disable-failure");
+        fs::create_dir_all(&base).unwrap();
+        let unit = base.join("weather.service");
+        fs::write(&unit, b"unit").unwrap();
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let disable = format!("systemctl --user disable {}", service_name());
+        let mut runner = RecordingCommandRunner::fail_on(events.clone(), disable.clone());
+        let mut logger = RecordingLogger::default();
+
+        let err = remove_unit(false, &unit, &mut runner, &mut logger).unwrap_err();
+
+        assert!(err.to_string().contains(&format!("{disable} failed")));
+        assert!(unit.exists());
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[format!("systemctl --user stop {}", service_name()), disable,]
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn remove_unit_reload_failure_is_reported() {
+        let base = unique_test_dir("remove-reload-failure");
+        fs::create_dir_all(&base).unwrap();
+        let unit = base.join("weather.service");
+        fs::write(&unit, b"unit").unwrap();
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let reload = "systemctl --user daemon-reload".to_string();
+        let mut runner = RecordingCommandRunner::fail_on(events.clone(), reload.clone());
+        let mut logger = RecordingLogger::default();
+
+        let err = remove_unit(false, &unit, &mut runner, &mut logger).unwrap_err();
+
+        assert!(err.to_string().contains(&format!("{reload} failed")));
+        assert!(!unit.exists());
+        assert_eq!(events.borrow().last(), Some(&reload));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn missing_unit_still_cleans_the_selected_layout() {
+        let base = unique_test_dir("missing-unit-cleanup");
+        let layout = ServiceLayout::resolve(
+            false,
+            Some(base.join("base")),
+            Some(base.join("external/weather.toml")),
+        )
+        .unwrap();
+        fs::create_dir_all(layout.config_path.parent().unwrap()).unwrap();
+        fs::write(&layout.config_path, b"config").unwrap();
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut runner = RecordingCommandRunner::new(events.clone());
+        let mut logger = RecordingLogger::default();
+
+        uninstall_with(
+            &layout,
+            &base.join("missing.service"),
+            ServiceCleanupOptions {
+                with_data: true,
+                with_bin: false,
+                remove_registry: false,
+            },
+            &mut runner,
+            &mut logger,
+        )
+        .unwrap();
+
+        assert!(!layout.config_path.exists());
+        assert!(events.borrow().is_empty());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn uninstall_removes_only_the_selected_scope_unit() {
+        let base = unique_test_dir("selected-unit");
+        fs::create_dir_all(&base).unwrap();
+        let layout = ServiceLayout::resolve(false, Some(base.join("layout")), None).unwrap();
+        let selected_unit = base.join("user.service");
+        let other_unit = base.join("system.service");
+        fs::write(&selected_unit, b"user").unwrap();
+        fs::write(&other_unit, b"system").unwrap();
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut runner = RecordingCommandRunner::new(events.clone());
+        let mut logger = RecordingLogger::default();
+
+        uninstall_with(
+            &layout,
+            &selected_unit,
+            ServiceCleanupOptions {
+                with_data: false,
+                with_bin: false,
+                remove_registry: false,
+            },
+            &mut runner,
+            &mut logger,
+        )
+        .unwrap();
+
+        assert!(!selected_unit.exists());
+        assert!(other_unit.exists());
+        assert!(
+            events
+                .borrow()
+                .iter()
+                .all(|event| event.starts_with("systemctl --user "))
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn uninstall_command_failure_skips_component_cleanup() {
+        for command in [
+            format!("systemctl --user stop {}", service_name()),
+            format!("systemctl --user disable {}", service_name()),
+            "systemctl --user daemon-reload".to_string(),
+        ] {
+            let base = unique_test_dir("failed-uninstall-cleanup");
+            fs::create_dir_all(&base).unwrap();
+            let layout = ServiceLayout::resolve(
+                false,
+                Some(base.join("layout")),
+                Some(base.join("weather.toml")),
+            )
+            .unwrap();
+            fs::write(&layout.config_path, b"config").unwrap();
+            let unit = base.join("weather.service");
+            fs::write(&unit, b"unit").unwrap();
+            let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let mut runner = RecordingCommandRunner::fail_on(events, command);
+            let mut logger = RecordingLogger::default();
+
+            uninstall_with(
+                &layout,
+                &unit,
+                ServiceCleanupOptions {
+                    with_data: true,
+                    with_bin: false,
+                    remove_registry: false,
+                },
+                &mut runner,
+                &mut logger,
+            )
+            .unwrap_err();
+
+            assert!(layout.config_path.exists());
+            let _ = fs::remove_dir_all(&base);
+        }
+    }
+
+    #[test]
     fn reinstall_output_omits_systemctl_next_steps() {
         let lines = install_next_step_lines(
             false,
@@ -617,21 +798,42 @@ mod tests {
 
     struct RecordingCommandRunner {
         events: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        fail_on: Option<String>,
     }
 
     impl RecordingCommandRunner {
         fn new(events: std::rc::Rc<std::cell::RefCell<Vec<String>>>) -> Self {
-            Self { events }
+            Self {
+                events,
+                fail_on: None,
+            }
+        }
+
+        fn fail_on(events: std::rc::Rc<std::cell::RefCell<Vec<String>>>, command: String) -> Self {
+            Self {
+                events,
+                fail_on: Some(command),
+            }
         }
     }
 
     impl CommandRunner for RecordingCommandRunner {
         fn status(&mut self, program: &str, args: &[&str]) -> Result<bool> {
-            self.events
-                .borrow_mut()
-                .push(format!("{program} {}", args.join(" ")));
-            Ok(true)
+            let command = format!("{program} {}", args.join(" "));
+            self.events.borrow_mut().push(command.clone());
+            Ok(self.fail_on.as_deref() != Some(command.as_str()))
         }
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "weather-systemd-{name}-{}-{nanos}",
+            std::process::id()
+        ))
     }
 
     #[derive(Default)]
