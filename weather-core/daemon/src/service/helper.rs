@@ -4,7 +4,8 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use weather_configure::{ComponentKind, ComponentRegistry, default_config_toml};
+use weather_configure::default_config_toml;
+use weather_manifest::{COMPONENT_MANIFEST_FILE_NAME, ComponentKind, ComponentManifest};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::service) struct ServiceLayout {
@@ -12,7 +13,7 @@ pub(in crate::service) struct ServiceLayout {
     pub(in crate::service) base: PathBuf,
     pub(in crate::service) bin_dir: PathBuf,
     pub(in crate::service) config_path: PathBuf,
-    pub(in crate::service) registry_path: PathBuf,
+    pub(in crate::service) manifest_path: PathBuf,
 }
 
 impl ServiceLayout {
@@ -33,13 +34,13 @@ impl ServiceLayout {
                 config_path.display()
             )
         })?;
-        let registry_path = config_dir.join("component.list.db");
+        let manifest_path = config_dir.join(COMPONENT_MANIFEST_FILE_NAME);
         Ok(Self {
             system,
             base,
             bin_dir,
             config_path,
-            registry_path,
+            manifest_path,
         })
     }
 }
@@ -48,7 +49,7 @@ impl ServiceLayout {
 pub(in crate::service) struct ServiceCleanupOptions {
     pub(in crate::service) with_data: bool,
     pub(in crate::service) with_bin: bool,
-    pub(in crate::service) remove_registry: bool,
+    pub(in crate::service) remove_manifest: bool,
 }
 
 pub(in crate::service) struct ServiceInstallFiles {
@@ -67,12 +68,12 @@ pub(in crate::service) fn install_service_files(
         )
     })?;
     fs::create_dir_all(config_dir).with_context(|| format!("mkdir {}", config_dir.display()))?;
-    let registry = ComponentRegistry::open(&layout.registry_path)?;
+    let manifest = ComponentManifest::open(&layout.manifest_path);
 
     // 复制当前 daemon 二进制 + workspace 中其他同目录二进制(若存在)。
     let exe = std::env::current_exe().context("failed to resolve current exe")?;
     let bin_exe = copy_binary(&exe, &layout.bin_dir)?;
-    registry.record(ComponentKind::Bin, &bin_exe)?;
+    manifest.record(ComponentKind::Bin, &bin_exe)?;
     if let Some(parent) = exe.parent() {
         for sibling in sibling_binary_names() {
             let src = parent.join(&sibling);
@@ -81,7 +82,7 @@ pub(in crate::service) fn install_service_files(
                 .with_context(|| format!("inspect sibling binary {}", src.display()))?
             {
                 let copied = copy_binary(&src, &layout.bin_dir)?;
-                registry.record(ComponentKind::Bin, copied)?;
+                manifest.record(ComponentKind::Bin, copied)?;
             }
         }
     }
@@ -95,7 +96,7 @@ pub(in crate::service) fn install_service_files(
         fs::write(&layout.config_path, default_config_toml())
             .with_context(|| format!("write default config {}", layout.config_path.display()))?;
     }
-    registry.record(ComponentKind::Config, &layout.config_path)?;
+    manifest.record(ComponentKind::Config, &layout.config_path)?;
 
     Ok(ServiceInstallFiles { bin_exe })
 }
@@ -207,44 +208,52 @@ pub(in crate::service) fn cleanup_service_layout(
     layout: &ServiceLayout,
     options: ServiceCleanupOptions,
 ) -> Result<()> {
-    if !options.with_data && !options.with_bin && !options.remove_registry {
+    if !options.with_data && !options.with_bin && !options.remove_manifest {
         return Ok(());
     }
-    let registry_exists = layout
-        .registry_path
+    let manifest_exists = layout
+        .manifest_path
         .try_exists()
-        .with_context(|| format!("inspect registry {}", layout.registry_path.display()))?;
-    let entries = if registry_exists {
-        ComponentRegistry::open(&layout.registry_path)?.list()?
+        .with_context(|| format!("inspect manifest {}", layout.manifest_path.display()))?;
+    let entries = if manifest_exists {
+        ComponentManifest::open(&layout.manifest_path).list()?
     } else {
         Vec::new()
     };
+    let mut first_error = None;
 
     for entry in entries {
         let should_remove = match entry.kind {
-            ComponentKind::Config
-            | ComponentKind::Db
-            | ComponentKind::Lock
-            | ComponentKind::Temp => options.with_data,
+            ComponentKind::Config | ComponentKind::Db | ComponentKind::Lock => options.with_data,
             ComponentKind::Bin => options.with_bin,
         };
         if should_remove {
-            remove_component_path(&entry.path)?;
+            retain_first_error(&mut first_error, remove_component_path(&entry.path));
         }
     }
 
     if options.with_data {
-        remove_component_path(&layout.config_path)?;
+        retain_first_error(&mut first_error, remove_component_path(&layout.config_path));
     }
     if options.with_bin {
-        remove_component_path(&layout.bin_dir)?;
+        retain_first_error(&mut first_error, remove_component_path(&layout.bin_dir));
     }
-    if options.remove_registry {
-        remove_component_path(&layout.registry_path)?;
-        remove_component_path(&sidecar_path(&layout.registry_path, "db-wal"))?;
-        remove_component_path(&sidecar_path(&layout.registry_path, "db-shm"))?;
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    if options.remove_manifest {
+        remove_component_path(&layout.manifest_path)?;
+        remove_component_path(&ComponentManifest::lock_path_for(&layout.manifest_path))?;
     }
     Ok(())
+}
+
+fn retain_first_error(first_error: &mut Option<anyhow::Error>, result: Result<()>) {
+    if let Err(error) = result
+        && first_error.is_none()
+    {
+        *first_error = Some(error);
+    }
 }
 
 pub(in crate::service) fn remove_component_path(path: &Path) -> Result<()> {
@@ -268,10 +277,6 @@ pub(in crate::service) fn remove_component_path(path: &Path) -> Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err).with_context(|| format!("remove component {}", path.display())),
     }
-}
-
-fn sidecar_path(path: &Path, extension: &str) -> PathBuf {
-    path.with_extension(extension)
 }
 
 #[cfg(test)]
@@ -308,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn service_layout_uses_the_external_config_registry() {
+    fn service_layout_uses_the_external_config_manifest() {
         let root = unique_test_dir("external-layout");
         let base = root.join("base");
         let config = root.join("external/weather.toml");
@@ -321,8 +326,8 @@ mod tests {
         assert_eq!(layout.bin_dir, root.join("base/bin"));
         assert_eq!(layout.config_path, config);
         assert_eq!(
-            layout.registry_path,
-            root.join("external/component.list.db")
+            layout.manifest_path,
+            root.join("external/component-manifest.toml")
         );
     }
 
@@ -340,10 +345,10 @@ mod tests {
 
         assert!(files.bin_exe.is_file());
         assert!(layout.config_path.is_file());
-        assert!(layout.registry_path.is_file());
-        assert!(!root.join("base/config/component.list.db").exists());
-        let entries = ComponentRegistry::open(&layout.registry_path)
-            .unwrap()
+        assert!(layout.manifest_path.is_file());
+        assert!(ComponentManifest::lock_path_for(&layout.manifest_path).is_file());
+        assert!(!root.join("base/config/component-manifest.toml").exists());
+        let entries = ComponentManifest::open(&layout.manifest_path)
             .list()
             .unwrap();
         assert!(entries.iter().any(|entry| {
@@ -421,64 +426,104 @@ mod tests {
         let layout = populated_layout(&root);
         let db = root.join("external/weather.db");
         let lock = root.join("external/weather.db.lock");
-        let temporary = root.join("external/tmp");
 
         cleanup_service_layout(
             &layout,
             ServiceCleanupOptions {
                 with_data: true,
                 with_bin: true,
-                remove_registry: true,
+                remove_manifest: true,
             },
         )
         .unwrap();
 
         assert!(!layout.config_path.exists());
         assert!(!layout.bin_dir.exists());
-        assert!(!layout.registry_path.exists());
+        assert!(!layout.manifest_path.exists());
+        assert!(!ComponentManifest::lock_path_for(&layout.manifest_path).exists());
         assert!(!db.exists());
         assert!(!lock.exists());
-        assert!(!temporary.exists());
         assert!(root.join("keep.txt").exists());
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn partial_cleanup_is_repeatable_and_preserves_the_registry() {
+    fn partial_cleanup_is_repeatable_and_preserves_the_manifest() {
         let root = unique_test_dir("partial-cleanup");
         let layout = populated_layout(&root);
         let data_only = ServiceCleanupOptions {
             with_data: true,
             with_bin: false,
-            remove_registry: false,
+            remove_manifest: false,
         };
         let bin_only = ServiceCleanupOptions {
             with_data: false,
             with_bin: true,
-            remove_registry: false,
+            remove_manifest: false,
         };
 
         cleanup_service_layout(&layout, data_only).unwrap();
         cleanup_service_layout(&layout, data_only).unwrap();
         assert!(!layout.config_path.exists());
         assert!(layout.bin_dir.exists());
-        assert!(layout.registry_path.exists());
+        assert!(layout.manifest_path.exists());
+        assert!(ComponentManifest::lock_path_for(&layout.manifest_path).exists());
 
         cleanup_service_layout(&layout, bin_only).unwrap();
         cleanup_service_layout(&layout, bin_only).unwrap();
         assert!(!layout.bin_dir.exists());
-        assert!(layout.registry_path.exists());
+        assert!(layout.manifest_path.exists());
+        assert!(ComponentManifest::lock_path_for(&layout.manifest_path).exists());
 
         cleanup_service_layout(
             &layout,
             ServiceCleanupOptions {
                 with_data: true,
                 with_bin: true,
-                remove_registry: true,
+                remove_manifest: true,
             },
         )
         .unwrap();
-        assert!(!layout.registry_path.exists());
+        assert!(!layout.manifest_path.exists());
+        assert!(!ComponentManifest::lock_path_for(&layout.manifest_path).exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cleanup_continues_after_error_and_preserves_manifest_for_retry() {
+        let root = unique_test_dir("cleanup-first-error");
+        let layout = ServiceLayout::resolve(
+            false,
+            Some(root.join("base")),
+            Some(root.join("external/weather.toml")),
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("external")).unwrap();
+        let blocker = root.join("external/a-blocker");
+        let blocked = blocker.join("child");
+        let removable = root.join("external/z-removable");
+        fs::write(&blocker, b"not-a-directory").unwrap();
+        fs::write(&removable, b"remove-me").unwrap();
+        let manifest = ComponentManifest::open(&layout.manifest_path);
+        manifest.record(ComponentKind::Db, &blocked).unwrap();
+        manifest.record(ComponentKind::Db, &removable).unwrap();
+        let options = ServiceCleanupOptions {
+            with_data: true,
+            with_bin: false,
+            remove_manifest: true,
+        };
+
+        let error = cleanup_service_layout(&layout, options).unwrap_err();
+
+        assert!(error.to_string().contains("inspect component"), "{error:#}");
+        assert!(!removable.exists());
+        assert!(layout.manifest_path.exists());
+        assert!(ComponentManifest::lock_path_for(&layout.manifest_path).exists());
+
+        fs::remove_file(blocker).unwrap();
+        cleanup_service_layout(&layout, options).unwrap();
+        assert!(!layout.manifest_path.exists());
+        assert!(!ComponentManifest::lock_path_for(&layout.manifest_path).exists());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -509,21 +554,17 @@ mod tests {
         let bin = layout.bin_dir.join(executable_name(service_name()));
         let db = root.join("external/weather.db");
         let lock = root.join("external/weather.db.lock");
-        let temporary = root.join("external/tmp");
         fs::write(&bin, b"bin").unwrap();
         fs::write(&db, b"db").unwrap();
         fs::write(&lock, b"lock").unwrap();
-        fs::create_dir_all(&temporary).unwrap();
-        fs::write(temporary.join("part"), b"temp").unwrap();
         fs::write(root.join("keep.txt"), b"keep").unwrap();
-        let registry = ComponentRegistry::open(&layout.registry_path).unwrap();
-        registry
+        let manifest = ComponentManifest::open(&layout.manifest_path);
+        manifest
             .record(ComponentKind::Config, &layout.config_path)
             .unwrap();
-        registry.record(ComponentKind::Bin, &bin).unwrap();
-        registry.record(ComponentKind::Db, &db).unwrap();
-        registry.record(ComponentKind::Lock, &lock).unwrap();
-        registry.record(ComponentKind::Temp, &temporary).unwrap();
+        manifest.record(ComponentKind::Bin, &bin).unwrap();
+        manifest.record(ComponentKind::Db, &db).unwrap();
+        manifest.record(ComponentKind::Lock, &lock).unwrap();
         layout
     }
 

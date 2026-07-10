@@ -6,10 +6,11 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use weather_configure::{
-    AppConfig, ComponentKind, ComponentRegistry, ConfigState, ensure_config_file, load_or_default,
-    normalize_config_stations, validate, write_config_atomic,
+    AppConfig, ConfigState, ensure_config_file, load_or_default, normalize_config_stations,
+    validate, write_config_atomic,
 };
 use weather_db::{DatabasePaths, DbActor};
+use weather_manifest::{ComponentKind, ComponentManifest};
 use weather_schema::{ENGINE_LOCK_METADATA_VERSION, EngineLockMetadata, correlation_id};
 use weather_updater::{WeatherProvider, create_weather_provider};
 
@@ -103,7 +104,7 @@ impl EngineRuntime {
     {
         let config_path = absolute_config_path(config_path)?;
         ensure_config_file(&config_path)?;
-        let components = ComponentRegistry::for_config_path(&config_path)?;
+        let components = ComponentManifest::for_config_path(&config_path);
         components.record(ComponentKind::Config, &config_path)?;
         let mut config = load_or_default(&config_path)?;
         let base_dir = config_path
@@ -648,7 +649,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn runtime_registers_exact_database_component_paths() {
+    async fn runtime_manifest_records_exact_database_component_paths() {
         let directory = tempfile::tempdir().unwrap();
         let config_path = directory.path().join("weather.toml");
         let data = directory.path().join("cache.sqlite3");
@@ -659,8 +660,7 @@ mod tests {
 
         let runtime = EngineRuntime::start(config_path.clone()).await.unwrap();
         runtime.engine.db.shutdown().await.unwrap();
-        let entries = ComponentRegistry::for_config_path(&config_path)
-            .unwrap()
+        let entries = ComponentManifest::for_config_path(&config_path)
             .list()
             .unwrap();
         let mut database_entries = entries

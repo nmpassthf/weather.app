@@ -3016,7 +3016,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono-tz",
- "rusqlite",
  "serde",
  "tempfile",
  "tokio",
@@ -3040,6 +3039,7 @@ dependencies = [
  "toml",
  "weather-configure",
  "weather-engine",
+ "weather-manifest",
  "weather-schema",
  "zeromq",
 ]
@@ -3074,9 +3074,21 @@ dependencies = [
  "toml",
  "weather-configure",
  "weather-db",
+ "weather-manifest",
  "weather-schema",
  "weather-updater",
  "zeromq",
+]
+
+[[package]]
+name = "weather-manifest"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fs2",
+ "serde",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]

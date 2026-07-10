@@ -1,4 +1,3 @@
-mod components;
 mod defaults;
 mod load;
 mod normalize;
@@ -8,7 +7,6 @@ mod state;
 mod types;
 mod validate;
 
-pub use components::*;
 pub use defaults::*;
 pub use load::*;
 pub use normalize::*;

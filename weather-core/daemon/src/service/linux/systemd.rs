@@ -94,7 +94,7 @@ pub(crate) fn uninstall(
         ServiceCleanupOptions {
             with_data,
             with_bin,
-            remove_registry: all,
+            remove_manifest: all,
         },
         &mut runner,
         &mut logger,
@@ -666,7 +666,7 @@ mod tests {
             ServiceCleanupOptions {
                 with_data: true,
                 with_bin: false,
-                remove_registry: false,
+                remove_manifest: false,
             },
             &mut runner,
             &mut logger,
@@ -697,7 +697,7 @@ mod tests {
             ServiceCleanupOptions {
                 with_data: false,
                 with_bin: false,
-                remove_registry: false,
+                remove_manifest: false,
             },
             &mut runner,
             &mut logger,
@@ -743,7 +743,7 @@ mod tests {
                 ServiceCleanupOptions {
                     with_data: true,
                     with_bin: false,
-                    remove_registry: false,
+                    remove_manifest: false,
                 },
                 &mut runner,
                 &mut logger,

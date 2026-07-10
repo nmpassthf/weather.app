@@ -5,10 +5,7 @@ use std::str::FromStr;
 use anyhow::{Context, Result, bail};
 use toml::Value;
 
-use crate::{
-    AppConfig, ComponentKind, ComponentRegistry, SUPPORTED_CONFIG_VERSION, default_config_toml,
-    normalize_station_name,
-};
+use crate::{AppConfig, SUPPORTED_CONFIG_VERSION, default_config_toml, normalize_station_name};
 
 /// 按 `ipc.hmac` 模式解析出实际 HMAC key。
 ///
@@ -55,7 +52,6 @@ pub fn ensure_config_file(path: &Path) -> Result<()> {
     }
     std::fs::write(path, default_config_toml())
         .with_context(|| format!("failed to write default config {}", path.display()))?;
-    ComponentRegistry::for_config_path(path)?.record(ComponentKind::Config, path)?;
     Ok(())
 }
 
@@ -272,6 +268,23 @@ mod tests {
     #[test]
     fn valid_config_passes() {
         assert!(validate(&base_config()).is_ok());
+    }
+
+    #[test]
+    fn ensuring_config_has_no_component_manifest_side_effect() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("weather.toml");
+
+        ensure_config_file(&path).unwrap();
+
+        assert!(path.is_file());
+        assert!(!directory.path().join("component-manifest.toml").exists());
+        assert!(
+            !directory
+                .path()
+                .join("component-manifest.toml.lock")
+                .exists()
+        );
     }
 
     #[test]

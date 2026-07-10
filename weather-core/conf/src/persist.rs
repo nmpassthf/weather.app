@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result};
 use tempfile::{Builder, NamedTempFile};
 
-use crate::{AppConfig, ComponentKind, ComponentRegistry};
+use crate::AppConfig;
 
 /// A fully written and synced configuration that has not replaced its target.
 /// Dropping this value removes the unique temporary file without changing the
@@ -46,9 +46,6 @@ pub fn prepare_config_atomic(path: &Path, config: &AppConfig) -> Result<Prepared
         .suffix(".tmp")
         .tempfile_in(parent)
         .with_context(|| format!("failed to create temp config in {}", parent.display()))?;
-
-    let components = ComponentRegistry::for_config_path(path)?;
-    components.record(ComponentKind::Config, path)?;
 
     temporary
         .write_all(content.as_bytes())
@@ -101,7 +98,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_prepared_config_preserves_target_and_removes_temporary_file() {
+    fn dropping_prepared_config_preserves_target_without_manifest_side_effects() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("weather.toml");
         let initial = AppConfig::default();
@@ -118,14 +115,12 @@ mod tests {
 
         assert!(!temporary_path.exists());
         assert_eq!(crate::load_from_path(&path).unwrap(), initial);
-        let entries = ComponentRegistry::for_config_path(&path)
-            .unwrap()
-            .list()
-            .unwrap();
+        assert!(!directory.path().join("component-manifest.toml").exists());
         assert!(
-            entries
-                .iter()
-                .all(|entry| entry.kind != ComponentKind::Temp)
+            !directory
+                .path()
+                .join("component-manifest.toml.lock")
+                .exists()
         );
     }
 }

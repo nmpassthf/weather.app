@@ -91,7 +91,7 @@ pub(crate) enum ServiceCommand {
         /// 同时删除 bin 目录。
         #[arg(long)]
         with_bin: bool,
-        /// 删除全部 data/bin，并在最后删除 component registry。
+        /// 删除全部 data/bin，并在最后删除 component manifest。
         #[arg(long)]
         all: bool,
     },

@@ -3,6 +3,7 @@ resolver = "3"
 members = [
   "weather-schema",
   "weather-core/conf",
+  "weather-core/manifest",
   "weather-core/utils",
   "weather-core/db",
   "weather-core/updater",
