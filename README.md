@@ -168,4 +168,36 @@ make release-static
 target/release-artifacts/<target-triple>/weather-daemon service reinstall systemd
 ```
 
-For upstream API inspection or troubleshooting, use the scripts in `scripts/`.
+## NMC Diagnostic Scripts
+
+The executable scripts in `scripts/` make live NMC requests for upstream API
+inspection and troubleshooting. Their arguments and defaults are:
+
+| Script | Arguments | Defaults | Additional dependencies |
+| --- | --- | --- | --- |
+| `list_provinces.sh` | none | none | none |
+| `list_cities.sh` | `[province_code]` | `ABJ` | none |
+| `fetch_weather.sh` | `[station_id]` | `MjXfi` | none |
+| `inspect_nmc_capabilities.sh` | `[station_id] [province_code]` | `Wqsps ABJ` | Python 3, `sed`, `mktemp`, `rm` |
+| `explore_nmc_api.sh` | `[forecast_page_url] [station_id]` | `<base-url>/publish/forecast/ABJ/chaoyang.html MjXfi` | `sed`, `mktemp`, `rm` |
+
+All five scripts require a POSIX-compatible `sh` and `curl`. Run them directly,
+for example:
+
+```sh
+./scripts/list_provinces.sh
+./scripts/list_cities.sh ABJ
+./scripts/fetch_weather.sh MjXfi
+./scripts/inspect_nmc_capabilities.sh Wqsps ABJ
+./scripts/explore_nmc_api.sh \
+  https://www.nmc.cn/publish/forecast/ABJ/chaoyang.html MjXfi
+```
+
+`NMC_BASE_URL` selects the upstream origin and defaults to
+`https://www.nmc.cn`. Supply an origin without a trailing slash. It also
+controls the default forecast page used by `explore_nmc_api.sh`; an explicit
+first argument overrides that page URL.
+
+```sh
+NMC_BASE_URL=http://127.0.0.1:8080 ./scripts/fetch_weather.sh MjXfi
+```
