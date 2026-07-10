@@ -20,9 +20,6 @@ pub fn restart_required_fields(current: &AppConfig, new: &AppConfig) -> Vec<&'st
     if current.updater.provider != new.updater.provider {
         fields.push("updater.provider");
     }
-    if current.daemon != new.daemon {
-        fields.push("daemon");
-    }
     fields
 }
 
@@ -73,7 +70,6 @@ mod tests {
         new.db.timezone = "UTC".to_string();
         new.updater.default_provider = "other".to_string();
         new.updater.provider[0].base_url = "https://example.invalid".to_string();
-        new.daemon.foreground = !current.daemon.foreground;
 
         assert_eq!(
             restart_required_fields(&current, &new),
@@ -83,7 +79,6 @@ mod tests {
                 "db",
                 "updater.default_provider",
                 "updater.provider",
-                "daemon",
             ]
         );
     }

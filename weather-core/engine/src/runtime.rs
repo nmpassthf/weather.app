@@ -6,8 +6,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use weather_configure::{
-    AppConfig, ConfigState, ensure_config_file, load_or_default, normalize_config_stations,
-    validate, write_config_atomic,
+    AppConfig, ConfigState, ensure_config_file, load_for_engine_startup, load_or_default, validate,
+    write_config_atomic,
 };
 use weather_db::{DatabasePaths, DbActor};
 use weather_manifest::{ComponentKind, ComponentManifest};
@@ -103,29 +103,31 @@ impl EngineRuntime {
         F: FnOnce(&weather_configure::UpdaterConfig) -> Result<Arc<dyn WeatherProvider>>,
     {
         let config_path = absolute_config_path(config_path)?;
-        ensure_config_file(&config_path)?;
-        let components = ComponentManifest::for_config_path(&config_path);
-        components.record(ComponentKind::Config, &config_path)?;
-        let mut config = load_or_default(&config_path)?;
+        // This first load is deliberately read-only: it is used only to find
+        // the stable singleton lock, including for legacy in-memory configs.
+        let preliminary_config = load_or_default(&config_path)?;
         let base_dir = config_path
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        let engine_lock_path = resolve_relative(&base_dir, &config.engine.lock_path)?;
-        components.record(ComponentKind::Lock, &engine_lock_path)?;
+        let engine_lock_path = resolve_relative(&base_dir, &preliminary_config.engine.lock_path)?;
         let launch = launch_metadata(&config_path, owner_token)?;
-        let _engine_lock = LockGuard::engine(engine_lock_path, &launch)?;
-        if normalize_config_stations(&mut config) {
-            validate(&config)?;
-            write_config_atomic(&config_path, &config)?;
-        }
+        let _engine_lock = LockGuard::engine(engine_lock_path.clone(), &launch)?;
+
+        // Only the singleton owner may create or migrate the persistent
+        // config. Migration and station normalization share one atomic write.
+        ensure_config_file(&config_path)?;
+        let mut config = load_for_engine_startup(&config_path)?;
+        let components = ComponentManifest::for_config_path(&config_path);
+        components.record(ComponentKind::Config, &config_path)?;
+        components.record(ComponentKind::Lock, &engine_lock_path)?;
         // Construct all stable fallible dependencies before taking the DB lock
         // or starting its worker. A constructor error must not leave an
         // asynchronously reaped worker temporarily holding the lock.
         let provider = factory(&config.updater)?;
-        // Bind the lock to the canonical DB path and ignore db.lock_path (kept
-        // only for TOML compatibility). Lexical and symlink aliases converge;
-        // hard-link aliases are not supported by suffix-derived sidecars.
+        // Bind the lock to the canonical DB path. Lexical and symlink aliases
+        // converge; hard-link aliases are not supported by suffix-derived
+        // sidecars.
         let db_path = resolve_relative(&base_dir, &config.db.path)?;
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
@@ -242,7 +244,9 @@ mod tests {
     };
 
     use anyhow::bail;
-    use weather_configure::{AppConfig, StationConfig, load_from_path, write_config_atomic};
+    use weather_configure::{
+        AppConfig, StationConfig, load_from_path, normalize_config_stations, write_config_atomic,
+    };
     use weather_schema::{
         DebugPayload, Empty, ListCitiesRequest, ListCitiesResponse, ListProvincesRequest,
         ListProvincesResponse, ResponseStatus, RpcKind, RpcRequest, SCHEMA_VERSION,
@@ -253,6 +257,35 @@ mod tests {
     };
 
     use super::*;
+
+    fn legacy_v1_toml(config: &AppConfig) -> String {
+        let mut value = toml::Value::try_from(config.clone()).unwrap();
+        let root = value.as_table_mut().unwrap();
+        root.insert("config_version".to_string(), toml::Value::Integer(1));
+        root.get_mut("ipc")
+            .and_then(toml::Value::as_table_mut)
+            .unwrap()
+            .insert(
+                "transport".to_string(),
+                toml::Value::String("tcp".to_string()),
+            );
+        root.get_mut("db")
+            .and_then(toml::Value::as_table_mut)
+            .unwrap()
+            .insert(
+                "lock_path".to_string(),
+                toml::Value::String("weather.db.lock".to_string()),
+            );
+        root.insert(
+            "daemon".to_string(),
+            toml::Value::Table(toml::toml! {
+                service_backend = "auto"
+                foreground = true
+                service_scope = "user"
+            }),
+        );
+        toml::to_string_pretty(&value).unwrap()
+    }
 
     struct ScriptedProvider {
         name: String,
@@ -563,6 +596,64 @@ mod tests {
 
         assert_eq!(runtime.engine.config.get(), expected);
         assert_eq!(load_from_path(&path).unwrap(), expected);
+        runtime.engine.db.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_config_is_persisted_only_after_engine_lock_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("weather.toml");
+        let original = legacy_v1_toml(&AppConfig::default());
+        std::fs::write(&config_path, &original).unwrap();
+        let blocker = LockGuard::exclusive(directory.path().join("engine.lock")).unwrap();
+
+        assert!(EngineRuntime::start(config_path.clone()).await.is_err());
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), original);
+        assert!(!directory.path().join("component-manifest.toml").exists());
+
+        drop(blocker);
+        let runtime = EngineRuntime::start(config_path.clone()).await.unwrap();
+        let persisted = std::fs::read_to_string(&config_path).unwrap();
+        let value: toml::Value = toml::from_str(&persisted).unwrap();
+
+        assert_eq!(
+            value
+                .get("config_version")
+                .and_then(toml::Value::as_integer),
+            Some(i64::from(weather_configure::SUPPORTED_CONFIG_VERSION))
+        );
+        assert!(value.get("daemon").is_none());
+        assert!(value.get("ipc").unwrap().get("transport").is_none());
+        assert!(value.get("db").unwrap().get("lock_path").is_none());
+        assert!(value.get("engine").unwrap().get("lock_path").is_some());
+        runtime.engine.db.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_config_is_created_only_by_engine_lock_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("weather.toml");
+        let blocker = LockGuard::exclusive(directory.path().join("engine.lock")).unwrap();
+
+        assert!(EngineRuntime::start(config_path.clone()).await.is_err());
+        assert!(!config_path.exists());
+        assert!(!directory.path().join("component-manifest.toml").exists());
+        assert!(
+            !directory
+                .path()
+                .join("component-manifest.toml.lock")
+                .exists()
+        );
+
+        drop(blocker);
+        let runtime = EngineRuntime::start(config_path.clone()).await.unwrap();
+
+        assert!(config_path.exists());
+        assert_eq!(
+            load_from_path(&config_path).unwrap().config_version,
+            weather_configure::SUPPORTED_CONFIG_VERSION
+        );
+        assert!(directory.path().join("component-manifest.toml").exists());
         runtime.engine.db.shutdown().await.unwrap();
     }
 

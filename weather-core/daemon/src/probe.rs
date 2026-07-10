@@ -480,6 +480,36 @@ fn file_matches_path(file: &File, path: &Path) -> Result<bool> {
 mod tests {
     use super::*;
 
+    fn legacy_v1_toml() -> String {
+        let mut value: toml::Value =
+            toml::from_str(&weather_configure::default_config_toml()).unwrap();
+        let root = value.as_table_mut().unwrap();
+        root.insert("config_version".to_string(), toml::Value::Integer(1));
+        root.get_mut("ipc")
+            .and_then(toml::Value::as_table_mut)
+            .unwrap()
+            .insert(
+                "transport".to_string(),
+                toml::Value::String("tcp".to_string()),
+            );
+        root.get_mut("db")
+            .and_then(toml::Value::as_table_mut)
+            .unwrap()
+            .insert(
+                "lock_path".to_string(),
+                toml::Value::String("weather.db.lock".to_string()),
+            );
+        root.insert(
+            "daemon".to_string(),
+            toml::Value::Table(toml::toml! {
+                service_backend = "auto"
+                foreground = true
+                service_scope = "user"
+            }),
+        );
+        toml::to_string_pretty(&value).unwrap()
+    }
+
     fn classify(
         lock_state: LockState,
         age: Duration,
@@ -731,5 +761,19 @@ mod tests {
         assert!(!config_path.exists());
         assert!(!parent.exists());
         assert!(!directory.path().join("missing").exists());
+    }
+
+    #[tokio::test]
+    async fn legacy_config_probe_migrates_only_in_memory() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("weather.toml");
+        let content = legacy_v1_toml();
+        std::fs::write(&config_path, &content).unwrap();
+
+        let _ = probe_status(Some(config_path.clone())).await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), content);
+        assert!(!directory.path().join("engine.lock").exists());
+        assert!(!directory.path().join("component-manifest.toml").exists());
     }
 }

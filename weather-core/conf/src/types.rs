@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::defaults::*;
 
-pub const SUPPORTED_CONFIG_VERSION: u32 = 1;
+pub const SUPPORTED_CONFIG_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -12,7 +12,6 @@ pub struct AppConfig {
     pub ipc: IpcConfig,
     pub db: DbConfig,
     pub updater: UpdaterConfig,
-    pub daemon: DaemonConfig,
     pub stations: Vec<StationConfig>,
 }
 
@@ -27,7 +26,6 @@ pub struct EngineConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IpcConfig {
-    pub transport: String,
     pub rpc_endpoint: String,
     pub pub_endpoint: String,
     /// HMAC 模式:`"disabled"`(默认,不签名)/ `"hmac_key"`(用 config 里 hmac_key 字段)/
@@ -41,7 +39,6 @@ pub struct IpcConfig {
 #[serde(deny_unknown_fields)]
 pub struct DbConfig {
     pub path: String,
-    pub lock_path: String,
     pub timezone: String,
 }
 
@@ -64,14 +61,6 @@ pub struct ProviderConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DaemonConfig {
-    pub service_backend: String,
-    pub foreground: bool,
-    pub service_scope: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct StationConfig {
     pub name: String,
     pub enabled: bool,
@@ -85,7 +74,6 @@ impl Default for AppConfig {
             ipc: IpcConfig::default(),
             db: DbConfig::default(),
             updater: UpdaterConfig::default(),
-            daemon: DaemonConfig::default(),
             stations: default_stations(),
         }
     }
@@ -104,7 +92,6 @@ impl Default for EngineConfig {
 impl Default for IpcConfig {
     fn default() -> Self {
         Self {
-            transport: default_transport(),
             rpc_endpoint: default_rpc_endpoint(),
             pub_endpoint: default_pub_endpoint(),
             hmac: default_hmac_mode(),
@@ -118,7 +105,6 @@ impl Default for DbConfig {
     fn default() -> Self {
         Self {
             path: default_db_path(),
-            lock_path: default_db_lock_path(),
             timezone: default_db_timezone(),
         }
     }
@@ -131,16 +117,6 @@ impl Default for UpdaterConfig {
             province_ttl_seconds: default_province_ttl_seconds(),
             default_provider: default_provider_name(),
             provider: default_providers(),
-        }
-    }
-}
-
-impl Default for DaemonConfig {
-    fn default() -> Self {
-        Self {
-            service_backend: default_service_backend(),
-            foreground: true,
-            service_scope: default_service_scope(),
         }
     }
 }

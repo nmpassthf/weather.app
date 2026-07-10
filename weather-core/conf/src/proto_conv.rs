@@ -1,12 +1,13 @@
 //! `weather_configure::AppConfig` 与 `weather_schema::AppConfig` 之间的转换。
 //!
-//! proto 镜像与 conf 结构体字段一一对应，转换是无损的字段拷贝。
+//! Config v2 no longer exposes several runtime-derived fields. Their protobuf
+//! numbers remain reserved for wire compatibility, so inbound values are
+//! ignored and outbound values are deterministic.
 
 use weather_schema as schema;
 
 use crate::{
-    AppConfig, DaemonConfig, DbConfig, EngineConfig, IpcConfig, ProviderConfig, StationConfig,
-    UpdaterConfig,
+    AppConfig, DbConfig, EngineConfig, IpcConfig, ProviderConfig, StationConfig, UpdaterConfig,
 };
 
 impl From<schema::AppConfig> for AppConfig {
@@ -17,7 +18,6 @@ impl From<schema::AppConfig> for AppConfig {
             ipc: value.ipc.unwrap_or_default().into(),
             db: value.db.unwrap_or_default().into(),
             updater: value.updater.unwrap_or_default().into(),
-            daemon: value.daemon.unwrap_or_default().into(),
             stations: value.stations.into_iter().map(Into::into).collect(),
         }
     }
@@ -31,7 +31,11 @@ impl From<AppConfig> for schema::AppConfig {
             ipc: Some(value.ipc.into()),
             db: Some(value.db.into()),
             updater: Some(value.updater.into()),
-            daemon: Some(value.daemon.into()),
+            daemon: Some(schema::DaemonConfig {
+                service_backend: "auto".to_string(),
+                foreground: true,
+                service_scope: "user".to_string(),
+            }),
             stations: value.stations.into_iter().map(Into::into).collect(),
         }
     }
@@ -60,7 +64,6 @@ impl From<EngineConfig> for schema::EngineConfig {
 impl From<schema::IpcConfig> for IpcConfig {
     fn from(value: schema::IpcConfig) -> Self {
         Self {
-            transport: value.transport,
             rpc_endpoint: value.rpc_endpoint,
             pub_endpoint: value.pub_endpoint,
             hmac: value.hmac,
@@ -73,7 +76,7 @@ impl From<schema::IpcConfig> for IpcConfig {
 impl From<IpcConfig> for schema::IpcConfig {
     fn from(value: IpcConfig) -> Self {
         Self {
-            transport: value.transport,
+            transport: "tcp".to_string(),
             rpc_endpoint: value.rpc_endpoint,
             pub_endpoint: value.pub_endpoint,
             hmac: value.hmac,
@@ -87,7 +90,6 @@ impl From<schema::DbConfig> for DbConfig {
     fn from(value: schema::DbConfig) -> Self {
         Self {
             path: value.path,
-            lock_path: value.lock_path,
             timezone: value.timezone,
         }
     }
@@ -95,9 +97,10 @@ impl From<schema::DbConfig> for DbConfig {
 
 impl From<DbConfig> for schema::DbConfig {
     fn from(value: DbConfig) -> Self {
+        let lock_path = format!("{}.lock", value.path);
         Self {
             path: value.path,
-            lock_path: value.lock_path,
+            lock_path,
             timezone: value.timezone,
         }
     }
@@ -145,26 +148,6 @@ impl From<ProviderConfig> for schema::ProviderConfig {
     }
 }
 
-impl From<schema::DaemonConfig> for DaemonConfig {
-    fn from(value: schema::DaemonConfig) -> Self {
-        Self {
-            service_backend: value.service_backend,
-            foreground: value.foreground,
-            service_scope: value.service_scope,
-        }
-    }
-}
-
-impl From<DaemonConfig> for schema::DaemonConfig {
-    fn from(value: DaemonConfig) -> Self {
-        Self {
-            service_backend: value.service_backend,
-            foreground: value.foreground,
-            service_scope: value.service_scope,
-        }
-    }
-}
-
 impl From<schema::StationConfig> for StationConfig {
     fn from(value: schema::StationConfig) -> Self {
         Self {
@@ -187,9 +170,8 @@ impl From<StationConfig> for schema::StationConfig {
 mod tests {
     use super::*;
 
-    #[test]
-    fn roundtrip_app_config_preserves_all_fields() {
-        let original = AppConfig {
+    fn sample_config() -> AppConfig {
+        AppConfig {
             config_version: crate::SUPPORTED_CONFIG_VERSION,
             engine: EngineConfig {
                 request_timeout_ms: 3000,
@@ -197,7 +179,6 @@ mod tests {
                 lock_path: "engine.lock".to_string(),
             },
             ipc: IpcConfig {
-                transport: "tcp".to_string(),
                 rpc_endpoint: "tcp://127.0.0.1:44445".to_string(),
                 pub_endpoint: "tcp://127.0.0.1:44444".to_string(),
                 hmac: "disabled".to_string(),
@@ -205,8 +186,7 @@ mod tests {
                 hmac_env_key_name: String::new(),
             },
             db: DbConfig {
-                path: "weather.db".to_string(),
-                lock_path: "weather.db.lock".to_string(),
+                path: "data/archive.weather.db".to_string(),
                 timezone: "Asia/Shanghai".to_string(),
             },
             updater: UpdaterConfig {
@@ -219,11 +199,6 @@ mod tests {
                     request_timeout_seconds: 20,
                 }],
             },
-            daemon: DaemonConfig {
-                service_backend: "auto".to_string(),
-                foreground: true,
-                service_scope: "user".to_string(),
-            },
             stations: vec![
                 StationConfig {
                     name: "北京-北京市-朝阳".to_string(),
@@ -234,10 +209,48 @@ mod tests {
                     enabled: false,
                 },
             ],
-        };
+        }
+    }
+
+    #[test]
+    fn roundtrip_app_config_preserves_all_live_fields() {
+        let original = sample_config();
 
         let schema: schema::AppConfig = original.clone().into();
         let back: AppConfig = schema.into();
         assert_eq!(original, back);
+    }
+
+    #[test]
+    fn inbound_legacy_wire_fields_do_not_affect_internal_config() {
+        let expected = sample_config();
+        let mut wire: schema::AppConfig = expected.clone().into();
+        wire.ipc.as_mut().unwrap().transport = "legacy-transport".to_string();
+        wire.db.as_mut().unwrap().lock_path = "legacy-db.lock".to_string();
+        wire.daemon = Some(schema::DaemonConfig {
+            service_backend: "legacy".to_string(),
+            foreground: false,
+            service_scope: "system".to_string(),
+        });
+
+        let actual: AppConfig = wire.into();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn outbound_legacy_wire_fields_are_stable() {
+        let wire: schema::AppConfig = sample_config().into();
+
+        assert_eq!(wire.ipc.unwrap().transport, "tcp");
+        assert_eq!(wire.db.unwrap().lock_path, "data/archive.weather.db.lock");
+        assert_eq!(
+            wire.daemon.unwrap(),
+            schema::DaemonConfig {
+                service_backend: "auto".to_string(),
+                foreground: true,
+                service_scope: "user".to_string(),
+            }
+        );
     }
 }

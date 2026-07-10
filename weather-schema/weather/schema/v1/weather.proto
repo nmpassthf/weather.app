@@ -201,13 +201,14 @@ message MigrateDbTimezoneResponse {
 
 message ConfiguredStation { string name = 1; bool enabled = 2; }
 
-// 完整 AppConfig 镜像，用于 GET_CONFIG / UPDATE_CONFIG RPC。
-// 字段号对齐 weather-core/conf/src/types.rs 的 AppConfig 层级。
+// AppConfig wire mirror for GET_CONFIG / UPDATE_CONFIG RPC. Field numbers are
+// stable; live fields map to internal config v2 and legacy fields stay wire-only.
 message AppConfig {
   EngineConfig engine = 1;
   IpcConfig ipc = 2;
   DbConfig db = 3;
   UpdaterConfig updater = 4;
+  // Legacy wire-only field. Internal config v2 ignores it.
   DaemonConfig daemon = 5;
   repeated StationConfig stations = 6;
   uint32 config_version = 7;
@@ -220,6 +221,7 @@ message EngineConfig {
   reserved 20 to 39;
 }
 message IpcConfig {
+  // Legacy wire-only field. Internal config v2 always uses TCP endpoints.
   string transport = 1;
   string rpc_endpoint = 2;
   string pub_endpoint = 3;
@@ -230,6 +232,7 @@ message IpcConfig {
 }
 message DbConfig {
   string path = 1;
+  // Legacy wire-only field. The DB lock is derived from the canonical DB path.
   string lock_path = 2;
   string timezone = 3;
   reserved 20 to 39;
