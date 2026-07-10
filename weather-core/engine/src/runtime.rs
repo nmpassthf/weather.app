@@ -193,7 +193,9 @@ mod tests {
         ListProvincesResponse, ResponseStatus, RpcKind, RpcRequest, SCHEMA_VERSION,
         WeatherSnapshot, decode_message, encode_message,
     };
-    use weather_updater::{ProviderCity, ProviderFuture, ProviderProvince, WeatherProvider};
+    use weather_updater::{
+        ProviderCity, ProviderFuture, ProviderProvince, WeatherFetch, WeatherProvider,
+    };
 
     use super::*;
 
@@ -247,16 +249,19 @@ mod tests {
             &'a self,
             _provider_station_id: &'a str,
             include_debug: bool,
-        ) -> ProviderFuture<'a, WeatherSnapshot> {
+        ) -> ProviderFuture<'a, WeatherFetch> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Box::pin(async move {
-                Ok(WeatherSnapshot {
-                    debug: include_debug.then(|| DebugPayload {
-                        provider: "scripted".to_string(),
-                        operation: "weather".to_string(),
+                Ok(WeatherFetch {
+                    snapshot: WeatherSnapshot {
+                        debug: include_debug.then(|| DebugPayload {
+                            provider: "scripted".to_string(),
+                            operation: "weather".to_string(),
+                            ..Default::default()
+                        }),
                         ..Default::default()
-                    }),
-                    ..Default::default()
+                    },
+                    warnings: Vec::new(),
                 })
             })
         }
@@ -348,6 +353,7 @@ mod tests {
                 .weather("S1", true)
                 .await
                 .unwrap()
+                .snapshot
                 .debug
                 .is_some()
         );

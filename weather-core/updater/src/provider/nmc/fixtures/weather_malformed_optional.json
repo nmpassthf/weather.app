@@ -1,0 +1,43 @@
+{
+  "code": 0,
+  "msg": "ok",
+  "data": {
+    "real": {
+      "station": { "province": "北京市", "city": "朝阳" },
+      "weather": { "info": "晴", "temperature": 30.0 },
+      "wind": { "direct": "北风", "speed": 2.5 },
+      "warn": "broken warning",
+      "sunriseSunset": ["broken sunrise"]
+    },
+    "predict": {
+      "station": { "province": "北京市", "city": "朝阳" },
+      "publish_time": "2026-06-29 08:00",
+      "detail": [
+        {
+          "date": "2026-06-29",
+          "day": {
+            "weather": { "info": "晴", "temperature": "34" },
+            "wind": { "direct": "北风", "power": "2级" }
+          },
+          "night": "broken night"
+        },
+        "broken day",
+        { "day": { "weather": { "info": "多云" } } }
+      ]
+    },
+    "air": ["broken air"],
+    "tempchart": [
+      "broken chart",
+      { "date": "2026-06-29", "max_temperature": 34.0 }
+    ],
+    "passedchart": "broken passed chart",
+    "climate": {
+      "period": "1991-2020",
+      "month": [
+        "broken month",
+        { "month": 6, "precipitation": 78.9 }
+      ]
+    },
+    "radar": 17
+  }
+}

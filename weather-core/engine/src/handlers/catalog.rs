@@ -672,7 +672,7 @@ mod tests {
     };
     use weather_updater::{
         ProviderCity as UpstreamCity, ProviderFuture, ProviderProvince as UpstreamProvince,
-        WeatherProvider,
+        WeatherFetch, WeatherProvider,
     };
 
     use crate::{runtime::EngineRuntime, station::canonical_station_name};
@@ -828,8 +828,13 @@ mod tests {
             &'a self,
             _provider_station_id: &'a str,
             _include_debug: bool,
-        ) -> ProviderFuture<'a, WeatherSnapshot> {
-            Box::pin(async { Ok(WeatherSnapshot::default()) })
+        ) -> ProviderFuture<'a, WeatherFetch> {
+            Box::pin(async {
+                Ok(WeatherFetch {
+                    snapshot: WeatherSnapshot::default(),
+                    warnings: Vec::new(),
+                })
+            })
         }
     }
 

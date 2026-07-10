@@ -17,11 +17,3 @@ fn short_region_name(value: &str) -> &str {
         .or_else(|| value.strip_suffix("特别行政区"))
         .unwrap_or(value)
 }
-
-pub(crate) fn clean(value: Option<String>) -> Option<String> {
-    value.filter(|v| !v.is_empty() && v != "9999")
-}
-
-pub(crate) fn clean_num(value: Option<f64>) -> Option<f64> {
-    value.filter(|v| (*v - 9999.0).abs() > f64::EPSILON)
-}

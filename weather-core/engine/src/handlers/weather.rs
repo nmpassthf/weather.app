@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use weather_db::ProviderStation;
 use weather_schema::*;
+use weather_updater::WeatherFetch;
 
 use crate::{
     handlers::RefreshTerminal,
@@ -117,29 +118,35 @@ impl Engine {
             .weather(&station.provider_station_id, include_debug)
             .await
         {
-            Ok(mut snapshot) => {
+            Ok(WeatherFetch {
+                mut snapshot,
+                mut warnings,
+            }) => {
                 snapshot.station = Some(merge_station(snapshot.station.take(), &station));
                 let debug = snapshot.debug.take();
                 let snapshot_for_storage = snapshot.clone();
                 snapshot.debug = debug;
 
-                let mut warnings = Vec::new();
                 if let Err(err) = self.persist_snapshot(snapshot_for_storage).await {
                     warnings.push(format!("cache write failed: {err:#}"));
                 }
+                let persisted_warning = warning_summary(&warnings);
                 if let Err(err) = self
                     .db
                     .log_fetch(
                         Some(station.unified_uuid.clone()),
                         "rest/weather".to_string(),
                         true,
-                        None,
+                        persisted_warning,
                     )
                     .await
                 {
                     warnings.push(format!("fetch log write failed: {err:#}"));
                 }
-                let warning = (!warnings.is_empty()).then(|| warnings.join("; "));
+                if let Some(debug) = snapshot.debug.as_mut() {
+                    debug.warnings.clone_from(&warnings);
+                }
+                let warning = warning_summary(&warnings);
                 self.publish_fetch_log(Some(&station.unified_uuid), "rest/weather", true, warning);
                 Ok(snapshot)
             }
@@ -241,6 +248,10 @@ impl Engine {
     }
 }
 
+fn warning_summary(warnings: &[String]) -> Option<String> {
+    (!warnings.is_empty()).then(|| warnings.join("; "))
+}
+
 fn first_enabled_station_name(config: &weather_configure::AppConfig) -> Option<&str> {
     config
         .stations
@@ -265,10 +276,90 @@ fn cached_snapshot_is_fresh(
 
 #[cfg(test)]
 mod tests {
+    use std::{path::Path, sync::Arc, time::Duration};
+
     use chrono::DateTime;
-    use weather_configure::{AppConfig, StationConfig};
+    use rusqlite::Connection;
+    use tokio::time::timeout;
+    use weather_configure::{AppConfig, StationConfig, write_config_atomic};
+    use weather_updater::{
+        ProviderCity, ProviderFuture, ProviderProvince, WeatherFetch, WeatherProvider,
+    };
 
     use super::*;
+    use crate::runtime::EngineRuntime;
+
+    struct WarningProvider;
+
+    impl WeatherProvider for WarningProvider {
+        fn provider_name(&self) -> &str {
+            "warning-test"
+        }
+
+        fn provinces(&self) -> ProviderFuture<'_, Vec<ProviderProvince>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn cities<'a>(
+            &'a self,
+            _provider_province_code: &'a str,
+        ) -> ProviderFuture<'a, Vec<ProviderCity>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn weather<'a>(
+            &'a self,
+            _provider_station_id: &'a str,
+            include_debug: bool,
+        ) -> ProviderFuture<'a, WeatherFetch> {
+            Box::pin(async move {
+                let warnings = vec!["predict: malformed object; ignored".to_string()];
+                Ok(WeatherFetch {
+                    snapshot: WeatherSnapshot {
+                        real: Some(ObservedWeather {
+                            temperature: Some(23.5),
+                            ..Default::default()
+                        }),
+                        debug: include_debug.then(|| DebugPayload {
+                            provider: "warning-test".to_string(),
+                            operation: "weather".to_string(),
+                            endpoint: "test://weather".to_string(),
+                            warnings: warnings.clone(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    warnings,
+                })
+            })
+        }
+    }
+
+    fn warning_station() -> ProviderStation {
+        let name = "北京-北京市-朝阳".to_string();
+        ProviderStation {
+            provider_name: "warning-test".to_string(),
+            display_name: name.clone(),
+            provider_station_id: "S1".to_string(),
+            provider_province_code: "P1".to_string(),
+            province: "北京市".to_string(),
+            city: "朝阳".to_string(),
+            url: "https://example.invalid/station".to_string(),
+            unified_uuid: weather_schema::unified_station_uuid(&name),
+            name,
+        }
+    }
+
+    fn latest_fetch_message(path: &Path) -> (bool, Option<String>) {
+        Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT ok, message FROM upstream_fetch_log ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
 
     #[test]
     fn default_weather_request_uses_first_enabled_station() {
@@ -326,5 +417,130 @@ mod tests {
 
         assert!(!cached_snapshot_is_fresh(fetched, now, 60, "Asia/Shanghai").unwrap());
         assert!(cached_snapshot_is_fresh(now - 1_000, now, 60, "Asia/Shanghai").unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provider_and_cache_warnings_reach_database_debug_and_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("weather.toml");
+        let db_path = directory.path().join("weather.db");
+        let mut config = AppConfig::default();
+        config.db.path = db_path.display().to_string();
+        config.updater.default_provider = "warning-test".to_string();
+        config.updater.provider[0].name = "warning-test".to_string();
+        write_config_atomic(&config_path, &config).unwrap();
+        let provider: Arc<dyn WeatherProvider> = Arc::new(WarningProvider);
+        let runtime = EngineRuntime::start_with_provider(config_path, provider)
+            .await
+            .unwrap();
+        let engine = runtime.test_engine();
+        let mut events = engine.sink.subscribe();
+
+        let snapshot = engine
+            .fetch_weather_uncached(warning_station(), false)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.real.unwrap().temperature, Some(23.5));
+        assert!(snapshot.debug.is_none());
+        let (_, envelope) = timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("fetch event timeout")
+            .expect("fetch event channel closed");
+        let event: FetchLogEvent = decode_message(&envelope.payload).unwrap();
+        assert!(event.ok);
+        assert_eq!(
+            event.message.as_deref(),
+            Some("predict: malformed object; ignored")
+        );
+        assert_eq!(
+            latest_fetch_message(&db_path),
+            (true, Some("predict: malformed object; ignored".to_string()))
+        );
+
+        Connection::open(&db_path)
+            .unwrap()
+            .execute_batch(
+                r#"CREATE TRIGGER fail_weather_cache_write
+                   BEFORE INSERT ON weather_snapshots_history
+                   BEGIN SELECT RAISE(FAIL, 'weather cache blocked'); END;"#,
+            )
+            .unwrap();
+        let snapshot = engine
+            .fetch_weather_uncached(warning_station(), true)
+            .await
+            .unwrap();
+        let warnings = snapshot.debug.unwrap().warnings;
+        assert_eq!(warnings[0], "predict: malformed object; ignored");
+        assert!(warnings[1].contains("cache write failed"), "{warnings:?}");
+        let (_, envelope) = timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("fetch event timeout")
+            .expect("fetch event channel closed");
+        let event: FetchLogEvent = decode_message(&envelope.payload).unwrap();
+        let message = event.message.unwrap();
+        assert!(message.contains("predict: malformed object; ignored"));
+        assert!(message.contains("cache write failed"));
+
+        engine.db.shutdown().await.unwrap();
+        let (ok, message) = latest_fetch_message(&db_path);
+        assert!(ok);
+        let message = message.unwrap();
+        assert!(message.contains("predict: malformed object; ignored"));
+        assert!(message.contains("cache write failed"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetch_log_write_failures_only_extend_event_and_debug_warnings() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("weather.toml");
+        let db_path = directory.path().join("weather.db");
+        let mut config = AppConfig::default();
+        config.db.path = db_path.display().to_string();
+        config.updater.default_provider = "warning-test".to_string();
+        config.updater.provider[0].name = "warning-test".to_string();
+        write_config_atomic(&config_path, &config).unwrap();
+        let provider: Arc<dyn WeatherProvider> = Arc::new(WarningProvider);
+        let runtime = EngineRuntime::start_with_provider(config_path, provider)
+            .await
+            .unwrap();
+        let engine = runtime.test_engine();
+        let mut events = engine.sink.subscribe();
+        Connection::open(&db_path)
+            .unwrap()
+            .execute_batch(
+                r#"CREATE TRIGGER fail_weather_fetch_log
+                   BEFORE INSERT ON upstream_fetch_log
+                   BEGIN SELECT RAISE(FAIL, 'fetch log blocked'); END;"#,
+            )
+            .unwrap();
+
+        let snapshot = engine
+            .fetch_weather_uncached(warning_station(), true)
+            .await
+            .unwrap();
+        let warnings = snapshot.debug.unwrap().warnings;
+        assert_eq!(warnings[0], "predict: malformed object; ignored");
+        assert!(
+            warnings[1].contains("fetch log write failed"),
+            "{warnings:?}"
+        );
+        let (_, envelope) = timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("fetch event timeout")
+            .expect("fetch event channel closed");
+        let event: FetchLogEvent = decode_message(&envelope.payload).unwrap();
+        assert!(event.ok);
+        let message = event.message.unwrap();
+        assert!(message.contains("predict: malformed object; ignored"));
+        assert!(message.contains("fetch log write failed"));
+        let fetch_count: i64 = Connection::open(&db_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM upstream_fetch_log", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(fetch_count, 0);
+
+        engine.db.shutdown().await.unwrap();
     }
 }

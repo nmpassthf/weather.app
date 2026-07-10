@@ -1,0 +1,64 @@
+{
+  "code": 0,
+  "msg": "ok",
+  "data": {
+    "real": {
+      "station": { "province": "北京市", "city": "朝阳" },
+      "weather": {
+        "info": "晴",
+        "temperature": 9999,
+        "humidity": "9999",
+        "rain": "9999.0",
+        "icomfort": 1,
+        "rcomfort": 71
+      }
+    },
+    "air": {
+      "publish_time": null,
+      "publishTime": "2026-06-29 09:00",
+      "aqi": "9999",
+      "AQI": "66",
+      "level": [null, "9999"],
+      "aqi_level": "二级",
+      "primary_pollutant": "",
+      "primaryPollutant": "O3",
+      "pm2_5": 9999,
+      "pm25": 22.0
+    },
+    "tempchart": {
+      "date": null,
+      "time": "2026-06-29",
+      "max_temperature": 9999,
+      "maxTemperature": 34.0,
+      "min_temperature": "bad",
+      "minTemperature": 24.0
+    },
+    "passedchart": {
+      "rain_1h": null,
+      "rain1h": 0.1,
+      "pressure": "bad",
+      "airpressure": 1001.0
+    },
+    "climate": {
+      "period": "1991-2020",
+      "month": [null, 9999],
+      "months": {
+        "month": "9999",
+        "mon": "6",
+        "average_max_temperature": null,
+        "avg_max_temperature": 30.1,
+        "precipitation": "9999",
+        "rain": 78.9
+      }
+    },
+    "radar": {
+      "title": null,
+      "name": "华北雷达",
+      "image": 17,
+      "image_url": "http://[",
+      "img": "/radar.png",
+      "url": null,
+      "page_url": "//cdn.example/radar"
+    }
+  }
+}

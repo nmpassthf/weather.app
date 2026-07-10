@@ -11,6 +11,12 @@ use nmc::NmcProvider;
 
 pub type ProviderFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
+#[derive(Debug, Clone)]
+pub struct WeatherFetch {
+    pub snapshot: WeatherSnapshot,
+    pub warnings: Vec<String>,
+}
+
 pub trait WeatherProvider: Send + Sync {
     fn provider_name(&self) -> &str;
     fn provinces(&self) -> ProviderFuture<'_, Vec<ProviderProvince>>;
@@ -22,7 +28,7 @@ pub trait WeatherProvider: Send + Sync {
         &'a self,
         provider_station_id: &'a str,
         include_debug: bool,
-    ) -> ProviderFuture<'a, WeatherSnapshot>;
+    ) -> ProviderFuture<'a, WeatherFetch>;
 }
 
 pub fn create_weather_provider(config: &UpdaterConfig) -> Result<Arc<dyn WeatherProvider>> {
@@ -104,20 +110,23 @@ mod tests {
             &'a self,
             provider_station_id: &'a str,
             include_debug: bool,
-        ) -> ProviderFuture<'a, WeatherSnapshot> {
+        ) -> ProviderFuture<'a, WeatherFetch> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.weather_args
                 .lock()
                 .expect("weather args lock")
                 .push((provider_station_id.to_string(), include_debug));
             Box::pin(async move {
-                Ok(WeatherSnapshot {
-                    debug: include_debug.then(|| DebugPayload {
-                        provider: "fake".to_string(),
-                        operation: "weather".to_string(),
+                Ok(WeatherFetch {
+                    snapshot: WeatherSnapshot {
+                        debug: include_debug.then(|| DebugPayload {
+                            provider: "fake".to_string(),
+                            operation: "weather".to_string(),
+                            ..Default::default()
+                        }),
                         ..Default::default()
-                    }),
-                    ..Default::default()
+                    },
+                    warnings: Vec::new(),
                 })
             })
         }
@@ -142,7 +151,15 @@ mod tests {
         assert_eq!(cloned.provider_name(), "fake");
         assert_eq!(cloned.provinces().await.unwrap()[0].provider_code, "P1");
         assert_eq!(provider.cities("P1").await.unwrap()[0].city, "city");
-        assert!(cloned.weather("S1", true).await.unwrap().debug.is_some());
+        assert!(
+            cloned
+                .weather("S1", true)
+                .await
+                .unwrap()
+                .snapshot
+                .debug
+                .is_some()
+        );
         assert_eq!(fake.calls.load(Ordering::Relaxed), 3);
         assert_eq!(
             *fake.weather_args.lock().expect("weather args lock"),
