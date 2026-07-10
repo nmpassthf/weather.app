@@ -6,7 +6,6 @@ use weather_schema::*;
 use crate::{
     client::EngineClient,
     pagination::{PageCursor, page_size_for_target},
-    util::short_region_name,
 };
 
 pub(crate) async fn execute_search(

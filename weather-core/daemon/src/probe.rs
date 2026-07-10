@@ -14,10 +14,7 @@ use weather_configure::{default_config_file, load_or_default};
 use weather_schema::*;
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
-use crate::{
-    path::{absolute_config_path, normalize_path, resolve_relative},
-    time::now_ms,
-};
+use crate::path::{absolute_config_path, normalize_path, resolve_relative};
 
 const PROBE_SAMPLE_ATTEMPTS: usize = 3;
 const LOCK_OBSERVATION_ATTEMPTS: usize = 3;
@@ -305,7 +302,7 @@ async fn rpc_endpoint_status(
         schema_version: SCHEMA_VERSION.to_string(),
         request_id: request_id.clone(),
         kind: RpcKind::GetEngineStatus as i32,
-        timestamp_unix_ms: now_ms(),
+        timestamp_unix_ms: unix_timestamp_ms().unwrap_or_default(),
         hmac_sha256: Vec::new(),
         payload: Empty {}.encode_to_vec(),
     };

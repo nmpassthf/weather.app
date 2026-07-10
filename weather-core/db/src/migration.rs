@@ -1,7 +1,6 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
+use weather_schema::unix_timestamp_ms;
 
 pub(crate) const LATEST_DB_VERSION: i64 = 1;
 pub(crate) const HISTORY_TABLE_NAME: &str = "weather_snapshots_history";
@@ -80,7 +79,11 @@ fn run_one(conn: &mut Connection, migration: Migration) -> Result<()> {
         .with_context(|| format!("failed to apply migration {}", migration.name))?;
     tx.execute(
         "INSERT INTO schema_migrations(version, name, applied_at_unix_ms) VALUES (?1, ?2, ?3)",
-        params![migration.version, migration.name, now_ms()],
+        params![
+            migration.version,
+            migration.name,
+            unix_timestamp_ms().unwrap_or_default()
+        ],
     )
     .with_context(|| format!("failed to record migration {}", migration.name))?;
     tx.commit()
@@ -328,13 +331,6 @@ pub(crate) fn validate_history_rebuild_schema(conn: &Connection) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }
 
 #[cfg(test)]

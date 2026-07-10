@@ -9,6 +9,7 @@ use chrono_tz::Tz;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use weather_schema::{
     SCHEMA_VERSION, WeatherSnapshot, decode_message, encode_message, unified_station_uuid,
+    unix_timestamp_ms,
 };
 
 use crate::{
@@ -181,7 +182,7 @@ impl DbInstance {
     ) -> Result<()> {
         validate_provider(provider)?;
         validate_provider_province_catalog(provinces)?;
-        let now = now_ms();
+        let now = unix_timestamp_ms().unwrap_or_default();
         let row_count = i64::try_from(provinces.len()).context("province row count overflow")?;
         let tx = self
             .conn
@@ -317,7 +318,7 @@ impl DbInstance {
     ) -> Result<()> {
         validate_provider(provider)?;
         validate_provider_city_catalog(provider_province_code, cities)?;
-        let now = now_ms();
+        let now = unix_timestamp_ms().unwrap_or_default();
         let row_count = i64::try_from(cities.len()).context("city row count overflow")?;
         let tx = self
             .conn
@@ -543,7 +544,7 @@ impl DbInstance {
                 station.url,
                 station.name,
                 station.unified_uuid,
-                now_ms()
+                unix_timestamp_ms().unwrap_or_default()
             ],
         )?;
         Ok(())
@@ -605,7 +606,11 @@ impl DbInstance {
                ON CONFLICT(key) DO UPDATE SET
                  value = excluded.value,
                  updated_at_unix_ms = excluded.updated_at_unix_ms"#,
-            params![DB_TIMEZONE_KEY, timezone.name(), now_ms()],
+            params![
+                DB_TIMEZONE_KEY,
+                timezone.name(),
+                unix_timestamp_ms().unwrap_or_default()
+            ],
         )?;
         self.timezone = timezone;
         Ok(())
@@ -771,7 +776,11 @@ impl DbInstance {
                ON CONFLICT(key) DO UPDATE SET
                  value = excluded.value,
                  updated_at_unix_ms = excluded.updated_at_unix_ms"#,
-            params![DB_TIMEZONE_KEY, new_timezone.name(), now_ms()],
+            params![
+                DB_TIMEZONE_KEY,
+                new_timezone.name(),
+                unix_timestamp_ms().unwrap_or_default()
+            ],
         )?;
         tx.execute(
             r#"INSERT INTO engine_state(key, value, updated_at_unix_ms)
@@ -779,7 +788,11 @@ impl DbInstance {
                ON CONFLICT(key) DO UPDATE SET
                  value = excluded.value,
                  updated_at_unix_ms = excluded.updated_at_unix_ms"#,
-            params![TIMEZONE_SYNC_PENDING_KEY, new_timezone.name(), now_ms()],
+            params![
+                TIMEZONE_SYNC_PENDING_KEY,
+                new_timezone.name(),
+                unix_timestamp_ms().unwrap_or_default()
+            ],
         )?;
         tx.commit()?;
         self.timezone = new_timezone;
@@ -833,7 +846,7 @@ impl DbInstance {
         ok: bool,
         message: Option<&str>,
     ) -> Result<()> {
-        let now = now_ms();
+        let now = unix_timestamp_ms().unwrap_or_default();
         let tx = self.conn.transaction()?;
         tx.execute(
             r#"INSERT INTO upstream_fetch_log(
@@ -982,13 +995,6 @@ fn map_provider_station(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderSta
         name: row.get(7)?,
         unified_uuid: row.get(8)?,
     })
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }
 
 #[cfg(test)]
@@ -1591,7 +1597,10 @@ mod tests {
                 .execute(
                     r#"INSERT INTO engine_state(key, value, updated_at_unix_ms)
                        VALUES (?1, 'Asia/Shanghai', ?2)"#,
-                    params![TIMEZONE_SYNC_PENDING_KEY, now_ms()],
+                    params![
+                        TIMEZONE_SYNC_PENDING_KEY,
+                        unix_timestamp_ms().unwrap_or_default()
+                    ],
                 )
                 .unwrap();
         }
@@ -1664,7 +1673,7 @@ mod tests {
     #[test]
     fn fetch_log_retention_prunes_by_age_and_optional_row_limit() {
         let mut db = temp_db();
-        let now = now_ms();
+        let now = unix_timestamp_ms().unwrap_or_default();
         for (index, timestamp) in [now - FETCH_LOG_RETENTION_MS - 1, now - 2, now - 1, now]
             .into_iter()
             .enumerate()

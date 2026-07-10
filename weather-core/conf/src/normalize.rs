@@ -1,13 +1,5 @@
 use crate::AppConfig;
-
-/// Canonicalize the user-facing station path while preserving its components.
-pub fn normalize_station_name(name: &str) -> String {
-    name.split('-')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
-}
+pub use weather_schema::normalize_station_name;
 
 /// Normalize every configured station in place, retaining order and enabled state.
 pub fn normalize_config_stations(config: &mut AppConfig) -> bool {

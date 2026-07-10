@@ -1,16 +1,5 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 pub(crate) fn format_index(index: usize) -> String {
     format!("{index:>2}")
-}
-
-pub(crate) fn short_region_name(value: &str) -> &str {
-    value
-        .strip_suffix('市')
-        .or_else(|| value.strip_suffix('省'))
-        .or_else(|| value.strip_suffix("自治区"))
-        .or_else(|| value.strip_suffix("特别行政区"))
-        .unwrap_or(value)
 }
 
 pub(crate) fn text(value: Option<&str>) -> &str {
@@ -51,11 +40,4 @@ fn number_with_unit(value: Option<f64>, unit: &str) -> String {
         Some(value) => format!("{value:.1}{unit}"),
         None => "-".to_string(),
     }
-}
-
-pub(crate) fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }

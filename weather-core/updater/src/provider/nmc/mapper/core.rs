@@ -1,7 +1,7 @@
 use serde_json::Value;
-use weather_schema::{ForecastDay, ForecastReport, ObservedWeather, StationRef, WeatherAlert};
-
-use crate::util::canonical_station_name;
+use weather_schema::{
+    ForecastDay, ForecastReport, ObservedWeather, StationRef, WeatherAlert, canonical_station_name,
+};
 
 use super::{MappingContext, value};
 use crate::provider::nmc::dto::{

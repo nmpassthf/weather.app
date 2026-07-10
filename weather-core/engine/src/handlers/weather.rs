@@ -4,10 +4,7 @@ use weather_schema::*;
 use weather_updater::WeatherFetch;
 
 use crate::{
-    handlers::RefreshTerminal,
-    runtime::Engine,
-    station::merge_station,
-    time::{date_for_tz, now_ms},
+    handlers::RefreshTerminal, runtime::Engine, station::merge_station, time::date_for_tz,
 };
 
 impl Engine {
@@ -78,7 +75,7 @@ impl Engine {
             let config = self.config.get();
             if cached_snapshot_is_fresh(
                 stored.fetched_at_unix_ms,
-                now_ms(),
+                unix_timestamp_ms().unwrap_or_default(),
                 config.updater.weather_ttl_seconds,
                 &config.db.timezone,
             )? {
@@ -191,7 +188,7 @@ impl Engine {
     }
 
     async fn persist_snapshot(&self, snapshot: WeatherSnapshot) -> Result<()> {
-        let fetched_at_unix_ms = now_ms();
+        let fetched_at_unix_ms = unix_timestamp_ms().unwrap_or_default();
         self.db
             .put_history_snapshot(snapshot, fetched_at_unix_ms)
             .await

@@ -3,7 +3,6 @@ mod path;
 mod probe;
 mod run;
 mod service;
-mod time;
 
 use anyhow::Result;
 use clap::Parser;

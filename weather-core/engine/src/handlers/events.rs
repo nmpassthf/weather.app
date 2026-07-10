@@ -1,7 +1,7 @@
 use prost::Message;
 use weather_schema::*;
 
-use crate::{runtime::Engine, time::now_ms};
+use crate::runtime::Engine;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RefreshTerminal {
@@ -26,7 +26,7 @@ impl Engine {
             schema_version: SCHEMA_VERSION.to_string(),
             event_id: correlation_id("engine-event"),
             kind: kind as i32,
-            timestamp_unix_ms: now_ms(),
+            timestamp_unix_ms: unix_timestamp_ms().unwrap_or_default(),
             hmac_sha256: Vec::new(),
             payload,
         };
@@ -55,7 +55,7 @@ impl Engine {
             schema_version: SCHEMA_VERSION.to_string(),
             event_id: correlation_id("engine-event"),
             kind: EventKind::EngineStatus as i32,
-            timestamp_unix_ms: now_ms(),
+            timestamp_unix_ms: unix_timestamp_ms().unwrap_or_default(),
             hmac_sha256: Vec::new(),
             payload,
         };
@@ -80,7 +80,7 @@ impl Engine {
             endpoint: endpoint.to_string(),
             ok,
             message,
-            timestamp_unix_ms: now_ms(),
+            timestamp_unix_ms: unix_timestamp_ms().unwrap_or_default(),
         }
         .encode_to_vec();
         self.publish_event(TOPIC_ENGINE_LOG, EventKind::FetchLog, payload);

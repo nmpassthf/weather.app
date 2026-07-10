@@ -13,7 +13,6 @@ use crate::{
     handlers::response::paginate,
     limits::{DEFAULT_PAGE_SIZE, MAX_CONCURRENT_CATALOG_FETCHES, normalize_pagination},
     runtime::Engine,
-    time::now_ms,
 };
 
 impl Engine {
@@ -64,7 +63,7 @@ impl Engine {
         if let Some(cache) = self.db.get_provider_provinces(&provider).await?
             && catalog_cache_is_fresh(
                 cache.fetched_at_unix_ms,
-                now_ms(),
+                unix_timestamp_ms().unwrap_or_default(),
                 self.config.get().updater.province_ttl_seconds,
             )
         {
@@ -85,7 +84,11 @@ impl Engine {
         let ttl_seconds = self.config.get().updater.province_ttl_seconds;
         let cached = self.db.get_provider_provinces(provider).await?;
         if cached.as_ref().is_some_and(|cache| {
-            catalog_cache_is_fresh(cache.fetched_at_unix_ms, now_ms(), ttl_seconds)
+            catalog_cache_is_fresh(
+                cache.fetched_at_unix_ms,
+                unix_timestamp_ms().unwrap_or_default(),
+                ttl_seconds,
+            )
         }) {
             return Ok(cached.expect("fresh cache was present").items);
         }
@@ -242,7 +245,7 @@ impl Engine {
             .await?
             && catalog_cache_is_fresh(
                 cache.fetched_at_unix_ms,
-                now_ms(),
+                unix_timestamp_ms().unwrap_or_default(),
                 self.config.get().updater.province_ttl_seconds,
             )
         {
@@ -294,7 +297,7 @@ impl Engine {
         provinces: Vec<ProviderProvince>,
     ) -> Result<ProviderCatalog> {
         let ttl_seconds = self.config.get().updater.province_ttl_seconds;
-        let now = now_ms();
+        let now = unix_timestamp_ms().unwrap_or_default();
         let expected_codes = provinces
             .iter()
             .map(|province| province.provider_code.clone())
@@ -404,7 +407,11 @@ impl Engine {
             .get_provider_cities(provider, provider_province_code)
             .await?;
         if cached.as_ref().is_some_and(|cache| {
-            catalog_cache_is_fresh(cache.fetched_at_unix_ms, now_ms(), ttl_seconds)
+            catalog_cache_is_fresh(
+                cache.fetched_at_unix_ms,
+                unix_timestamp_ms().unwrap_or_default(),
+                ttl_seconds,
+            )
         }) {
             return Ok(cached.expect("fresh cache was present").items);
         }
@@ -667,15 +674,15 @@ mod tests {
     use weather_configure::{AppConfig, write_config_atomic};
     use weather_schema::{
         EventEnvelope, FetchLogEvent, FuzzyMatchStationsRequest, FuzzyMatchStationsResponse,
-        ResponseStatus, RpcRequest, SCHEMA_VERSION, WeatherSnapshot, decode_message,
-        encode_message,
+        ResponseStatus, RpcRequest, SCHEMA_VERSION, WeatherSnapshot, canonical_station_name,
+        decode_message, encode_message,
     };
     use weather_updater::{
         ProviderCity as UpstreamCity, ProviderFuture, ProviderProvince as UpstreamProvince,
         WeatherFetch, WeatherProvider,
     };
 
-    use crate::{runtime::EngineRuntime, station::canonical_station_name};
+    use crate::runtime::EngineRuntime;
 
     enum Reply<T> {
         Success(Vec<T>),

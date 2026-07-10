@@ -26,7 +26,7 @@ use self::{
     pending::{PendingLease, PendingRegistry, RegisterError},
     session::{ClientSession, SessionTaskResult},
 };
-use crate::{pagination::PageCursor, util::now_ms};
+use crate::pagination::PageCursor;
 
 const ENGINE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const RPC_SEND_QUEUE: usize = 64;
@@ -223,7 +223,7 @@ impl EngineClient {
             schema_version: SCHEMA_VERSION.to_string(),
             request_id,
             kind: kind as i32,
-            timestamp_unix_ms: now_ms(),
+            timestamp_unix_ms: unix_timestamp_ms().unwrap_or_default(),
             hmac_sha256: Vec::new(),
             payload,
         };

@@ -5,14 +5,11 @@ use std::{
 
 use tokio::task::{Id, JoinSet};
 use weather_configure::AppConfig;
-use weather_schema::GetWeatherRequest;
+use weather_schema::{GetWeatherRequest, unix_timestamp_ms};
 
 use crate::{
-    handlers::RefreshTerminal,
-    lifecycle::Cancellation,
-    limits::MAX_CONCURRENT_REFRESHES,
-    runtime::Engine,
-    time::{local_date_and_next_change, now_ms},
+    handlers::RefreshTerminal, lifecycle::Cancellation, limits::MAX_CONCURRENT_REFRESHES,
+    runtime::Engine, time::local_date_and_next_change,
 };
 
 const STAGGER: Duration = Duration::from_secs(5);
@@ -41,20 +38,25 @@ pub(crate) async fn run_refresh_loop(
     let mut schedules = HashMap::new();
     reconcile_schedules(&mut schedules, &station_order, now, ttl);
 
-    let mut last_local_date = local_date_and_next_change(now_ms(), &initial.db.timezone)
-        .ok()
-        .map(|(date, _)| date);
+    let mut last_local_date = local_date_and_next_change(
+        unix_timestamp_ms().unwrap_or_default(),
+        &initial.db.timezone,
+    )
+    .ok()
+    .map(|(date, _)| date);
     let mut jobs = JoinSet::new();
     let mut job_names = HashMap::<Id, String>::new();
 
     let result = loop {
         let config = engine.config.get();
         let now = Instant::now();
-        let (current_date, date_wait) =
-            match local_date_and_next_change(now_ms(), &config.db.timezone) {
-                Ok((date, wait)) => (Some(date), wait),
-                Err(_) => (None, FALLBACK_WAKE),
-            };
+        let (current_date, date_wait) = match local_date_and_next_change(
+            unix_timestamp_ms().unwrap_or_default(),
+            &config.db.timezone,
+        ) {
+            Ok((date, wait)) => (Some(date), wait),
+            Err(_) => (None, FALLBACK_WAKE),
+        };
         if let Some(current_date) = current_date {
             if last_local_date
                 .as_ref()

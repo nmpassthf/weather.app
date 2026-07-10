@@ -1,5 +1,5 @@
 use weather_db::{ProviderCity, ProviderStation};
-use weather_schema::StationRef;
+use weather_schema::{StationRef, canonical_station_name};
 
 pub(crate) fn merge_station(
     upstream: Option<StationRef>,
@@ -47,29 +47,11 @@ pub(crate) fn station_names(station: &ProviderStation) -> Vec<String> {
     vec![canonical_station_name(&station.province, &station.city)]
 }
 
-pub(crate) fn canonical_station_name(province: &str, city: &str) -> String {
-    let region = short_region_name(province);
-    let city_level = province;
-    let core = short_region_name(city_level);
-    if city == core || city == province {
-        format!("{region}-{city_level}")
-    } else {
-        format!("{region}-{city_level}-{city}")
-    }
-}
-
-pub(crate) fn short_region_name(value: &str) -> &str {
-    value
-        .strip_suffix('市')
-        .or_else(|| value.strip_suffix('省'))
-        .or_else(|| value.strip_suffix("自治区"))
-        .or_else(|| value.strip_suffix("特别行政区"))
-        .unwrap_or(value)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weather_schema::short_region_name;
+
     #[test]
     fn short_region_name_strips_suffixes() {
         assert_eq!(short_region_name("北京市"), "北京");

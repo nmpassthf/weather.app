@@ -1,7 +1,7 @@
 use prost::Message;
 use weather_schema::*;
 
-use crate::{runtime::Engine, time::now_ms};
+use crate::runtime::Engine;
 
 impl Engine {
     pub(crate) fn status(
@@ -68,7 +68,7 @@ impl Engine {
             schema_version: SCHEMA_VERSION.to_string(),
             request_id: request_id.to_string(),
             status: status as i32,
-            timestamp_unix_ms: now_ms(),
+            timestamp_unix_ms: unix_timestamp_ms().unwrap_or_default(),
             hmac_sha256: Vec::new(),
             payload: payload.encode_to_vec(),
             error,
@@ -88,7 +88,7 @@ impl Engine {
             schema_version: SCHEMA_VERSION.to_string(),
             request_id: request_id.to_string(),
             status: ResponseStatus::Error as i32,
-            timestamp_unix_ms: now_ms(),
+            timestamp_unix_ms: unix_timestamp_ms().unwrap_or_default(),
             hmac_sha256: Vec::new(),
             payload: Vec::new(),
             error: Some(EngineError {

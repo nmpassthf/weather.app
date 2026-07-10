@@ -1,15 +1,8 @@
 use std::str::FromStr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-
-pub(crate) fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
 
 /// 把 `unix_ms` 在 `timezone`（IANA 名，如 `Asia/Shanghai`）下格式化为 `YYYY-MM-DD`。
 pub(crate) fn date_for_tz(unix_ms: i64, timezone: &str) -> Result<String> {

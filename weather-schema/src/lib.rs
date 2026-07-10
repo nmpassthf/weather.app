@@ -3,6 +3,8 @@ mod constants;
 mod correlation;
 mod crypto;
 mod lifecycle;
+mod station;
+mod time;
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/weather.schema.v1.rs"));
 }
@@ -14,6 +16,8 @@ pub use correlation::*;
 pub use crypto::*;
 pub use generated::*;
 pub use lifecycle::*;
+pub use station::*;
+pub use time::*;
 pub use uuid::*;
 
 #[cfg(test)]

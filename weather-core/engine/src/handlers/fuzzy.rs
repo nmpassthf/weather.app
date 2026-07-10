@@ -9,7 +9,7 @@ use crate::{
     handlers::response::paginate,
     limits::{DEFAULT_FUZZY_PAGE_SIZE, normalize_pagination},
     runtime::Engine,
-    station::{canonical_station_name, city_to_provider_station, short_region_name, station_names},
+    station::{city_to_provider_station, station_names},
 };
 
 #[derive(Clone)]

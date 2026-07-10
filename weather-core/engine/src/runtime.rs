@@ -1,7 +1,6 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -11,7 +10,9 @@ use weather_configure::{
 };
 use weather_db::{DatabasePaths, DbActor};
 use weather_manifest::{ComponentKind, ComponentManifest};
-use weather_schema::{ENGINE_LOCK_METADATA_VERSION, EngineLockMetadata, correlation_id};
+use weather_schema::{
+    ENGINE_LOCK_METADATA_VERSION, EngineLockMetadata, correlation_id, unix_timestamp_ms,
+};
 use weather_updater::{WeatherProvider, create_weather_provider};
 
 use crate::{
@@ -176,11 +177,7 @@ fn launch_metadata(config_path: &Path, owner_token: Option<String>) -> Result<En
     if owner_token.as_deref().is_some_and(str::is_empty) {
         bail!("engine owner token must not be empty");
     }
-    let started_at_unix_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before the Unix epoch")?
-        .as_millis()
-        .try_into()
+    let started_at_unix_ms = u64::try_from(unix_timestamp_ms()?)
         .context("engine start timestamp does not fit in u64 milliseconds")?;
     Ok(EngineLockMetadata {
         version: ENGINE_LOCK_METADATA_VERSION,
