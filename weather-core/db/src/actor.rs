@@ -75,11 +75,6 @@ pub(crate) enum DbCommand {
         provider: String,
         reply: oneshot::Sender<Result<Option<CatalogCache<ProviderProvince>>>>,
     },
-    ResolveProviderProvinceCode {
-        provider: String,
-        province: String,
-        reply: oneshot::Sender<Result<String>>,
-    },
     ReplaceProviderCities {
         provider: String,
         provider_province_code: String,
@@ -472,19 +467,6 @@ impl DbActor {
         .await
     }
 
-    pub async fn resolve_provider_province_code(
-        &self,
-        provider: &str,
-        province: &str,
-    ) -> Result<String> {
-        self.call(|reply| DbCommand::ResolveProviderProvinceCode {
-            provider: provider.to_string(),
-            province: province.to_string(),
-            reply,
-        })
-        .await
-    }
-
     pub async fn replace_provider_cities(
         &self,
         provider: &str,
@@ -737,9 +719,6 @@ impl DbCommand {
             Self::GetProviderProvinces { reply, .. } => {
                 let _ = reply.send(rejected_command(message));
             }
-            Self::ResolveProviderProvinceCode { reply, .. } => {
-                let _ = reply.send(rejected_command(message));
-            }
             Self::GetProviderCities { reply, .. } => {
                 let _ = reply.send(rejected_command(message));
             }
@@ -790,14 +769,6 @@ fn handle(db: &mut DbInstance, cmd: DbCommand) -> Option<Arc<str>> {
         }
         DbCommand::GetProviderProvinces { provider, reply } => {
             let _ = reply.send(db.get_provider_provinces(&provider));
-            None
-        }
-        DbCommand::ResolveProviderProvinceCode {
-            provider,
-            province,
-            reply,
-        } => {
-            let _ = reply.send(db.resolve_provider_province_code(&provider, &province));
             None
         }
         DbCommand::ReplaceProviderCities {

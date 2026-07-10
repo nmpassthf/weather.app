@@ -31,9 +31,7 @@ impl NmcTransport {
             USER_AGENT,
         )
         .context("failed to build NMC HTTP client")?;
-        let base_url = http
-            .url_for("", &[])
-            .context("failed to normalize NMC base URL")?;
+        let base_url = Url::parse(&config.base_url).context("failed to normalize NMC base URL")?;
         Ok(Self { http, base_url })
     }
 
@@ -53,8 +51,10 @@ impl NmcTransport {
 
     pub(super) async fn weather(&self, provider_station_id: &str) -> Result<JsonDocument> {
         let query = [("stationid", provider_station_id)];
-        let endpoint = self.http.url_for(WEATHER_PATH, &query)?;
-        let body = self.http.get_json(WEATHER_PATH, &query).await?;
+        let (endpoint, body) = self
+            .http
+            .get_json_with_endpoint(WEATHER_PATH, &query)
+            .await?;
         Ok(JsonDocument { endpoint, body })
     }
 }

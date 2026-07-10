@@ -44,13 +44,9 @@ pub(crate) struct Engine {
     pub(crate) control: EngineControl,
 }
 
-pub struct EngineRuntime {
+pub(crate) struct EngineRuntime {
     engine: Engine,
     _engine_lock: LockGuard,
-}
-
-pub async fn run_engine(config_path: PathBuf, mode: String) -> Result<EngineExit> {
-    run_engine_with_owner(config_path, mode, None).await
 }
 
 pub async fn run_engine_with_owner(
@@ -63,7 +59,8 @@ pub async fn run_engine_with_owner(
 }
 
 impl EngineRuntime {
-    pub async fn start(config_path: PathBuf) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) async fn start(config_path: PathBuf) -> Result<Self> {
         Self::start_with_provider_factory(config_path, None, create_weather_provider).await
     }
 
@@ -71,7 +68,8 @@ impl EngineRuntime {
         Self::start_with_provider_factory(config_path, owner_token, create_weather_provider).await
     }
 
-    pub async fn start_with_provider(
+    #[cfg(test)]
+    pub(crate) async fn start_with_provider(
         config_path: PathBuf,
         provider: Arc<dyn WeatherProvider>,
     ) -> Result<Self> {
@@ -162,7 +160,7 @@ impl EngineRuntime {
         })
     }
 
-    pub async fn run_sockets(self, mode: String) -> Result<EngineExit> {
+    async fn run_sockets(self, mode: String) -> Result<EngineExit> {
         let ipc = self.engine.config.get().ipc;
         run_engine_sockets(self.engine, ipc.rpc_endpoint, ipc.pub_endpoint, mode).await
     }
@@ -189,6 +187,7 @@ fn launch_metadata(config_path: &Path, owner_token: Option<String>) -> Result<En
     })
 }
 
+#[cfg(test)]
 fn validate_injected_provider(
     config: &weather_configure::UpdaterConfig,
     provider: &dyn WeatherProvider,

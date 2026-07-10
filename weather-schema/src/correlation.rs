@@ -12,13 +12,13 @@ use uuid::Uuid;
 /// concurrent callers in one process never receive the same ID. Wall-clock
 /// time and process IDs are deliberately not part of the uniqueness contract.
 #[derive(Debug)]
-pub struct CorrelationIdGenerator {
+struct CorrelationIdGenerator {
     nonce: Uuid,
     next_sequence: AtomicU64,
 }
 
 impl CorrelationIdGenerator {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             nonce: Uuid::new_v4(),
             next_sequence: AtomicU64::new(0),
@@ -28,7 +28,7 @@ impl CorrelationIdGenerator {
     /// Returns the next opaque ID for `scope`.
     ///
     /// Sequence exhaustion fails instead of wrapping and reusing an ID.
-    pub fn next(&self, scope: &str) -> String {
+    fn next(&self, scope: &str) -> String {
         let sequence = self
             .next_sequence
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -44,12 +44,6 @@ impl CorrelationIdGenerator {
             nonce,
             next_sequence: AtomicU64::new(0),
         }
-    }
-}
-
-impl Default for CorrelationIdGenerator {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

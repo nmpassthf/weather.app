@@ -10,4 +10,4 @@ mod singleflight;
 mod station;
 mod time;
 
-pub use runtime::{EngineExit, EngineRuntime, run_engine, run_engine_with_owner};
+pub use runtime::{EngineExit, run_engine_with_owner};

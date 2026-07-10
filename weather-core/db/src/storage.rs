@@ -286,30 +286,6 @@ impl DbInstance {
         }))
     }
 
-    pub(crate) fn resolve_provider_province_code(
-        &self,
-        provider: &str,
-        province: &str,
-    ) -> Result<String> {
-        validate_provider(provider)?;
-        let mut stmt = self.conn.prepare(
-            r#"SELECT provider_code FROM provider_provinces
-               WHERE provider = ?1 AND name = ?2
-               ORDER BY provider_code"#,
-        )?;
-        let rows = stmt
-            .query_map(params![provider, province], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        match rows.as_slice() {
-            [code] => Ok(code.clone()),
-            [] => bail!("provider province `{province}` not found for `{provider}`"),
-            codes => bail!(
-                "provider province `{province}` is ambiguous for `{provider}`: {}",
-                codes.join(", ")
-            ),
-        }
-    }
-
     pub(crate) fn replace_provider_cities(
         &mut self,
         provider: &str,
@@ -1363,7 +1339,8 @@ mod tests {
         db.replace_provider_provinces("nmc", &[sample_province("B", "B")])
             .unwrap();
         assert!(db.get_provider_cities("nmc", "A").unwrap().is_none());
-        assert!(db.resolve_provider_province_code("nmc", "A").is_err());
+        let provinces = db.get_provider_provinces("nmc").unwrap().unwrap().items;
+        assert_eq!(provinces, vec![sample_province("B", "B")]);
     }
 
     #[test]

@@ -43,7 +43,6 @@ same-file = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-thiserror = "2.0"
 tempfile = "3.27"
 tokio = { version = "1.45", features = ["macros", "rt-multi-thread", "time", "sync", "process", "signal", "net"] }
 toml = "0.8"

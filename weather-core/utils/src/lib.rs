@@ -25,7 +25,7 @@ impl JsonHttpClient {
         Ok(Self { client, base_url })
     }
 
-    pub fn url_for(&self, path: &str, query: &[(&str, &str)]) -> Result<Url> {
+    fn url_for(&self, path: &str, query: &[(&str, &str)]) -> Result<Url> {
         let mut url = self
             .base_url
             .join(path)
@@ -40,8 +40,22 @@ impl JsonHttpClient {
     where
         T: DeserializeOwned,
     {
+        self.get_json_with_endpoint(path, query)
+            .await
+            .map(|(_, body)| body)
+    }
+
+    pub async fn get_json_with_endpoint<T>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<(Url, T)>
+    where
+        T: DeserializeOwned,
+    {
         let url = self.url_for(path, query)?;
-        self.client
+        let body = self
+            .client
             .get(url.clone())
             .send()
             .await
@@ -50,7 +64,8 @@ impl JsonHttpClient {
             .with_context(|| format!("HTTP status error for {url}"))?
             .json::<T>()
             .await
-            .with_context(|| format!("failed to parse JSON response from {url}"))
+            .with_context(|| format!("failed to parse JSON response from {url}"))?;
+        Ok((url, body))
     }
 }
 

@@ -162,10 +162,6 @@ pub fn load_for_engine_startup(path: &Path) -> Result<AppConfig> {
     Ok(config)
 }
 
-pub fn validate_toml_compatibility(content: &str) -> Result<()> {
-    load_from_str(content).map(|_| ())
-}
-
 fn load_from_str(content: &str) -> Result<LoadedConfig> {
     let value: Value = toml::from_str(content).context("failed to parse TOML config")?;
     let source_version = config_version(&value)?;
