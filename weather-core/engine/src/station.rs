@@ -1,4 +1,4 @@
-use weather_db::{ProviderCity, ProviderProvince, ProviderStation};
+use weather_db::{ProviderCity, ProviderStation};
 use weather_schema::StationRef;
 
 pub(crate) fn merge_station(
@@ -40,26 +40,6 @@ pub(crate) fn city_to_provider_station(
         url: city.url.clone(),
         unified_uuid: weather_schema::unified_station_uuid(&name),
         name,
-    }
-}
-
-pub(crate) fn push_matching_provinces(
-    target: &mut Vec<ProviderProvince>,
-    source: &[ProviderProvince],
-    hint: &str,
-) {
-    for province in source.iter().filter(|province| {
-        province.name == hint
-            || short_region_name(&province.name) == hint
-            || province.name.contains(hint)
-            || hint.contains(short_region_name(&province.name))
-    }) {
-        if !target
-            .iter()
-            .any(|item| item.provider_code == province.provider_code)
-        {
-            target.push(province.clone());
-        }
     }
 }
 

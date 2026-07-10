@@ -91,6 +91,10 @@ pub(crate) enum DbCommand {
         provider_province_code: String,
         reply: oneshot::Sender<Result<Option<CatalogCache<ProviderCity>>>>,
     },
+    GetAllProviderCityScopes {
+        provider: String,
+        reply: oneshot::Sender<Result<Vec<ProviderCityScopeCache>>>,
+    },
     GetProviderStationByUuid {
         provider: String,
         uuid: String,
@@ -138,7 +142,7 @@ pub struct CatalogCache<T> {
     pub fetched_at_unix_ms: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderProvince {
     pub provider_code: String,
     pub name: String,
@@ -153,13 +157,20 @@ impl ProviderProvince {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderCity {
     pub provider_code: String,
     pub provider_province_code: String,
     pub province: String,
     pub city: String,
     pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCityScopeCache {
+    pub provider_province_code: String,
+    pub items: Vec<ProviderCity>,
+    pub fetched_at_unix_ms: i64,
 }
 
 impl ProviderCity {
@@ -502,6 +513,17 @@ impl DbActor {
         .await
     }
 
+    pub async fn get_all_provider_city_scopes(
+        &self,
+        provider: &str,
+    ) -> Result<Vec<ProviderCityScopeCache>> {
+        self.call(|reply| DbCommand::GetAllProviderCityScopes {
+            provider: provider.to_string(),
+            reply,
+        })
+        .await
+    }
+
     pub async fn get_provider_station_by_uuid(
         &self,
         provider: String,
@@ -721,6 +743,9 @@ impl DbCommand {
             Self::GetProviderCities { reply, .. } => {
                 let _ = reply.send(rejected_command(message));
             }
+            Self::GetAllProviderCityScopes { reply, .. } => {
+                let _ = reply.send(rejected_command(message));
+            }
             Self::GetProviderStationByUuid { reply, .. }
             | Self::GetProviderStationByName { reply, .. } => {
                 let _ = reply.send(rejected_command(message));
@@ -791,6 +816,10 @@ fn handle(db: &mut DbInstance, cmd: DbCommand) -> Option<Arc<str>> {
             reply,
         } => {
             let _ = reply.send(db.get_provider_cities(&provider, &provider_province_code));
+            None
+        }
+        DbCommand::GetAllProviderCityScopes { provider, reply } => {
+            let _ = reply.send(db.get_all_provider_city_scopes(&provider));
             None
         }
         DbCommand::GetProviderStationByUuid {

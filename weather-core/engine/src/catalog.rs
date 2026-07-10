@@ -12,10 +12,17 @@ pub(crate) struct CityCatalogKey {
     pub(crate) province_code: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderCatalog {
+    pub(crate) provinces: Vec<ProviderProvince>,
+    pub(crate) cities: Vec<ProviderCity>,
+}
+
 #[derive(Clone)]
 pub(crate) struct CatalogCoordinator {
     pub(crate) province_flights: Singleflight<String, Vec<ProviderProvince>>,
     pub(crate) city_flights: Singleflight<CityCatalogKey, Vec<ProviderCity>>,
+    pub(crate) population_flights: Singleflight<String, ProviderCatalog>,
     upstream_permits: Arc<Semaphore>,
 }
 
@@ -31,6 +38,7 @@ impl CatalogCoordinator {
         Self {
             province_flights: Singleflight::default(),
             city_flights: Singleflight::default(),
+            population_flights: Singleflight::default(),
             upstream_permits: Arc::new(Semaphore::new(limit)),
         }
     }

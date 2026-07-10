@@ -12,7 +12,10 @@ use weather_schema::{
 };
 
 use crate::{
-    actor::{CatalogCache, ProviderCity, ProviderProvince, ProviderStation, StoredSnapshot},
+    actor::{
+        CatalogCache, ProviderCity, ProviderCityScopeCache, ProviderProvince, ProviderStation,
+        StoredSnapshot,
+    },
     migration,
     validation::{validate_provider_city_catalog, validate_provider_province_catalog},
 };
@@ -400,6 +403,86 @@ impl DbInstance {
             items,
             fetched_at_unix_ms,
         }))
+    }
+
+    pub(crate) fn get_all_provider_city_scopes(
+        &self,
+        provider: &str,
+    ) -> Result<Vec<ProviderCityScopeCache>> {
+        validate_provider(provider)?;
+
+        let orphan_city = self
+            .conn
+            .query_row(
+                r#"SELECT provider_province_code, provider_code
+                   FROM provider_cities AS city
+                   WHERE provider = ?1
+                     AND NOT EXISTS (
+                         SELECT 1 FROM catalog_cache_state AS state
+                         WHERE state.provider = city.provider
+                           AND state.catalog_kind = 'cities'
+                           AND state.scope = city.provider_province_code
+                     )
+                   ORDER BY provider_province_code, provider_code
+                   LIMIT 1"#,
+                params![provider],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((scope, code)) = orphan_city {
+            bail!("provider city `{provider}/{scope}/{code}` has no matching catalog cache state");
+        }
+
+        let states = {
+            let mut stmt = self.conn.prepare(
+                r#"SELECT scope, fetched_at_unix_ms, row_count
+                   FROM catalog_cache_state
+                   WHERE provider = ?1 AND catalog_kind = 'cities'
+                   ORDER BY scope"#,
+            )?;
+            stmt.query_map(params![provider], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        let mut scopes = Vec::with_capacity(states.len());
+        let mut stmt = self.conn.prepare(
+            r#"SELECT provider_code, provider_province_code, province, city, url
+               FROM provider_cities
+               WHERE provider = ?1 AND provider_province_code = ?2
+               ORDER BY city, provider_code"#,
+        )?;
+        for (scope, fetched_at_unix_ms, expected_count) in states {
+            let items = stmt
+                .query_map(params![provider, scope], |row| {
+                    Ok(ProviderCity {
+                        provider_code: row.get(0)?,
+                        provider_province_code: row.get(1)?,
+                        province: row.get(2)?,
+                        city: row.get(3)?,
+                        url: row.get(4)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            validate_catalog_count(
+                provider,
+                CATALOG_CITIES,
+                &scope,
+                expected_count,
+                items.len(),
+            )?;
+            scopes.push(ProviderCityScopeCache {
+                provider_province_code: scope,
+                items,
+                fetched_at_unix_ms,
+            });
+        }
+        Ok(scopes)
     }
 
     fn get_catalog_state(
@@ -1140,6 +1223,108 @@ mod tests {
         assert!(empty.items.is_empty());
         assert!(empty.fetched_at_unix_ms > 0);
         assert!(db.get_provider_cities("other", "X").unwrap().is_none());
+    }
+
+    #[test]
+    fn all_city_scopes_include_empty_caches_in_canonical_order() {
+        let mut db = temp_db();
+        db.replace_provider_provinces(
+            "nmc",
+            &[sample_province("B", "Beta"), sample_province("A", "Alpha")],
+        )
+        .unwrap();
+        db.replace_provider_provinces("other", &[sample_province("A", "Other")])
+            .unwrap();
+        db.replace_provider_cities(
+            "nmc",
+            "B",
+            &[
+                sample_city("B2", "B", "Zulu"),
+                sample_city("B1", "B", "Alpha"),
+            ],
+        )
+        .unwrap();
+        db.replace_provider_cities("nmc", "A", &[]).unwrap();
+        db.replace_provider_cities("other", "A", &[sample_city("O1", "A", "Other")])
+            .unwrap();
+
+        let scopes = db.get_all_provider_city_scopes("nmc").unwrap();
+
+        assert_eq!(
+            scopes
+                .iter()
+                .map(|scope| scope.provider_province_code.as_str())
+                .collect::<Vec<_>>(),
+            ["A", "B"]
+        );
+        assert!(scopes[0].items.is_empty());
+        assert!(scopes[0].fetched_at_unix_ms > 0);
+        assert_eq!(
+            scopes[1]
+                .items
+                .iter()
+                .map(|city| city.provider_code.as_str())
+                .collect::<Vec<_>>(),
+            ["B1", "B2"]
+        );
+    }
+
+    #[test]
+    fn all_city_scopes_reject_count_mismatches_and_rows_without_state() {
+        let mut mismatched = temp_db();
+        mismatched
+            .replace_provider_provinces("nmc", &[sample_province("A", "Alpha")])
+            .unwrap();
+        mismatched
+            .replace_provider_cities("nmc", "A", &[sample_city("A1", "A", "Alpha")])
+            .unwrap();
+        mismatched
+            .conn
+            .execute(
+                r#"UPDATE catalog_cache_state SET row_count = 2
+                   WHERE provider = 'nmc' AND catalog_kind = 'cities' AND scope = 'A'"#,
+                [],
+            )
+            .unwrap();
+        let mismatch = mismatched
+            .get_all_provider_city_scopes("nmc")
+            .unwrap_err()
+            .to_string();
+        assert!(mismatch.contains("scope `A`"), "{mismatch}");
+
+        let orphan_city = temp_db();
+        orphan_city
+            .conn
+            .execute(
+                r#"INSERT INTO provider_cities(
+                       provider, provider_code, provider_province_code,
+                       province, city, url, updated_at_unix_ms
+                   ) VALUES ('nmc', 'A1', 'A', 'Alpha', 'City', '/A1', 1)"#,
+                [],
+            )
+            .unwrap();
+        let city_error = orphan_city
+            .get_all_provider_city_scopes("nmc")
+            .unwrap_err()
+            .to_string();
+        assert!(city_error.contains("no matching catalog cache state"));
+
+        let independent_scope = temp_db();
+        independent_scope
+            .conn
+            .execute(
+                r#"INSERT INTO catalog_cache_state(
+                       provider, catalog_kind, scope, fetched_at_unix_ms, row_count
+                   ) VALUES ('nmc', 'cities', 'A', 1, 0)"#,
+                [],
+            )
+            .unwrap();
+        let scopes = independent_scope
+            .get_all_provider_city_scopes("nmc")
+            .unwrap();
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0].provider_province_code, "A");
+        assert!(scopes[0].items.is_empty());
     }
 
     #[test]

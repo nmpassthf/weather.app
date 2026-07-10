@@ -1,4 +1,7 @@
-use anyhow::{Result, bail};
+use std::{collections::BTreeMap, sync::Arc};
+
+use anyhow::{Context, Result, anyhow, bail};
+use tokio::task::JoinSet;
 use weather_db::{
     ProviderCity, ProviderProvince, validate_provider_city_catalog,
     validate_provider_province_catalog,
@@ -6,9 +9,9 @@ use weather_db::{
 use weather_schema::*;
 
 use crate::{
-    catalog::{CityCatalogKey, catalog_cache_is_fresh},
+    catalog::{CityCatalogKey, ProviderCatalog, catalog_cache_is_fresh},
     handlers::response::paginate,
-    limits::{DEFAULT_PAGE_SIZE, normalize_pagination},
+    limits::{DEFAULT_PAGE_SIZE, MAX_CONCURRENT_CATALOG_FETCHES, normalize_pagination},
     runtime::Engine,
     time::now_ms,
 };
@@ -224,21 +227,8 @@ impl Engine {
 
     pub(super) async fn resolve_provider_province_code(&self, province: &str) -> Result<String> {
         let provider = self.provider.provider_name();
-        let codes = self
-            .provider_provinces()
-            .await?
-            .into_iter()
-            .filter(|candidate| candidate.name == province)
-            .map(|candidate| candidate.provider_code)
-            .collect::<Vec<_>>();
-        match codes.as_slice() {
-            [code] => Ok(code.clone()),
-            [] => bail!("provider province `{province}` not found for `{provider}`"),
-            codes => bail!(
-                "provider province `{province}` is ambiguous for `{provider}`: {}",
-                codes.join(", ")
-            ),
-        }
+        let provinces = self.provider_provinces().await?;
+        Ok(resolve_provider_province(&provinces, provider, province)?.provider_code)
     }
 
     pub(super) async fn provider_cities_by_code(
@@ -272,6 +262,135 @@ impl Engine {
             })
             .await?;
         Ok(result.as_ref().clone())
+    }
+
+    pub(super) async fn provider_catalog(&self) -> Result<Arc<ProviderCatalog>> {
+        let provider = self.provider.provider_name().to_string();
+        self.catalog
+            .population_flights
+            .run(provider.clone(), || async {
+                let provinces = self.provider_provinces().await?;
+                self.populate_provider_catalog(&provider, provinces).await
+            })
+            .await
+    }
+
+    pub(super) async fn provider_catalog_from_provinces(
+        &self,
+        provinces: Vec<ProviderProvince>,
+    ) -> Result<Arc<ProviderCatalog>> {
+        let provider = self.provider.provider_name().to_string();
+        self.catalog
+            .population_flights
+            .run(provider.clone(), || async {
+                self.populate_provider_catalog(&provider, provinces).await
+            })
+            .await
+    }
+
+    async fn populate_provider_catalog(
+        &self,
+        provider: &str,
+        provinces: Vec<ProviderProvince>,
+    ) -> Result<ProviderCatalog> {
+        let ttl_seconds = self.config.get().updater.province_ttl_seconds;
+        let now = now_ms();
+        let expected_codes = provinces
+            .iter()
+            .map(|province| province.provider_code.clone())
+            .collect::<Vec<_>>();
+        let mut city_scopes = BTreeMap::<String, Vec<ProviderCity>>::new();
+        let mut cached_scopes = self
+            .db
+            .get_all_provider_city_scopes(provider)
+            .await?
+            .into_iter()
+            .map(|scope| (scope.provider_province_code.clone(), scope))
+            .collect::<BTreeMap<_, _>>();
+        let mut pending = Vec::new();
+
+        for code in &expected_codes {
+            match cached_scopes.remove(code) {
+                Some(scope)
+                    if catalog_cache_is_fresh(scope.fetched_at_unix_ms, now, ttl_seconds) =>
+                {
+                    city_scopes.insert(code.clone(), scope.items);
+                }
+                _ => pending.push(code.clone()),
+            }
+        }
+
+        city_scopes.extend(self.load_provider_city_scopes(pending).await?);
+        let cities = flatten_city_scopes(&expected_codes, city_scopes)?;
+        validate_population_city_codes(&cities)?;
+        Ok(ProviderCatalog { provinces, cities })
+    }
+
+    pub(super) async fn provider_catalog_for_provinces(
+        &self,
+        provinces: Vec<ProviderProvince>,
+    ) -> Result<ProviderCatalog> {
+        let expected_codes = provinces
+            .iter()
+            .map(|province| province.provider_code.clone())
+            .collect::<Vec<_>>();
+        let scopes = self
+            .load_provider_city_scopes(expected_codes.clone())
+            .await?;
+        let cities = flatten_city_scopes(&expected_codes, scopes)?;
+        validate_population_city_codes(&cities)?;
+        Ok(ProviderCatalog { provinces, cities })
+    }
+
+    pub(super) async fn provider_catalog_for_province(
+        &self,
+        province: &str,
+    ) -> Result<ProviderCatalog> {
+        let provider = self.provider.provider_name();
+        let provinces = self.provider_provinces().await?;
+        let province = resolve_provider_province(&provinces, provider, province)?;
+        self.provider_catalog_for_provinces(vec![province]).await
+    }
+
+    pub(super) async fn load_provider_city_scopes(
+        &self,
+        province_codes: Vec<String>,
+    ) -> Result<BTreeMap<String, Vec<ProviderCity>>> {
+        let mut pending = province_codes.into_iter();
+        let mut tasks = JoinSet::<(String, Result<Vec<ProviderCity>>)>::new();
+        let mut loaded = BTreeMap::new();
+
+        while tasks.len() < MAX_CONCURRENT_CATALOG_FETCHES {
+            let Some(code) = pending.next() else {
+                break;
+            };
+            spawn_city_scope(&mut tasks, self.clone(), code);
+        }
+
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok((code, Ok(mut cities))) => {
+                    sort_provider_cities(&mut cities);
+                    loaded.insert(code, cities);
+                    if let Some(code) = pending.next() {
+                        spawn_city_scope(&mut tasks, self.clone(), code);
+                    }
+                }
+                Ok((code, Err(err))) => {
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    return Err(
+                        err.context(format!("failed to populate provider city scope `{code}`"))
+                    );
+                }
+                Err(err) => {
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    return Err(anyhow!("provider city population task failed: {err}"));
+                }
+            }
+        }
+        Ok(loaded)
     }
 
     async fn refresh_provider_cities(
@@ -455,6 +574,71 @@ fn sort_provider_cities(cities: &mut [ProviderCity]) {
     });
 }
 
+fn resolve_provider_province(
+    provinces: &[ProviderProvince],
+    provider: &str,
+    province: &str,
+) -> Result<ProviderProvince> {
+    let matches = provinces
+        .iter()
+        .filter(|candidate| candidate.name == province)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [province] => Ok((*province).clone()),
+        [] => bail!("provider province `{province}` not found for `{provider}`"),
+        matches => bail!(
+            "provider province `{province}` is ambiguous for `{provider}`: {}",
+            matches
+                .iter()
+                .map(|candidate| candidate.provider_code.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn spawn_city_scope(
+    tasks: &mut JoinSet<(String, Result<Vec<ProviderCity>>)>,
+    engine: Engine,
+    code: String,
+) {
+    tasks.spawn(async move {
+        let result = engine.provider_cities_by_code(&code).await;
+        (code, result)
+    });
+}
+
+fn flatten_city_scopes(
+    expected_codes: &[String],
+    mut scopes: BTreeMap<String, Vec<ProviderCity>>,
+) -> Result<Vec<ProviderCity>> {
+    let mut cities = Vec::new();
+    for code in expected_codes {
+        let scope = scopes
+            .remove(code)
+            .with_context(|| format!("provider city scope `{code}` was not populated"))?;
+        cities.extend(scope);
+    }
+    Ok(cities)
+}
+
+fn validate_population_city_codes(cities: &[ProviderCity]) -> Result<()> {
+    let mut owners = BTreeMap::<&str, &str>::new();
+    for city in cities {
+        if let Some(previous) = owners.insert(
+            city.provider_code.as_str(),
+            city.provider_province_code.as_str(),
+        ) {
+            bail!(
+                "duplicate provider city code `{}` across province scopes `{previous}` and `{}`",
+                city.provider_code,
+                city.provider_province_code
+            );
+        }
+    }
+    Ok(())
+}
+
 fn append_warning(message: &mut Option<String>, warning: String) {
     match message {
         Some(message) => {
@@ -481,13 +665,17 @@ mod tests {
     use rusqlite::Connection;
     use tokio::{sync::Semaphore, time::timeout};
     use weather_configure::{AppConfig, write_config_atomic};
-    use weather_schema::{EventEnvelope, FetchLogEvent, WeatherSnapshot, decode_message};
+    use weather_schema::{
+        EventEnvelope, FetchLogEvent, FuzzyMatchStationsRequest, FuzzyMatchStationsResponse,
+        ResponseStatus, RpcRequest, SCHEMA_VERSION, WeatherSnapshot, decode_message,
+        encode_message,
+    };
     use weather_updater::{
         ProviderCity as UpstreamCity, ProviderFuture, ProviderProvince as UpstreamProvince,
         WeatherProvider,
     };
 
-    use crate::runtime::EngineRuntime;
+    use crate::{runtime::EngineRuntime, station::canonical_station_name};
 
     enum Reply<T> {
         Success(Vec<T>),
@@ -716,6 +904,55 @@ mod tests {
 
     async fn shutdown(runtime: &EngineRuntime) {
         runtime.test_engine().db.shutdown().await.unwrap();
+    }
+
+    async fn fuzzy_page(
+        engine: &crate::runtime::Engine,
+        query: &str,
+        province: Option<&str>,
+        page_offset: u32,
+        page_size: u32,
+    ) -> FuzzyMatchStationsResponse {
+        let response = engine
+            .handle_fuzzy(&RpcRequest {
+                schema_version: SCHEMA_VERSION.to_string(),
+                request_id: "fuzzy-test".to_string(),
+                payload: encode_message(&FuzzyMatchStationsRequest {
+                    query: query.to_string(),
+                    province: province.map(str::to_string),
+                    page_offset,
+                    page_size,
+                }),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(
+            response.status,
+            ResponseStatus::Ok as i32,
+            "{:?}",
+            response.error
+        );
+        decode_message(&response.payload).unwrap()
+    }
+
+    fn fuzzy_keys(response: &FuzzyMatchStationsResponse) -> Vec<String> {
+        response
+            .stations
+            .iter()
+            .map(|station| format!("station:{}", station.unified_uuid))
+            .chain(
+                response
+                    .cities
+                    .iter()
+                    .map(|city| format!("city:{}:{}", city.province, city.city)),
+            )
+            .chain(
+                response
+                    .provinces
+                    .iter()
+                    .map(|province| format!("province:{}", province.name)),
+            )
+            .collect()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -949,6 +1186,486 @@ mod tests {
 
         assert_eq!(provider.peak_active_calls.load(Ordering::SeqCst), 8);
         assert_eq!(provider.active_calls.load(Ordering::SeqCst), 0);
+        shutdown(&runtime).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn provider_population_uses_one_province_snapshot_at_zero_ttl() {
+        let provider = Arc::new(CatalogProvider::new());
+        provider.queue_provinces(Reply::Success(vec![
+            upstream_province("B", "Beta"),
+            upstream_province("A", "Alpha"),
+            upstream_province("E", "Empty"),
+        ]));
+        provider.queue_cities("A", Reply::Success(vec![upstream_city("A1", "A", "Alpha")]));
+        provider.queue_cities("B", Reply::Success(vec![upstream_city("B1", "B", "Beta")]));
+        provider.queue_cities("E", Reply::Success(Vec::new()));
+        let (_directory, runtime, _db_path) = start_runtime(provider.clone(), 0).await;
+        let engine = runtime.test_engine();
+
+        let catalog = engine.provider_catalog().await.unwrap();
+
+        assert_eq!(provider.province_calls(), 1);
+        assert_eq!(provider.total_city_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            catalog
+                .provinces
+                .iter()
+                .map(|province| province.provider_code.as_str())
+                .collect::<Vec<_>>(),
+            ["A", "B", "E"]
+        );
+        assert_eq!(
+            catalog
+                .cities
+                .iter()
+                .map(|city| city.provider_province_code.as_str())
+                .collect::<Vec<_>>(),
+            ["A", "B"]
+        );
+        shutdown(&runtime).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn warm_provider_population_is_local_and_keeps_scope_order() {
+        let provider = Arc::new(CatalogProvider::new());
+        provider.queue_provinces(Reply::Success(vec![
+            upstream_province("B", "Beta"),
+            upstream_province("A", "Alpha"),
+        ]));
+        provider.queue_cities(
+            "A",
+            Reply::Success(vec![
+                upstream_city("A2", "A", "Zulu"),
+                upstream_city("A1", "A", "Alpha"),
+            ]),
+        );
+        provider.queue_cities("B", Reply::Success(vec![upstream_city("B1", "B", "Beta")]));
+        let (_directory, runtime, _db_path) = start_runtime(provider.clone(), 3_600).await;
+        let engine = runtime.test_engine();
+
+        let cold = engine.provider_catalog().await.unwrap();
+        let warm = engine.provider_catalog().await.unwrap();
+
+        assert_eq!(provider.province_calls(), 1);
+        assert_eq!(provider.total_city_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(cold.cities, warm.cities);
+        assert_eq!(
+            warm.cities
+                .iter()
+                .map(|city| city.provider_code.as_str())
+                .collect::<Vec<_>>(),
+            ["A1", "A2", "B1"]
+        );
+        shutdown(&runtime).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn provider_population_has_a_rolling_eight_scope_window() {
+        let provider = Arc::new(CatalogProvider::new());
+        provider.queue_provinces(Reply::Success(
+            (0..9)
+                .rev()
+                .map(|index| upstream_province(&format!("P{index}"), "Province"))
+                .collect(),
+        ));
+        for index in 0..9 {
+            let code = format!("P{index}");
+            provider.queue_cities(
+                &code,
+                Reply::Success(vec![upstream_city(&format!("S{index}"), &code, "City")]),
+            );
+        }
+        let gate = provider.block_calls();
+        let (_directory, runtime, _db_path) = start_runtime(provider.clone(), 3_600).await;
+        let engine = runtime.test_engine();
+        let task = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.provider_catalog().await })
+        };
+
+        wait_for(|| provider.province_calls() == 1).await;
+        gate.add_permits(1);
+        wait_for(|| provider.active_calls.load(Ordering::SeqCst) == 8).await;
+        assert_eq!(provider.total_city_calls.load(Ordering::SeqCst), 8);
+        gate.add_permits(8);
+        wait_for(|| provider.total_city_calls.load(Ordering::SeqCst) == 9).await;
+        gate.add_permits(1);
+        let catalog = task.await.unwrap().unwrap();
+
+        assert_eq!(provider.peak_active_calls.load(Ordering::SeqCst), 8);
+        assert_eq!(provider.active_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            catalog
+                .cities
+                .iter()
+                .map(|city| city.provider_province_code.as_str())
+                .collect::<Vec<_>>(),
+            ["P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8"]
+        );
+        shutdown(&runtime).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlapping_provider_populations_share_one_flight() {
+        let provider = Arc::new(CatalogProvider::new());
+        provider.queue_provinces(Reply::Success(vec![upstream_province("P", "Province")]));
+        provider.queue_cities("P", Reply::Success(vec![upstream_city("S", "P", "Shared")]));
+        let gate = provider.block_calls();
+        let (_directory, runtime, _db_path) = start_runtime(provider.clone(), 3_600).await;
+        let engine = runtime.test_engine();
+        let first = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.provider_catalog().await })
+        };
+        wait_for(|| provider.province_calls() == 1).await;
+        let second = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.provider_catalog().await })
+        };
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(provider.province_calls(), 1);
+        gate.add_permits(1);
+        wait_for(|| provider.city_calls("P") == 1).await;
+        gate.add_permits(1);
+
+        let first = first.await.unwrap().unwrap();
+        let second = second.await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(provider.province_calls(), 1);
+        assert_eq!(provider.city_calls("P"), 1);
+        shutdown(&runtime).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_population_leader_is_replaced_without_leaking_tasks() {
+        let provider = Arc::new(CatalogProvider::new());
+        provider.queue_provinces(Reply::Success(vec![upstream_province("P", "First")]));
+        provider.queue_provinces(Reply::Success(vec![upstream_province("P", "Second")]));
+        provider.queue_cities("P", Reply::Success(vec![upstream_city("S", "P", "City")]));
+        let gate = provider.block_calls();
+        let (_directory, runtime, _db_path) = start_runtime(provider.clone(), 0).await;
+        let engine = runtime.test_engine();
+        let leader = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.provider_catalog().await })
+        };
+        wait_for(|| provider.province_calls() == 1).await;
+        let waiter = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.provider_catalog().await })
+        };
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+
+        leader.abort();
+        assert!(leader.await.unwrap_err().is_cancelled());
+        wait_for(|| provider.province_calls() == 2).await;
+        gate.add_permits(1);
+        wait_for(|| provider.city_calls("P") == 1).await;
+        gate.add_permits(1);
+        let catalog = waiter.await.unwrap().unwrap();
+
+        assert_eq!(catalog.provinces[0].name, "Second");
+        wait_for(|| provider.active_calls.load(Ordering::SeqCst) == 0).await;
+        assert_eq!(provider.province_calls(), 2);
+        assert_eq!(provider.city_calls("P"), 1);
+        shutdown(&runtime).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn population_deadline_aborts_all_owned_provider_calls() {
+        let provider = Arc::new(CatalogProvider::new());
+        provider.queue_provinces(Reply::Success(vec![upstream_province("P", "Province")]));
+        provider.queue_cities("P", Reply::Success(vec![upstream_city("S", "P", "City")]));
+        let (_directory, runtime, _db_path) = start_runtime(provider.clone(), 3_600).await;
+        let engine = runtime.test_engine();
+        engine.provider_provinces().await.unwrap();
+        let _gate = provider.block_calls();
+
+        let population = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                timeout(Duration::from_millis(50), engine.provider_catalog()).await
+            })
+        };
+        wait_for(|| provider.city_calls("P") == 1).await;
+        let expired = population.await.unwrap();
+
+        assert!(expired.is_err());
+        wait_for(|| provider.active_calls.load(Ordering::SeqCst) == 0).await;
+        shutdown(&runtime).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn population_first_error_aborts_and_drains_other_scopes() {
+        let provider = Arc::new(CatalogProvider::new());
+        provider.queue_provinces(Reply::Success(vec![
+            upstream_province("A", "Alpha"),
+            upstream_province("B", "Beta"),
+        ]));
+        provider.queue_cities("A", Reply::Failure("cold scope unavailable"));
+        provider.queue_cities("B", Reply::Success(vec![upstream_city("B1", "B", "Beta")]));
+        let (_directory, runtime, _db_path) = start_runtime(provider.clone(), 3_600).await;
+        let engine = runtime.test_engine();
+
+        let error = engine.provider_catalog().await.unwrap_err().to_string();
+
+        assert!(error.contains("failed to populate provider city scope `A`"));
+        assert!(error.contains("cold scope unavailable"));
+        assert_eq!(provider.active_calls.load(Ordering::SeqCst), 0);
+        shutdown(&runtime).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn population_uses_stale_scopes_when_zero_ttl_refreshes_fail() {
+        let provider = Arc::new(CatalogProvider::new());
+        provider.queue_provinces(Reply::Success(vec![upstream_province("P", "Province")]));
+        provider.queue_cities("P", Reply::Success(vec![upstream_city("OLD", "P", "Old")]));
+        provider.queue_provinces(Reply::Failure("province unavailable"));
+        provider.queue_cities("P", Reply::Failure("city unavailable"));
+        let (_directory, runtime, _db_path) = start_runtime(provider.clone(), 0).await;
+        let engine = runtime.test_engine();
+
+        let first = engine.provider_catalog().await.unwrap();
+        let stale = engine.provider_catalog().await.unwrap();
+
+        assert_eq!(first.cities, stale.cities);
+        assert_eq!(stale.cities[0].provider_code, "OLD");
+        assert_eq!(provider.province_calls(), 2);
+        assert_eq!(provider.city_calls("P"), 2);
+        shutdown(&runtime).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn population_preserves_valid_upstream_when_city_cache_write_fails() {
+        let provider = Arc::new(CatalogProvider::new());
+        provider.queue_provinces(Reply::Success(vec![upstream_province("P", "Province")]));
+        provider.queue_cities("P", Reply::Success(vec![upstream_city("S", "P", "City")]));
+        let (_directory, runtime, db_path) = start_runtime(provider, 3_600).await;
+        let engine = runtime.test_engine();
+        engine.provider_provinces().await.unwrap();
+        Connection::open(&db_path)
+            .unwrap()
+            .execute_batch(
+                r#"CREATE TRIGGER fail_city_cache_write
+                   BEFORE INSERT ON provider_cities
+                   BEGIN SELECT RAISE(FAIL, 'city cache blocked'); END;"#,
+            )
+            .unwrap();
+
+        let catalog = engine.provider_catalog().await.unwrap();
+
+        assert_eq!(catalog.cities[0].provider_code, "S");
+        shutdown(&runtime).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn population_reuses_city_state_when_province_cache_writes_fail() {
+        let provider = Arc::new(CatalogProvider::new());
+        provider.queue_provinces(Reply::Success(vec![upstream_province("P", "Province")]));
+        provider.queue_provinces(Reply::Success(vec![upstream_province("P", "Province")]));
+        provider.queue_cities("P", Reply::Success(vec![upstream_city("S", "P", "City")]));
+        let (_directory, runtime, db_path) = start_runtime(provider.clone(), 3_600).await;
+        Connection::open(&db_path)
+            .unwrap()
+            .execute_batch(
+                r#"CREATE TRIGGER fail_province_cache_write
+                   BEFORE INSERT ON provider_provinces
+                   BEGIN SELECT RAISE(FAIL, 'province cache blocked'); END;"#,
+            )
+            .unwrap();
+        let engine = runtime.test_engine();
+
+        let first = engine.provider_catalog().await.unwrap();
+        let second = engine.provider_catalog().await.unwrap();
+
+        assert_eq!(first.cities, second.cities);
+        assert_eq!(provider.province_calls(), 2);
+        assert_eq!(provider.city_calls("P"), 1);
+        shutdown(&runtime).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn population_rejects_duplicate_city_codes_across_scopes() {
+        let provider = Arc::new(CatalogProvider::new());
+        provider.queue_provinces(Reply::Success(vec![
+            upstream_province("A", "Alpha"),
+            upstream_province("B", "Beta"),
+        ]));
+        provider.queue_cities(
+            "A",
+            Reply::Success(vec![upstream_city("DUP", "A", "Alpha")]),
+        );
+        provider.queue_cities("B", Reply::Success(vec![upstream_city("DUP", "B", "Beta")]));
+        let (_directory, runtime, _db_path) = start_runtime(provider, 3_600).await;
+        let engine = runtime.test_engine();
+
+        let error = engine.provider_catalog().await.unwrap_err().to_string();
+
+        assert!(error.contains("duplicate provider city code `DUP`"));
+        assert!(error.contains("province scopes `A` and `B`"));
+        shutdown(&runtime).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scoped_fuzzy_only_populates_the_requested_province() {
+        let provider = Arc::new(CatalogProvider::new());
+        provider.queue_provinces(Reply::Success(vec![
+            upstream_province("A", "province-A"),
+            upstream_province("B", "province-B"),
+        ]));
+        provider.queue_cities("A", Reply::Success(vec![upstream_city("A1", "A", "Alpha")]));
+        let (_directory, runtime, _db_path) = start_runtime(provider.clone(), 3_600).await;
+        let engine = runtime.test_engine();
+
+        let cold = fuzzy_page(&engine, "", Some("province-A"), 0, 32).await;
+        let warm = fuzzy_page(&engine, "", Some("province-A"), 0, 32).await;
+
+        assert_eq!(fuzzy_keys(&cold), fuzzy_keys(&warm));
+        assert_eq!(provider.province_calls(), 1);
+        assert_eq!(provider.city_calls("A"), 1);
+        assert_eq!(provider.city_calls("B"), 0);
+        assert_eq!(cold.stations.len(), 1);
+        assert_eq!(cold.cities.len(), 1);
+        assert_eq!(cold.provinces.len(), 1);
+        shutdown(&runtime).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scoped_fuzzy_uses_stale_target_without_populating_other_provinces() {
+        let provider = Arc::new(CatalogProvider::new());
+        provider.queue_provinces(Reply::Success(vec![
+            upstream_province("A", "province-A"),
+            upstream_province("B", "province-B"),
+        ]));
+        provider.queue_cities("A", Reply::Success(vec![upstream_city("A1", "A", "Alpha")]));
+        provider.queue_provinces(Reply::Failure("province unavailable"));
+        provider.queue_cities("A", Reply::Failure("city unavailable"));
+        let (_directory, runtime, _db_path) = start_runtime(provider.clone(), 0).await;
+        let engine = runtime.test_engine();
+
+        let first = fuzzy_page(&engine, "", Some("province-A"), 0, 32).await;
+        let stale = fuzzy_page(&engine, "", Some("province-A"), 0, 32).await;
+
+        assert_eq!(fuzzy_keys(&first), fuzzy_keys(&stale));
+        assert_eq!(provider.province_calls(), 2);
+        assert_eq!(provider.city_calls("A"), 2);
+        assert_eq!(provider.city_calls("B"), 0);
+        shutdown(&runtime).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fuzzy_pages_form_one_stable_deduplicated_candidate_sequence() {
+        let provider = Arc::new(CatalogProvider::new());
+        provider.queue_provinces(Reply::Success(vec![
+            upstream_province("B", "province-B"),
+            upstream_province("A", "province-A"),
+        ]));
+        provider.queue_cities(
+            "A",
+            Reply::Success(vec![
+                upstream_city("A3", "A", "Three"),
+                upstream_city("A1", "A", "One"),
+                upstream_city("A2", "A", "Two"),
+            ]),
+        );
+        provider.queue_cities(
+            "B",
+            Reply::Success(vec![
+                upstream_city("B2", "B", "Five"),
+                upstream_city("B1", "B", "Four"),
+            ]),
+        );
+        let (_directory, runtime, _db_path) = start_runtime(provider.clone(), 3_600).await;
+        let engine = runtime.test_engine();
+
+        let default_page = fuzzy_page(&engine, "", None, 0, 0).await;
+        assert!(default_page.has_more);
+        assert_eq!(default_page.next_offset, 10);
+        let full = fuzzy_page(&engine, "", None, 0, 256).await;
+        let full_keys = fuzzy_keys(&full);
+        assert_eq!(full_keys.len(), 12);
+        assert_eq!(
+            full_keys
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            full_keys.len()
+        );
+
+        let mut paged_keys = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = fuzzy_page(&engine, "", None, offset, 3).await;
+            paged_keys.extend(fuzzy_keys(&page));
+            if !page.has_more {
+                assert_eq!(page.next_offset, 12);
+                break;
+            }
+            assert!(page.next_offset > offset);
+            offset = page.next_offset;
+        }
+        assert_eq!(paged_keys, full_keys);
+
+        let beyond = fuzzy_page(&engine, "", None, 100, 3).await;
+        assert!(fuzzy_keys(&beyond).is_empty());
+        assert!(!beyond.has_more);
+        assert_eq!(beyond.next_offset, 12);
+        assert_eq!(provider.province_calls(), 1);
+        assert_eq!(provider.total_city_calls.load(Ordering::SeqCst), 2);
+        shutdown(&runtime).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn targeted_resolution_populates_only_its_matching_scope_and_reuses_mapping() {
+        let provider = Arc::new(CatalogProvider::new());
+        provider.queue_provinces(Reply::Success(vec![
+            upstream_province("A", "Alpha省"),
+            upstream_province("B", "Beta省"),
+        ]));
+        let mut target = upstream_city("A1", "A", "Target");
+        target.province = "Alpha省".to_string();
+        provider.queue_cities("A", Reply::Success(vec![target]));
+        let (_directory, runtime, _db_path) = start_runtime(provider.clone(), 3_600).await;
+        let engine = runtime.test_engine();
+        let name = canonical_station_name("Alpha省", "Target");
+
+        let first = engine.station_by_name(&name).await.unwrap();
+        let second = engine.station_by_name(&name).await.unwrap();
+
+        assert_eq!(first.provider_station_id, "A1");
+        assert_eq!(second.provider_station_id, "A1");
+        assert_eq!(provider.province_calls(), 1);
+        assert_eq!(provider.city_calls("A"), 1);
+        assert_eq!(provider.city_calls("B"), 0);
+        shutdown(&runtime).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn targeted_resolution_uses_one_nationwide_population_when_hint_is_unknown() {
+        let provider = Arc::new(CatalogProvider::new());
+        provider.queue_provinces(Reply::Success(vec![
+            upstream_province("A", "AdministrativeA"),
+            upstream_province("B", "AdministrativeB"),
+        ]));
+        let mut target = upstream_city("A1", "A", "Target");
+        target.province = "Alias省".to_string();
+        provider.queue_cities("A", Reply::Success(vec![target]));
+        provider.queue_cities("B", Reply::Success(vec![upstream_city("B1", "B", "Other")]));
+        let (_directory, runtime, _db_path) = start_runtime(provider.clone(), 0).await;
+        let engine = runtime.test_engine();
+        let name = canonical_station_name("Alias省", "Target");
+
+        let station = engine.station_by_name(&name).await.unwrap();
+
+        assert_eq!(station.provider_station_id, "A1");
+        assert_eq!(provider.province_calls(), 1);
+        assert_eq!(provider.city_calls("A"), 1);
+        assert_eq!(provider.city_calls("B"), 1);
         shutdown(&runtime).await;
     }
 
