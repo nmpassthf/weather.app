@@ -18,6 +18,9 @@ use crate::{
     runtime::{Engine, EngineExit},
 };
 
+#[cfg(test)]
+mod e2e;
+
 pub(crate) type EventSink = broadcast::Sender<(String, EventEnvelope)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
