@@ -22,6 +22,7 @@ use crate::{
     lock::resolve_relative,
     server::{EventSink, run_engine_sockets},
     singleflight::Singleflight,
+    time::{SystemWeatherClock, WeatherClock},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +43,7 @@ pub(crate) struct Engine {
     pub(crate) catalog: CatalogCoordinator,
     pub(crate) sink: EventSink,
     pub(crate) control: EngineControl,
+    pub(crate) weather_clock: Arc<dyn WeatherClock>,
 }
 
 pub(crate) struct EngineRuntime {
@@ -61,11 +63,23 @@ pub async fn run_engine_with_owner(
 impl EngineRuntime {
     #[cfg(test)]
     pub(crate) async fn start(config_path: PathBuf) -> Result<Self> {
-        Self::start_with_provider_factory(config_path, None, create_weather_provider).await
+        Self::start_with_provider_factory(
+            config_path,
+            None,
+            Arc::new(SystemWeatherClock),
+            create_weather_provider,
+        )
+        .await
     }
 
     async fn start_with_owner(config_path: PathBuf, owner_token: Option<String>) -> Result<Self> {
-        Self::start_with_provider_factory(config_path, owner_token, create_weather_provider).await
+        Self::start_with_provider_factory(
+            config_path,
+            owner_token,
+            Arc::new(SystemWeatherClock),
+            create_weather_provider,
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -73,7 +87,17 @@ impl EngineRuntime {
         config_path: PathBuf,
         provider: Arc<dyn WeatherProvider>,
     ) -> Result<Self> {
-        Self::start_with_provider_factory(config_path, None, move |config| {
+        Self::start_with_provider_and_clock(config_path, provider, Arc::new(SystemWeatherClock))
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn start_with_provider_and_clock(
+        config_path: PathBuf,
+        provider: Arc<dyn WeatherProvider>,
+        weather_clock: Arc<dyn WeatherClock>,
+    ) -> Result<Self> {
+        Self::start_with_provider_factory(config_path, None, weather_clock, move |config| {
             validate_injected_provider(config, provider.as_ref())?;
             Ok(provider)
         })
@@ -86,16 +110,22 @@ impl EngineRuntime {
         provider: Arc<dyn WeatherProvider>,
         owner_token: String,
     ) -> Result<Self> {
-        Self::start_with_provider_factory(config_path, Some(owner_token), move |config| {
-            validate_injected_provider(config, provider.as_ref())?;
-            Ok(provider)
-        })
+        Self::start_with_provider_factory(
+            config_path,
+            Some(owner_token),
+            Arc::new(SystemWeatherClock),
+            move |config| {
+                validate_injected_provider(config, provider.as_ref())?;
+                Ok(provider)
+            },
+        )
         .await
     }
 
     async fn start_with_provider_factory<F>(
         config_path: PathBuf,
         owner_token: Option<String>,
+        weather_clock: Arc<dyn WeatherClock>,
         factory: F,
     ) -> Result<Self>
     where
@@ -155,6 +185,7 @@ impl EngineRuntime {
                 catalog: CatalogCoordinator::default(),
                 sink,
                 control: EngineControl::new(),
+                weather_clock,
             },
             _engine_lock,
         })
@@ -168,6 +199,12 @@ impl EngineRuntime {
     #[cfg(test)]
     pub(crate) fn test_engine(&self) -> Engine {
         self.engine.clone()
+    }
+}
+
+impl Engine {
+    pub(crate) fn weather_now_unix_ms(&self) -> i64 {
+        self.weather_clock.now_unix_ms()
     }
 }
 

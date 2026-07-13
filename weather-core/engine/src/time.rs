@@ -3,6 +3,19 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use weather_schema::unix_timestamp_ms;
+
+pub(crate) trait WeatherClock: Send + Sync {
+    fn now_unix_ms(&self) -> i64;
+}
+
+pub(crate) struct SystemWeatherClock;
+
+impl WeatherClock for SystemWeatherClock {
+    fn now_unix_ms(&self) -> i64 {
+        unix_timestamp_ms().unwrap_or_default()
+    }
+}
 
 /// 把 `unix_ms` 在 `timezone`（IANA 名，如 `Asia/Shanghai`）下格式化为 `YYYY-MM-DD`。
 pub(crate) fn date_for_tz(unix_ms: i64, timezone: &str) -> Result<String> {

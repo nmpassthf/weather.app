@@ -22,6 +22,7 @@ zeromq.workspace = true
 [dev-dependencies]
 rusqlite.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 toml.workspace = true
 
 [build-dependencies]

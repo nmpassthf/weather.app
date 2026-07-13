@@ -7,6 +7,46 @@ use crate::{
     handlers::RefreshTerminal, runtime::Engine, station::merge_station, time::date_for_tz,
 };
 
+struct RefreshCompletionGuard {
+    engine: Engine,
+    unified_uuid: Option<String>,
+    armed: bool,
+}
+
+impl RefreshCompletionGuard {
+    fn start(engine: &Engine, requested_uuid: &str) -> Self {
+        let unified_uuid = (!requested_uuid.trim().is_empty()).then(|| requested_uuid.to_string());
+        engine.publish_refresh_started(unified_uuid.as_deref());
+        Self {
+            engine: engine.clone(),
+            unified_uuid,
+            armed: true,
+        }
+    }
+
+    fn set_unified_uuid(&mut self, unified_uuid: String) {
+        self.unified_uuid = Some(unified_uuid);
+    }
+
+    fn complete(mut self, outcome: RefreshTerminal) {
+        self.armed = false;
+        self.engine
+            .publish_refresh_terminal(self.unified_uuid.as_deref(), outcome);
+    }
+}
+
+impl Drop for RefreshCompletionGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.armed = false;
+            self.engine.publish_refresh_terminal(
+                self.unified_uuid.as_deref(),
+                RefreshTerminal::Failure("refresh cancelled before completion".to_string()),
+            );
+        }
+    }
+}
+
 impl Engine {
     pub(super) async fn handle_get_weather(&self, request: &RpcRequest) -> RpcResponse {
         self.handle_weather_request(request, false).await
@@ -45,25 +85,23 @@ impl Engine {
         &self,
         req: GetWeatherRequest,
     ) -> Result<WeatherSnapshot> {
+        let mut completion = req
+            .refresh
+            .then(|| RefreshCompletionGuard::start(self, &req.unified_uuid));
         let station = match self.resolve_station(&req.unified_uuid).await {
             Ok(station) => station,
             Err(err) => {
-                if req.refresh {
-                    let uuid =
-                        (!req.unified_uuid.trim().is_empty()).then_some(req.unified_uuid.as_str());
-                    self.publish_refresh_terminal(
-                        uuid,
-                        RefreshTerminal::Failure(format!("{err:#}")),
-                    );
+                if let Some(completion) = completion.take() {
+                    completion.complete(RefreshTerminal::Failure(format!("{err:#}")));
                 }
                 return Err(err);
             }
         };
         let uuid = station.unified_uuid.clone();
-        let include_debug = req.include_debug;
-        if req.refresh {
-            self.publish_refresh_started(Some(&uuid));
+        if let Some(completion) = completion.as_mut() {
+            completion.set_unified_uuid(uuid.clone());
         }
+        let include_debug = req.include_debug;
         if !req.refresh
             && !include_debug
             && let Some(stored) = self.db.get_latest_snapshot(uuid.clone()).await?
@@ -71,7 +109,7 @@ impl Engine {
             let config = self.config.get();
             if cached_snapshot_is_fresh(
                 stored.fetched_at_unix_ms,
-                unix_timestamp_ms().unwrap_or_default(),
+                self.weather_now_unix_ms(),
                 config.updater.weather_ttl_seconds,
                 &config.db.timezone,
             )? {
@@ -89,13 +127,13 @@ impl Engine {
             })
             .await
             .map(|snapshot| snapshot.as_ref().clone());
-        if req.refresh {
+        if let Some(completion) = completion.take() {
             let outcome = match &result {
                 Ok(snapshot) if snapshot.stale => RefreshTerminal::Stale,
                 Ok(_) => RefreshTerminal::Success,
                 Err(err) => RefreshTerminal::Failure(format!("{err:#}")),
             };
-            self.publish_refresh_terminal(Some(&uuid), outcome);
+            completion.complete(outcome);
         }
         result
     }
@@ -184,7 +222,7 @@ impl Engine {
     }
 
     async fn persist_snapshot(&self, snapshot: WeatherSnapshot) -> Result<()> {
-        let fetched_at_unix_ms = unix_timestamp_ms().unwrap_or_default();
+        let fetched_at_unix_ms = self.weather_now_unix_ms();
         self.db
             .put_history_snapshot(snapshot, fetched_at_unix_ms)
             .await
@@ -269,18 +307,152 @@ fn cached_snapshot_is_fresh(
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, sync::Arc, time::Duration};
+    use std::{
+        future::pending,
+        path::Path,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use chrono::DateTime;
     use rusqlite::Connection;
-    use tokio::time::timeout;
+    use tokio::{sync::Semaphore, time::timeout};
     use weather_configure::{AppConfig, StationConfig, write_config_atomic};
     use weather_updater::{
         ProviderCity, ProviderFuture, ProviderProvince, WeatherFetch, WeatherProvider,
     };
 
     use super::*;
-    use crate::runtime::EngineRuntime;
+    use crate::{runtime::EngineRuntime, time::WeatherClock};
+
+    struct FixedWeatherClock(i64);
+
+    impl WeatherClock for FixedWeatherClock {
+        fn now_unix_ms(&self) -> i64 {
+            self.0
+        }
+    }
+
+    struct ActiveWeatherFuture(Arc<AtomicUsize>);
+
+    impl Drop for ActiveWeatherFuture {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    struct BlockingProvider {
+        active: Arc<AtomicUsize>,
+        started: Arc<Semaphore>,
+    }
+
+    impl BlockingProvider {
+        fn new() -> Self {
+            Self {
+                active: Arc::new(AtomicUsize::new(0)),
+                started: Arc::new(Semaphore::new(0)),
+            }
+        }
+    }
+
+    impl WeatherProvider for BlockingProvider {
+        fn provider_name(&self) -> &str {
+            "blocking-test"
+        }
+
+        fn provinces(&self) -> ProviderFuture<'_, Vec<ProviderProvince>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn cities<'a>(
+            &'a self,
+            _provider_province_code: &'a str,
+        ) -> ProviderFuture<'a, Vec<ProviderCity>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn weather<'a>(
+            &'a self,
+            _provider_station_id: &'a str,
+            _include_debug: bool,
+        ) -> ProviderFuture<'a, WeatherFetch> {
+            let active = Arc::clone(&self.active);
+            let started = Arc::clone(&self.started);
+            Box::pin(async move {
+                active.fetch_add(1, Ordering::SeqCst);
+                let _active = ActiveWeatherFuture(active);
+                started.add_permits(1);
+                pending::<Result<WeatherFetch>>().await
+            })
+        }
+    }
+
+    async fn blocking_runtime() -> (
+        tempfile::TempDir,
+        EngineRuntime,
+        Engine,
+        Arc<BlockingProvider>,
+        String,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("weather.toml");
+        let db_path = directory.path().join("weather.db");
+        let mut config = AppConfig::default();
+        config.db.path = db_path.display().to_string();
+        config.updater.default_provider = "blocking-test".to_string();
+        config.updater.provider[0].name = "blocking-test".to_string();
+        write_config_atomic(&config_path, &config).unwrap();
+        let provider = Arc::new(BlockingProvider::new());
+        let runtime = EngineRuntime::start_with_provider_and_clock(
+            config_path,
+            provider.clone(),
+            Arc::new(FixedWeatherClock(1_782_252_000_000)),
+        )
+        .await
+        .unwrap();
+        let engine = runtime.test_engine();
+        let name = config.stations[0].name.clone();
+        let uuid = unified_station_uuid(&name);
+        engine
+            .db
+            .put_provider_station_mapping(ProviderStation {
+                provider_name: "blocking-test".to_string(),
+                display_name: name.clone(),
+                provider_station_id: "S1".to_string(),
+                provider_province_code: "P1".to_string(),
+                province: "北京市".to_string(),
+                city: "北京".to_string(),
+                url: "test://weather".to_string(),
+                unified_uuid: uuid.clone(),
+                name,
+            })
+            .await
+            .unwrap();
+        (directory, runtime, engine, provider, uuid)
+    }
+
+    async fn recv_refresh_event(
+        events: &mut tokio::sync::broadcast::Receiver<(String, EventEnvelope)>,
+    ) -> RefreshEvent {
+        let (topic, envelope) = timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("refresh event was not published")
+            .unwrap();
+        assert_eq!(topic, TOPIC_ENGINE_REFRESH);
+        assert_eq!(envelope.kind, EventKind::Refresh as i32);
+        decode_message(&envelope.payload).unwrap()
+    }
+
+    async fn wait_for_provider_start(provider: &BlockingProvider) {
+        timeout(Duration::from_secs(5), provider.started.acquire())
+            .await
+            .expect("weather provider was not called")
+            .unwrap()
+            .forget();
+    }
 
     struct WarningProvider;
 
@@ -410,6 +582,137 @@ mod tests {
 
         assert!(!cached_snapshot_is_fresh(fetched, now, 60, "Asia/Shanghai").unwrap());
         assert!(cached_snapshot_is_fresh(now - 1_000, now, 60, "Asia/Shanghai").unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborted_refresh_emits_one_failure_and_drops_the_active_provider_future() {
+        let (_directory, _runtime, engine, provider, uuid) = blocking_runtime().await;
+        let mut events = engine.sink.subscribe();
+        let request_engine = engine.clone();
+        let expected_uuid = uuid.clone();
+        let task = tokio::spawn(async move {
+            request_engine
+                .get_weather_internal(GetWeatherRequest {
+                    unified_uuid: uuid,
+                    refresh: true,
+                    include_debug: false,
+                })
+                .await
+        });
+        wait_for_provider_start(&provider).await;
+
+        let started = recv_refresh_event(&mut events).await;
+        assert_eq!(
+            started.unified_uuid.as_deref(),
+            Some(expected_uuid.as_str())
+        );
+        assert!(started.started);
+        assert!(!started.completed);
+        assert_eq!(
+            RefreshPhase::try_from(started.phase).unwrap(),
+            RefreshPhase::Started
+        );
+        assert_eq!(
+            RefreshOutcome::try_from(started.outcome).unwrap(),
+            RefreshOutcome::Unspecified
+        );
+        assert_eq!(started.message, None);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let terminal = recv_refresh_event(&mut events).await;
+
+        assert_eq!(provider.active.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            terminal.unified_uuid.as_deref(),
+            Some(expected_uuid.as_str())
+        );
+        assert!(!terminal.started);
+        assert!(terminal.completed);
+        assert_eq!(
+            RefreshPhase::try_from(terminal.phase).unwrap(),
+            RefreshPhase::Completed
+        );
+        assert_eq!(
+            RefreshOutcome::try_from(terminal.outcome).unwrap(),
+            RefreshOutcome::Failure
+        );
+        assert_eq!(
+            terminal.message.as_deref(),
+            Some("failure: refresh cancelled before completion")
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        engine.db.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timed_out_refresh_emits_one_failure_and_drops_the_active_provider_future() {
+        let (_directory, _runtime, engine, provider, uuid) = blocking_runtime().await;
+        let mut events = engine.sink.subscribe();
+        let request_engine = engine.clone();
+        let expected_uuid = uuid.clone();
+        let task = tokio::spawn(async move {
+            timeout(
+                Duration::from_millis(100),
+                request_engine.get_weather_internal(GetWeatherRequest {
+                    unified_uuid: uuid,
+                    refresh: true,
+                    include_debug: false,
+                }),
+            )
+            .await
+        });
+        wait_for_provider_start(&provider).await;
+
+        let started = recv_refresh_event(&mut events).await;
+        assert_eq!(
+            started.unified_uuid.as_deref(),
+            Some(expected_uuid.as_str())
+        );
+        assert!(started.started);
+        assert!(!started.completed);
+        assert_eq!(
+            RefreshPhase::try_from(started.phase).unwrap(),
+            RefreshPhase::Started
+        );
+        assert_eq!(
+            RefreshOutcome::try_from(started.outcome).unwrap(),
+            RefreshOutcome::Unspecified
+        );
+        assert_eq!(started.message, None);
+        let result = timeout(Duration::from_secs(5), task)
+            .await
+            .expect("refresh request did not reach its timeout")
+            .unwrap();
+        assert!(result.is_err());
+        let terminal = recv_refresh_event(&mut events).await;
+
+        assert_eq!(provider.active.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            terminal.unified_uuid.as_deref(),
+            Some(expected_uuid.as_str())
+        );
+        assert!(!terminal.started);
+        assert!(terminal.completed);
+        assert_eq!(
+            RefreshPhase::try_from(terminal.phase).unwrap(),
+            RefreshPhase::Completed
+        );
+        assert_eq!(
+            RefreshOutcome::try_from(terminal.outcome).unwrap(),
+            RefreshOutcome::Failure
+        );
+        assert_eq!(
+            terminal.message.as_deref(),
+            Some("failure: refresh cancelled before completion")
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        engine.db.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

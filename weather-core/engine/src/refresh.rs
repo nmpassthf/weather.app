@@ -1,15 +1,18 @@
 use std::{
     collections::{HashMap, HashSet},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use tokio::task::{Id, JoinSet};
+use tokio::{
+    task::{Id, JoinSet},
+    time::Instant,
+};
 use weather_configure::AppConfig;
-use weather_schema::{GetWeatherRequest, unix_timestamp_ms};
+use weather_schema::GetWeatherRequest;
 
 use crate::{
-    handlers::RefreshTerminal, lifecycle::Cancellation, limits::MAX_CONCURRENT_REFRESHES,
-    runtime::Engine, time::local_date_and_next_change,
+    lifecycle::Cancellation, limits::MAX_CONCURRENT_REFRESHES, runtime::Engine,
+    time::local_date_and_next_change,
 };
 
 const STAGGER: Duration = Duration::from_secs(5);
@@ -18,7 +21,8 @@ const FALLBACK_WAKE: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone)]
 struct StationSchedule {
     last_completed: Option<Instant>,
-    next_due: Instant,
+    /// `None` means the TTL deadline is not representable and is infinitely far away.
+    next_due: Option<Instant>,
     in_flight: bool,
     date_refresh_pending: bool,
 }
@@ -38,25 +42,21 @@ pub(crate) async fn run_refresh_loop(
     let mut schedules = HashMap::new();
     reconcile_schedules(&mut schedules, &station_order, now, ttl);
 
-    let mut last_local_date = local_date_and_next_change(
-        unix_timestamp_ms().unwrap_or_default(),
-        &initial.db.timezone,
-    )
-    .ok()
-    .map(|(date, _)| date);
+    let mut last_local_date =
+        local_date_and_next_change(engine.weather_now_unix_ms(), &initial.db.timezone)
+            .ok()
+            .map(|(date, _)| date);
     let mut jobs = JoinSet::new();
     let mut job_names = HashMap::<Id, String>::new();
 
     let result = loop {
         let config = engine.config.get();
         let now = Instant::now();
-        let (current_date, date_wait) = match local_date_and_next_change(
-            unix_timestamp_ms().unwrap_or_default(),
-            &config.db.timezone,
-        ) {
-            Ok((date, wait)) => (Some(date), wait),
-            Err(_) => (None, FALLBACK_WAKE),
-        };
+        let (current_date, date_wait) =
+            match local_date_and_next_change(engine.weather_now_unix_ms(), &config.db.timezone) {
+                Ok((date, wait)) => (Some(date), wait),
+                Err(_) => (None, FALLBACK_WAKE),
+            };
         if let Some(current_date) = current_date {
             if last_local_date
                 .as_ref()
@@ -98,22 +98,16 @@ pub(crate) async fn run_refresh_loop(
             }
             joined = jobs.join_next_with_id(), if has_jobs => {
                 if let Some(joined) = joined {
-                    let (id, failed) = match joined {
-                        Ok((id, ())) => (id, None),
+                    let id = match joined {
+                        Ok((id, ())) => id,
                         Err(err) => {
                             let id = err.id();
-                            (id, Some(err.to_string()))
+                            eprintln!("weather-engine warn: refresh task failed: {err}");
+                            id
                         }
                     };
                     if let Some(name) = job_names.remove(&id) {
                         finish_job(&mut schedules, &name, Instant::now(), ttl);
-                        if let Some(message) = failed {
-                            let uuid = weather_schema::unified_station_uuid(&name);
-                            engine.publish_refresh_terminal(
-                                Some(&uuid),
-                                RefreshTerminal::Failure(format!("refresh task failed: {message}")),
-                            );
-                        }
                     }
                 }
             }
@@ -223,7 +217,7 @@ fn claim_due_stations(
         let Some(schedule) = schedules.get_mut(name) else {
             continue;
         };
-        if schedule.in_flight || schedule.next_due > now {
+        if schedule.in_flight || schedule.next_due.is_none_or(|next_due| next_due > now) {
             continue;
         }
 
@@ -245,7 +239,7 @@ fn finish_job(
         schedule.in_flight = false;
         schedule.last_completed = Some(completed_at);
         schedule.next_due = if schedule.date_refresh_pending {
-            completed_at
+            Some(completed_at)
         } else {
             deadline(completed_at, ttl)
         };
@@ -263,13 +257,14 @@ fn next_scheduler_wait(
     schedules
         .values()
         .filter(|schedule| !schedule.in_flight)
-        .map(|schedule| schedule.next_due.saturating_duration_since(now))
+        .filter_map(|schedule| schedule.next_due)
+        .map(|next_due| next_due.saturating_duration_since(now))
         .min()
         .unwrap_or(FALLBACK_WAKE)
 }
 
-fn deadline(start: Instant, delay: Duration) -> Instant {
-    start.checked_add(delay).unwrap_or(start)
+fn deadline(start: Instant, delay: Duration) -> Option<Instant> {
+    start.checked_add(delay)
 }
 
 fn stagger(index: usize) -> Duration {
@@ -335,7 +330,7 @@ mod tests {
         reconcile_schedules(
             &mut schedules,
             &["A".to_string()],
-            deadline(started, Duration::from_secs(10)),
+            deadline(started, Duration::from_secs(10)).unwrap(),
             Duration::from_secs(5),
         );
 
@@ -356,7 +351,7 @@ mod tests {
 
         schedule_date_refresh(&mut schedules, &names, now);
 
-        assert_eq!(schedules["A"].next_due, now);
+        assert_eq!(schedules["A"].next_due, Some(now));
         assert_eq!(schedules["B"].next_due, deadline(now, STAGGER));
         assert!(schedules["A"].date_refresh_pending);
         assert!(schedules["B"].date_refresh_pending);
@@ -376,7 +371,7 @@ mod tests {
         reconcile_schedules(
             &mut schedules,
             &names,
-            deadline(now, Duration::from_secs(1)),
+            deadline(now, Duration::from_secs(1)).unwrap(),
             Duration::from_secs(600),
         );
 
@@ -391,14 +386,14 @@ mod tests {
         reconcile_schedules(&mut schedules, &names, now, Duration::from_secs(60));
         schedules.get_mut("A").unwrap().in_flight = true;
 
-        schedule_date_refresh(&mut schedules, &names, deadline(now, STAGGER));
+        schedule_date_refresh(&mut schedules, &names, deadline(now, STAGGER).unwrap());
         assert!(schedules["A"].date_refresh_pending);
 
-        let completed = deadline(now, Duration::from_secs(10));
+        let completed = deadline(now, Duration::from_secs(10)).unwrap();
         finish_job(&mut schedules, "A", completed, Duration::from_secs(60));
 
         assert!(!schedules["A"].in_flight);
-        assert_eq!(schedules["A"].next_due, completed);
+        assert_eq!(schedules["A"].next_due, Some(completed));
         assert!(schedules["A"].date_refresh_pending);
     }
 
@@ -411,7 +406,7 @@ mod tests {
         let mut schedules = HashMap::new();
         reconcile_schedules(&mut schedules, &names, now, Duration::from_secs(60));
         for schedule in schedules.values_mut() {
-            schedule.next_due = now;
+            schedule.next_due = Some(now);
         }
 
         let claimed = claim_due_stations(
@@ -426,7 +421,7 @@ mod tests {
         assert!(claimed.iter().all(|name| schedules[name].in_flight));
         for name in names.iter().skip(MAX_CONCURRENT_REFRESHES) {
             assert!(!schedules[name].in_flight);
-            assert_eq!(schedules[name].next_due, now);
+            assert_eq!(schedules[name].next_due, Some(now));
         }
         assert_eq!(
             next_scheduler_wait(&schedules, now, MAX_CONCURRENT_REFRESHES),
@@ -435,6 +430,77 @@ mod tests {
         assert_eq!(
             next_scheduler_wait(&schedules, now, MAX_CONCURRENT_REFRESHES - 1),
             Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn unrepresentable_ttl_deadline_is_infinite_instead_of_immediately_due() {
+        let now = Instant::now();
+        let names = vec!["A".to_string()];
+        let mut schedules = HashMap::new();
+        reconcile_schedules(&mut schedules, &names, now, Duration::from_secs(60));
+
+        finish_job(&mut schedules, "A", now, Duration::MAX);
+
+        assert_eq!(schedules["A"].next_due, None);
+        assert!(
+            claim_due_stations(
+                &names,
+                &mut schedules,
+                now,
+                Duration::MAX,
+                MAX_CONCURRENT_REFRESHES,
+            )
+            .is_empty()
+        );
+        assert_eq!(next_scheduler_wait(&schedules, now, 0), FALLBACK_WAKE);
+    }
+
+    #[test]
+    fn date_refresh_reactivates_an_infinite_ttl_schedule() {
+        let now = Instant::now();
+        let names = vec!["A".to_string()];
+        let mut schedules = HashMap::new();
+        reconcile_schedules(&mut schedules, &names, now, Duration::from_secs(60));
+        finish_job(&mut schedules, "A", now, Duration::MAX);
+
+        schedule_date_refresh(&mut schedules, &names, now);
+
+        assert_eq!(schedules["A"].next_due, Some(now));
+        assert_eq!(
+            claim_due_stations(
+                &names,
+                &mut schedules,
+                now,
+                Duration::MAX,
+                MAX_CONCURRENT_REFRESHES,
+            ),
+            names
+        );
+    }
+
+    #[test]
+    fn shorter_ttl_reactivates_an_infinite_ttl_schedule() {
+        let now = Instant::now();
+        let names = vec!["A".to_string()];
+        let mut schedules = HashMap::new();
+        reconcile_schedules(&mut schedules, &names, now, Duration::from_secs(60));
+        finish_job(&mut schedules, "A", now, Duration::MAX);
+
+        let short_ttl = Duration::from_secs(10);
+        reconcile_schedules(&mut schedules, &names, now, short_ttl);
+        let due = deadline(now, short_ttl).unwrap();
+
+        assert_eq!(schedules["A"].next_due, Some(due));
+        assert_eq!(
+            claim_due_stations(
+                &names,
+                &mut schedules,
+                due,
+                short_ttl,
+                MAX_CONCURRENT_REFRESHES,
+            ),
+            names
         );
     }
 }
