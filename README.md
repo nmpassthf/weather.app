@@ -138,9 +138,9 @@ binaries.
 Recommended checks after code changes:
 
 ```sh
-cargo fmt
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
-cargo clippy --all-targets --all-features
 ```
 
 ## Updates
