@@ -17,6 +17,9 @@ pub fn restart_required_fields(current: &AppConfig, new: &AppConfig) -> Vec<&'st
     if current.updater.default_provider != new.updater.default_provider {
         fields.push("updater.default_provider");
     }
+    if current.updater.network != new.updater.network {
+        fields.push("updater.network");
+    }
     if current.updater.provider != new.updater.provider {
         fields.push("updater.provider");
     }
@@ -69,6 +72,7 @@ mod tests {
         new.ipc.rpc_endpoint = "tcp://127.0.0.1:55555".to_string();
         new.db.timezone = "UTC".to_string();
         new.updater.default_provider = "other".to_string();
+        new.updater.network.https_proxy = Some("http://proxy.example:8123".to_string());
         new.updater.provider[0].base_url = "https://example.invalid".to_string();
 
         assert_eq!(
@@ -78,6 +82,7 @@ mod tests {
                 "ipc",
                 "db",
                 "updater.default_provider",
+                "updater.network",
                 "updater.provider",
             ]
         );

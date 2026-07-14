@@ -6,7 +6,7 @@ mod transport;
 mod tests;
 
 use anyhow::{Context, Result};
-use weather_configure::ProviderConfig;
+use weather_configure::{NetworkConfig, ProviderConfig};
 use weather_schema::DebugPayload;
 
 use crate::{ProviderCity, ProviderProvince, WeatherFetch};
@@ -23,10 +23,10 @@ pub(crate) struct NmcProvider {
 }
 
 impl NmcProvider {
-    pub(crate) fn new(config: &ProviderConfig) -> Result<Self> {
+    pub(crate) fn new(config: &ProviderConfig, network: &NetworkConfig) -> Result<Self> {
         Ok(Self {
             name: config.name.clone(),
-            transport: NmcTransport::new(config)?,
+            transport: NmcTransport::new(config, network)?,
         })
     }
 }

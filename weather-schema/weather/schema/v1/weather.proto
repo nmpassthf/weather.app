@@ -284,12 +284,33 @@ message UpdaterConfig {
   uint64 province_ttl_seconds = 2;
   string default_provider = 3;
   repeated ProviderConfig provider = 4;
+  NetworkConfig network = 5;
+  reserved 20 to 39;
+}
+message NetworkConfig {
+  // Missing proxy values inherit their matching process environment variables.
+  // An explicitly empty value clears that proxy after inheritance.
+  optional string http_proxy = 1;
+  optional string https_proxy = 2;
+  optional string no_proxy = 3;
+  optional string all_proxy = 4;
+  bool allow_insecure = 5;
   reserved 20 to 39;
 }
 message ProviderConfig {
   string name = 1;
   string base_url = 2;
   uint64 request_timeout_seconds = 3;
+  ProviderNetworkConfig network = 4;
+  reserved 20 to 39;
+}
+message ProviderNetworkConfig {
+  // Missing values inherit updater.network; present values override by field.
+  optional string http_proxy = 1;
+  optional string https_proxy = 2;
+  optional string no_proxy = 3;
+  optional string all_proxy = 4;
+  optional bool allow_insecure = 5;
   reserved 20 to 39;
 }
 message DaemonConfig {

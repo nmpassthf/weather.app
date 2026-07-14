@@ -38,7 +38,7 @@ prost = "0.14"
 prost-build = "0.14"
 protoc-bin-vendored = "3"
 ratatui = "0.30"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 same-file = "1.0"
 serde = { version = "1.0", features = ["derive"] }
@@ -47,6 +47,7 @@ sha2 = "0.10"
 tempfile = "3.27"
 tokio = { version = "1.45", features = ["macros", "rt-multi-thread", "time", "sync", "process", "signal", "net"] }
 toml = "0.8"
+url = "2.5"
 uuid = { version = "1.23", features = ["v4"] }
 zeromq = "0.6"
 crossterm = "0.29"

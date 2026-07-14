@@ -43,7 +43,7 @@ pub fn create_weather_provider(config: &UpdaterConfig) -> Result<Arc<dyn Weather
             )
         })?;
     match provider.name.as_str() {
-        "nmc" => Ok(Arc::new(NmcProvider::new(provider)?)),
+        "nmc" => Ok(Arc::new(NmcProvider::new(provider, &config.network)?)),
         other => bail!("unsupported updater provider `{other}`"),
     }
 }
@@ -137,6 +137,7 @@ mod tests {
             weather_ttl_seconds: 60,
             province_ttl_seconds: 60,
             default_provider: default_provider.to_string(),
+            network: Default::default(),
             provider: providers,
         }
     }
@@ -175,6 +176,7 @@ mod tests {
                 name: "nmc".to_string(),
                 base_url: "https://example.invalid".to_string(),
                 request_timeout_seconds: 3,
+                network: Default::default(),
             }],
         ))
         .unwrap();
@@ -199,6 +201,7 @@ mod tests {
                 name: "other".to_string(),
                 base_url: "https://example.invalid".to_string(),
                 request_timeout_seconds: 3,
+                network: Default::default(),
             }],
         ))
         .err()

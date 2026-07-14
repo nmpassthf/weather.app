@@ -3024,6 +3024,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "url",
  "weather-schema",
 ]
 

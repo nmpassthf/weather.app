@@ -427,10 +427,24 @@ mod tests {
                 weather_ttl_seconds: 333,
                 province_ttl_seconds: 444,
                 default_provider: "custom".to_string(),
+                network: Some(NetworkConfig {
+                    http_proxy: Some("http://global-proxy.example:8080".to_string()),
+                    https_proxy: None,
+                    no_proxy: Some("localhost".to_string()),
+                    all_proxy: None,
+                    allow_insecure: false,
+                }),
                 provider: vec![ProviderConfig {
                     name: "custom".to_string(),
                     base_url: "https://example.invalid".to_string(),
                     request_timeout_seconds: 555,
+                    network: Some(ProviderNetworkConfig {
+                        http_proxy: None,
+                        https_proxy: Some("http://custom-proxy.example:8123".to_string()),
+                        no_proxy: None,
+                        all_proxy: None,
+                        allow_insecure: Some(true),
+                    }),
                 }],
             }),
             daemon: Some(DaemonConfig {

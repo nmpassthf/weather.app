@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use weather_schema::{DEFAULT_ZMQ_PUB_ENDPOINT, DEFAULT_ZMQ_RPC_ENDPOINT};
 
-use crate::types::{AppConfig, ProviderConfig, StationConfig};
+use crate::types::{AppConfig, ProviderConfig, ProviderNetworkConfig, StationConfig};
 
 /// 序列化默认配置为 TOML，用于初始化配置文件或 `weather-tui config defaults`。
 ///
@@ -78,6 +78,7 @@ pub(crate) fn default_providers() -> Vec<ProviderConfig> {
         name: "nmc".to_string(),
         base_url: "https://www.nmc.cn".to_string(),
         request_timeout_seconds: default_request_timeout_seconds(),
+        network: ProviderNetworkConfig::default(),
     }]
 }
 pub(crate) fn default_stations() -> Vec<StationConfig> {
@@ -85,4 +86,39 @@ pub(crate) fn default_stations() -> Vec<StationConfig> {
         name: "北京-北京市".to_string(),
         enabled: true,
     }]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_tables_serialize_at_global_and_provider_scopes() {
+        let mut config = AppConfig::default();
+        config.updater.network.http_proxy = Some("http://global-proxy:8080".to_string());
+        config.updater.provider[0].network.https_proxy =
+            Some("http://provider-proxy:8443".to_string());
+        let content = toml::to_string_pretty(&config).unwrap();
+
+        assert!(content.contains("[updater.network]"), "{content}");
+        assert!(
+            content.contains("http_proxy = \"http://global-proxy:8080\""),
+            "{content}"
+        );
+        assert!(content.contains("[updater.provider.network]"), "{content}");
+        assert!(
+            content.contains("https_proxy = \"http://provider-proxy:8443\""),
+            "{content}"
+        );
+        assert_eq!(toml::from_str::<AppConfig>(&content).unwrap(), config);
+    }
+
+    #[test]
+    fn empty_provider_network_is_omitted_from_default_toml() {
+        let content = default_config_toml();
+
+        assert!(content.contains("[updater.network]"), "{content}");
+        assert!(content.contains("allow_insecure = false"), "{content}");
+        assert!(!content.contains("[updater.provider.network]"), "{content}");
+    }
 }

@@ -7,6 +7,4 @@ edition.workspace = true
 anyhow.workspace = true
 reqwest.workspace = true
 serde.workspace = true
-
-[dev-dependencies]
 tokio.workspace = true

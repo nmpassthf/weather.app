@@ -189,6 +189,7 @@ mod tests {
             name: "other".to_string(),
             base_url: "https://example.invalid".to_string(),
             request_timeout_seconds: 1,
+            network: Default::default(),
         });
 
         let error = commit_config(&commit_lock, &state, &path, candidate)

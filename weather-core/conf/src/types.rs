@@ -48,7 +48,49 @@ pub struct UpdaterConfig {
     pub weather_ttl_seconds: u64,
     pub province_ttl_seconds: u64,
     pub default_provider: String,
+    #[serde(default)]
+    pub network: NetworkConfig,
     pub provider: Vec<ProviderConfig>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_proxy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub https_proxy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_proxy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub all_proxy: Option<String>,
+    #[serde(default)]
+    pub allow_insecure: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderNetworkConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_proxy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub https_proxy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_proxy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub all_proxy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_insecure: Option<bool>,
+}
+
+impl ProviderNetworkConfig {
+    pub fn is_empty(&self) -> bool {
+        self.http_proxy.is_none()
+            && self.https_proxy.is_none()
+            && self.no_proxy.is_none()
+            && self.all_proxy.is_none()
+            && self.allow_insecure.is_none()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -57,6 +99,8 @@ pub struct ProviderConfig {
     pub name: String,
     pub base_url: String,
     pub request_timeout_seconds: u64,
+    #[serde(default, skip_serializing_if = "ProviderNetworkConfig::is_empty")]
+    pub network: ProviderNetworkConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -116,6 +160,7 @@ impl Default for UpdaterConfig {
             weather_ttl_seconds: default_weather_ttl_seconds(),
             province_ttl_seconds: default_province_ttl_seconds(),
             default_provider: default_provider_name(),
+            network: NetworkConfig::default(),
             provider: default_providers(),
         }
     }

@@ -253,11 +253,20 @@ async fn debug_flag_controls_payload_but_warnings_always_reach_the_engine_bounda
                 .expect("write response");
         }
     });
-    let provider = NmcProvider::new(&ProviderConfig {
-        name: "nmc".to_string(),
-        base_url: format!("http://{addr}/nmc/"),
-        request_timeout_seconds: 3,
-    })
+    let provider = NmcProvider::new(
+        &ProviderConfig {
+            name: "nmc".to_string(),
+            base_url: format!("http://{addr}/nmc/"),
+            request_timeout_seconds: 3,
+            network: weather_configure::ProviderNetworkConfig {
+                http_proxy: Some(String::new()),
+                https_proxy: Some(String::new()),
+                all_proxy: Some(String::new()),
+                ..Default::default()
+            },
+        },
+        &weather_configure::NetworkConfig::default(),
+    )
     .unwrap();
 
     let without_debug = provider.weather("MjXfi", false).await.unwrap();

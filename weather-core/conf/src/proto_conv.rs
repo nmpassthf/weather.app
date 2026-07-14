@@ -7,7 +7,8 @@
 use weather_schema as schema;
 
 use crate::{
-    AppConfig, DbConfig, EngineConfig, IpcConfig, ProviderConfig, StationConfig, UpdaterConfig,
+    AppConfig, DbConfig, EngineConfig, IpcConfig, NetworkConfig, ProviderConfig,
+    ProviderNetworkConfig, StationConfig, UpdaterConfig,
 };
 
 impl From<schema::AppConfig> for AppConfig {
@@ -112,6 +113,7 @@ impl From<schema::UpdaterConfig> for UpdaterConfig {
             weather_ttl_seconds: value.weather_ttl_seconds,
             province_ttl_seconds: value.province_ttl_seconds,
             default_provider: value.default_provider,
+            network: value.network.map(Into::into).unwrap_or_default(),
             provider: value.provider.into_iter().map(Into::into).collect(),
         }
     }
@@ -123,7 +125,32 @@ impl From<UpdaterConfig> for schema::UpdaterConfig {
             weather_ttl_seconds: value.weather_ttl_seconds,
             province_ttl_seconds: value.province_ttl_seconds,
             default_provider: value.default_provider,
+            network: Some(value.network.into()),
             provider: value.provider.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<schema::NetworkConfig> for NetworkConfig {
+    fn from(value: schema::NetworkConfig) -> Self {
+        Self {
+            http_proxy: value.http_proxy,
+            https_proxy: value.https_proxy,
+            no_proxy: value.no_proxy,
+            all_proxy: value.all_proxy,
+            allow_insecure: value.allow_insecure,
+        }
+    }
+}
+
+impl From<NetworkConfig> for schema::NetworkConfig {
+    fn from(value: NetworkConfig) -> Self {
+        Self {
+            http_proxy: value.http_proxy,
+            https_proxy: value.https_proxy,
+            no_proxy: value.no_proxy,
+            all_proxy: value.all_proxy,
+            allow_insecure: value.allow_insecure,
         }
     }
 }
@@ -134,6 +161,7 @@ impl From<schema::ProviderConfig> for ProviderConfig {
             name: value.name,
             base_url: value.base_url,
             request_timeout_seconds: value.request_timeout_seconds,
+            network: value.network.map(Into::into).unwrap_or_default(),
         }
     }
 }
@@ -144,6 +172,31 @@ impl From<ProviderConfig> for schema::ProviderConfig {
             name: value.name,
             base_url: value.base_url,
             request_timeout_seconds: value.request_timeout_seconds,
+            network: Some(value.network.into()),
+        }
+    }
+}
+
+impl From<schema::ProviderNetworkConfig> for ProviderNetworkConfig {
+    fn from(value: schema::ProviderNetworkConfig) -> Self {
+        Self {
+            http_proxy: value.http_proxy,
+            https_proxy: value.https_proxy,
+            no_proxy: value.no_proxy,
+            all_proxy: value.all_proxy,
+            allow_insecure: value.allow_insecure,
+        }
+    }
+}
+
+impl From<ProviderNetworkConfig> for schema::ProviderNetworkConfig {
+    fn from(value: ProviderNetworkConfig) -> Self {
+        Self {
+            http_proxy: value.http_proxy,
+            https_proxy: value.https_proxy,
+            no_proxy: value.no_proxy,
+            all_proxy: value.all_proxy,
+            allow_insecure: value.allow_insecure,
         }
     }
 }
@@ -193,10 +246,22 @@ mod tests {
                 weather_ttl_seconds: 900,
                 province_ttl_seconds: 86400,
                 default_provider: "nmc".to_string(),
+                network: NetworkConfig {
+                    http_proxy: Some("http://global-proxy.example:8080".to_string()),
+                    https_proxy: None,
+                    no_proxy: Some("localhost,127.0.0.1".to_string()),
+                    all_proxy: None,
+                    allow_insecure: false,
+                },
                 provider: vec![ProviderConfig {
                     name: "nmc".to_string(),
                     base_url: "https://www.nmc.cn".to_string(),
                     request_timeout_seconds: 20,
+                    network: ProviderNetworkConfig {
+                        https_proxy: Some("http://nmc-proxy.example:8123".to_string()),
+                        allow_insecure: Some(true),
+                        ..Default::default()
+                    },
                 }],
             },
             stations: vec![

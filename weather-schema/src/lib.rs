@@ -50,10 +50,24 @@ mod tests {
                 weather_ttl_seconds: 900,
                 province_ttl_seconds: 86_400,
                 default_provider: "nmc".to_string(),
+                network: Some(NetworkConfig {
+                    http_proxy: Some("http://global-proxy.example:8080".to_string()),
+                    https_proxy: None,
+                    no_proxy: Some("localhost,127.0.0.1".to_string()),
+                    all_proxy: None,
+                    allow_insecure: false,
+                }),
                 provider: vec![ProviderConfig {
                     name: "nmc".to_string(),
                     base_url: "https://www.nmc.cn".to_string(),
                     request_timeout_seconds: 20,
+                    network: Some(ProviderNetworkConfig {
+                        http_proxy: None,
+                        https_proxy: Some("http://nmc-proxy.example:8123".to_string()),
+                        no_proxy: None,
+                        all_proxy: None,
+                        allow_insecure: Some(true),
+                    }),
                 }],
             }),
             daemon: Some(DaemonConfig {

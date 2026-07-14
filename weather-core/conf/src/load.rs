@@ -372,6 +372,20 @@ pub fn validate(config: &AppConfig) -> Result<()> {
     {
         bail!("updater.default_provider must match a configured provider");
     }
+    validate_network_proxy_urls(
+        "updater.network",
+        config.updater.network.http_proxy.as_deref(),
+        config.updater.network.https_proxy.as_deref(),
+        config.updater.network.all_proxy.as_deref(),
+    )?;
+    for provider in &config.updater.provider {
+        validate_network_proxy_urls(
+            &format!("updater provider `{}` network", provider.name),
+            provider.network.http_proxy.as_deref(),
+            provider.network.https_proxy.as_deref(),
+            provider.network.all_proxy.as_deref(),
+        )?;
+    }
     let mut station_names = HashSet::new();
     for station in &config.stations {
         let normalized = normalize_station_name(&station.name);
@@ -380,6 +394,35 @@ pub fn validate(config: &AppConfig) -> Result<()> {
         }
         if !station_names.insert(normalized.clone()) {
             bail!("duplicate station.name `{normalized}` after normalization");
+        }
+    }
+    Ok(())
+}
+
+fn validate_network_proxy_urls(
+    scope: &str,
+    http_proxy: Option<&str>,
+    https_proxy: Option<&str>,
+    all_proxy: Option<&str>,
+) -> Result<()> {
+    for (field, value) in [
+        ("http_proxy", http_proxy),
+        ("https_proxy", https_proxy),
+        ("all_proxy", all_proxy),
+    ] {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let parsed = url::Url::parse(value)
+            .with_context(|| format!("{scope}.{field} is not a valid proxy URL"))?;
+        if !matches!(
+            parsed.scheme(),
+            "http" | "https" | "socks4" | "socks4a" | "socks5" | "socks5h"
+        ) || parsed.host_str().is_none()
+        {
+            bail!(
+                "{scope}.{field} must use http, https, socks4, socks4a, socks5, or socks5h and include a host"
+            );
         }
     }
     Ok(())
@@ -462,6 +505,19 @@ mod tests {
     }
 
     #[test]
+    fn validates_global_and_provider_network_proxy_urls() {
+        let mut config = base_config();
+        config.updater.network.http_proxy = Some("http://127.0.0.1:8123".to_string());
+        config.updater.provider[0].network.https_proxy =
+            Some("https://provider-proxy.example:8443".to_string());
+        assert!(validate(&config).is_ok());
+
+        config.updater.provider[0].network.all_proxy = Some("ftp://127.0.0.1:21".to_string());
+        let err = validate(&config).unwrap_err().to_string();
+        assert!(err.contains("network.all_proxy must use http, https, socks4"));
+    }
+
+    #[test]
     fn ensuring_config_has_no_component_manifest_side_effect() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("weather.toml");
@@ -519,6 +575,24 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         assert!(format!("{err:#}").contains("unknown field `enable_hmac`"));
+    }
+
+    #[test]
+    fn current_config_without_network_uses_compatible_defaults() {
+        let mut value: Value = toml::from_str(&default_config_toml()).unwrap();
+        value
+            .get_mut("updater")
+            .and_then(Value::as_table_mut)
+            .unwrap()
+            .remove("network");
+
+        let loaded = load_from_str(&toml::to_string_pretty(&value).unwrap()).unwrap();
+
+        assert_eq!(
+            loaded.config.updater.network,
+            crate::NetworkConfig::default()
+        );
+        assert!(loaded.config.updater.provider[0].network.is_empty());
     }
 
     #[test]

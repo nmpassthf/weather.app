@@ -61,6 +61,35 @@ weather-tui config show
 weather-tui engine restart
 ```
 
+Network defaults live under `updater.network`. Missing proxy fields inherit the
+matching process `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`
+variables; an explicitly empty string clears the inherited value.
+HTTP(S), SOCKS4/4A, and SOCKS5/5H proxy URLs are supported.
+
+```toml
+[updater.network]
+http_proxy = "http://127.0.0.1:8123"
+https_proxy = "http://127.0.0.1:8123"
+no_proxy = "localhost,127.0.0.1"
+all_proxy = ""
+allow_insecure = false
+
+[[updater.provider]]
+name = "nmc"
+base_url = "https://www.nmc.cn"
+request_timeout_seconds = 20
+
+# Optional per-provider, field-by-field overrides.
+[updater.provider.network]
+https_proxy = "http://nmc-proxy.example:8123"
+no_proxy = "localhost,127.0.0.1,.internal.example"
+```
+
+Omitted provider network fields inherit `updater.network`; an explicitly empty
+provider value clears that global value. `allow_insecure = true` disables TLS
+certificate validation and should only be used for a trusted intercepting
+proxy. Changing global or provider network settings requires an engine restart.
+
 ## Service Installation
 
 Service management currently supports systemd on Linux only. The `windows`
