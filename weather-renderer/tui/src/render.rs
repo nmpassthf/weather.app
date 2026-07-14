@@ -2,8 +2,9 @@ use std::fmt::Write as _;
 
 use weather_schema::*;
 
-use crate::util::{
-    degrees, format_index, hectopascal, meter_per_second, mm, percent, text, wind_summary,
+use crate::{
+    presentation::WeatherView,
+    util::{degrees, format_index, meter_per_second, mm, percent, text},
 };
 
 pub(crate) fn render_status(status: &EngineStatus) -> String {
@@ -23,6 +24,7 @@ pub(crate) fn render_status(status: &EngineStatus) -> String {
 }
 
 pub(crate) fn render_weather(snapshot: &WeatherSnapshot) -> String {
+    let weather = WeatherView::new(snapshot);
     let mut out = String::new();
     if let Some(station) = &snapshot.station {
         writeln!(out, "{}", station_label(station)).ok();
@@ -31,50 +33,38 @@ pub(crate) fn render_weather(snapshot: &WeatherSnapshot) -> String {
         writeln!(out, "数据状态: stale").ok();
     }
     writeln!(out, "{}", "-".repeat(64)).ok();
-    if let Some(real) = &snapshot.real {
-        writeln!(out, "实况发布时间: {}", text(real.publish_time.as_deref())).ok();
+    if let Some(current) = &weather.current {
+        writeln!(out, "实况发布时间: {}", current.publish_time).ok();
         writeln!(
             out,
             "当前天气: {}  气温: {}  体感: {}  湿度: {}  降水: {}  气压: {}  温差: {}",
-            text(real.info.as_deref()),
-            degrees(real.temperature),
-            degrees(real.feel_temperature),
-            percent(real.humidity),
-            mm(real.rain),
-            hectopascal(real.air_pressure),
-            degrees(real.temperature_diff)
+            current.info,
+            current.temperature,
+            current.feel_temperature,
+            current.humidity,
+            current.rain,
+            current.observed_pressure,
+            current.temperature_diff
         )
         .ok();
-        if real.comfort_label.is_some() || real.comfort_index.is_some() {
+        if current.has_comfort {
             writeln!(
                 out,
                 "舒适度: {}  指数: {}",
-                text(real.comfort_label.as_deref()),
-                text(real.comfort_index.as_deref())
+                current.comfort_label, current.comfort_index
             )
             .ok();
         }
         writeln!(
             out,
             "风: {} {}  风速: {}  风向角: {}",
-            text(real.wind_direct.as_deref()),
-            text(real.wind_power.as_deref()),
-            meter_per_second(real.wind_speed),
-            real.wind_degree
-                .map(|value| format!("{value:.0}°"))
-                .unwrap_or_else(|| "-".to_string())
+            current.wind_direct, current.wind_power, current.wind_speed, current.wind_degree
         )
         .ok();
-        writeln!(
-            out,
-            "日出/日落: {} / {}",
-            text(real.sunrise.as_deref()),
-            text(real.sunset.as_deref())
-        )
-        .ok();
-        if let Some(alert) = &real.alert {
+        writeln!(out, "日出/日落: {} / {}", current.sunrise, current.sunset).ok();
+        if let Some(alert) = &weather.alert {
             writeln!(out).ok();
-            writeln!(out, "预警: {}", text(alert.alert.as_deref())).ok();
+            writeln!(out, "预警: {}", alert.alert).ok();
             if let Some(content) = &alert.issue_content {
                 writeln!(out, "内容: {content}").ok();
             }
@@ -83,14 +73,9 @@ pub(crate) fn render_weather(snapshot: &WeatherSnapshot) -> String {
             }
         }
     }
-    if let Some(predict) = &snapshot.predict {
+    if let Some(forecast) = &weather.forecast {
         writeln!(out).ok();
-        writeln!(
-            out,
-            "未来预报: {} 发布",
-            text(predict.publish_time.as_deref())
-        )
-        .ok();
+        writeln!(out, "未来预报: {} 发布", forecast.publish_time).ok();
         writeln!(out, "{}", "-".repeat(64)).ok();
         writeln!(
             out,
@@ -98,20 +83,16 @@ pub(crate) fn render_weather(snapshot: &WeatherSnapshot) -> String {
             "日期", "白天", "夜间", "高/低温", "风"
         )
         .ok();
-        for day in &predict.days {
+        for day in &forecast.days {
             writeln!(
                 out,
                 "{:<12} {:<12} {:<12} {:<11} {:<14} {}",
                 day.date,
-                text(day.day_info.as_deref()),
-                text(day.night_info.as_deref()),
-                format!(
-                    "{}/{}℃",
-                    text(day.day_temperature.as_deref()),
-                    text(day.night_temperature.as_deref())
-                ),
-                forecast_wind_summary(day),
-                mm(day.precipitation)
+                day.day_info,
+                day.night_info,
+                format!("{}/{}℃", day.day_temperature, day.night_temperature),
+                day.wind,
+                day.precipitation
             )
             .ok();
         }
@@ -198,24 +179,6 @@ pub(crate) fn render_weather(snapshot: &WeatherSnapshot) -> String {
         }
     }
     out.trim_end().to_string()
-}
-
-fn forecast_wind_summary(day: &ForecastDay) -> String {
-    let day_wind = wind_summary(
-        day.day_wind_direct.as_deref(),
-        day.day_wind_power.as_deref(),
-    );
-    let night_wind = wind_summary(
-        day.night_wind_direct.as_deref(),
-        day.night_wind_power.as_deref(),
-    );
-    if day_wind == "-" && night_wind == "-" {
-        wind_summary(day.wind_direct.as_deref(), day.wind_power.as_deref())
-    } else if night_wind == "-" || day_wind == night_wind {
-        day_wind
-    } else {
-        format!("{day_wind}/{night_wind}")
-    }
 }
 
 fn number(value: Option<f64>) -> String {
@@ -498,6 +461,8 @@ mod tests {
         assert!(rendered.contains("气压: 1001hPa"));
         assert!(rendered.contains("舒适度: 较舒适"));
         assert!(rendered.contains("温差: 1.2℃"));
+        assert!(rendered.contains("34/24℃"));
+        assert!(rendered.contains("东北风3级/北风2级"));
         assert!(rendered.contains("空气质量"));
         assert!(rendered.contains("AQI: 66"));
         assert!(rendered.contains("历史观测"));
@@ -506,5 +471,32 @@ mod tests {
         assert!(rendered.contains("雷达"));
         assert!(rendered.contains("https://www.nmc.cn/radar.png"));
         assert!(!rendered.contains("raw_json"));
+    }
+
+    #[test]
+    fn weather_output_keeps_alert_text_unsplit() {
+        let rendered = render_weather(&WeatherSnapshot {
+            real: Some(ObservedWeather {
+                alert: Some(WeatherAlert {
+                    alert: Some("雷电黄色预警".to_string()),
+                    issue_content: Some("预计有雷阵雨；伴有阵风".to_string()),
+                    prevention: Some("减少户外活动；远离高处".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line == "内容: 预计有雷阵雨；伴有阵风")
+        );
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line == "防御: 减少户外活动；远离高处")
+        );
     }
 }

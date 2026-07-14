@@ -1,0 +1,11 @@
+{
+  "code": 0,
+  "msg": "ok",
+  "data": {
+    "real": {
+      "station": { "province": "北京市", "city": "朝阳" },
+      "publish_time": "2026-06-29 10:00",
+      "weather": { "info": "晴", "temperature": 30.0 }
+    }
+  }
+}

@@ -1,26 +1,26 @@
-//! UPDATE_CONFIG 的不可变字段校验：只有 `stations` 与 `updater` 允许变更，
-//! `engine`/`ipc`/`db`/`daemon` 必须与 engine 当前 live config 一致。
+//! UPDATE_CONFIG 热更新边界：仅站点和两个 TTL 可以在线提交。
 
 use crate::AppConfig;
 
-/// 比对 `current`（engine 当前持有的 config）与 `new`（client 下发的 config）。
-///
-/// 若任一不可变字段（engine/ipc/db/daemon）不一致，返回 `Err(字段名)`；
-/// 全部一致返回 `Ok(())`。`updater` 与 `stations` 不参与比对。
-pub fn diff_immutable_fields(current: &AppConfig, new: &AppConfig) -> Result<(), String> {
+/// Return restart-required fields in stable configuration order.
+pub fn restart_required_fields(current: &AppConfig, new: &AppConfig) -> Vec<&'static str> {
+    let mut fields = Vec::new();
     if current.engine != new.engine {
-        return Err("immutable field `engine` changed".to_string());
+        fields.push("engine");
     }
     if current.ipc != new.ipc {
-        return Err("immutable field `ipc` changed".to_string());
+        fields.push("ipc");
     }
     if current.db != new.db {
-        return Err("immutable field `db` changed".to_string());
+        fields.push("db");
     }
-    if current.daemon != new.daemon {
-        return Err("immutable field `daemon` changed".to_string());
+    if current.updater.default_provider != new.updater.default_provider {
+        fields.push("updater.default_provider");
     }
-    Ok(())
+    if current.updater.provider != new.updater.provider {
+        fields.push("updater.provider");
+    }
+    fields
 }
 
 #[cfg(test)]
@@ -38,7 +38,7 @@ mod tests {
     #[test]
     fn identical_config_passes() {
         let config = base();
-        assert!(diff_immutable_fields(&config, &config).is_ok());
+        assert!(restart_required_fields(&config, &config).is_empty());
     }
 
     #[test]
@@ -49,52 +49,38 @@ mod tests {
             name: "北京-北京市-朝阳".to_string(),
             enabled: true,
         });
-        assert!(diff_immutable_fields(&current, &new).is_ok());
+        assert!(restart_required_fields(&current, &new).is_empty());
     }
 
     #[test]
-    fn updater_change_allowed() {
+    fn updater_ttl_changes_are_hot() {
         let current = base();
         let mut new = current.clone();
         new.updater.weather_ttl_seconds = 1800;
-        assert!(diff_immutable_fields(&current, &new).is_ok());
+        new.updater.province_ttl_seconds = 3600;
+        assert!(restart_required_fields(&current, &new).is_empty());
     }
 
     #[test]
-    fn ipc_change_rejected() {
-        let current = base();
-        let mut new = current.clone();
-        new.ipc.rpc_endpoint = "tcp://127.0.0.1:55555".to_string();
-        let err = diff_immutable_fields(&current, &new).unwrap_err();
-        assert!(err.contains("`ipc`"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn engine_change_rejected() {
+    fn restart_required_fields_have_stable_order() {
         let current = base();
         let mut new = current.clone();
         new.engine.request_timeout_ms = 9999;
-        let err = diff_immutable_fields(&current, &new).unwrap_err();
-        assert!(err.contains("`engine`"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn db_change_rejected() {
-        let current = base();
-        let mut new = current.clone();
+        new.ipc.rpc_endpoint = "tcp://127.0.0.1:55555".to_string();
         new.db.timezone = "UTC".to_string();
-        let err = diff_immutable_fields(&current, &new).unwrap_err();
-        assert!(err.contains("`db`"), "unexpected error: {err}");
-    }
+        new.updater.default_provider = "other".to_string();
+        new.updater.provider[0].base_url = "https://example.invalid".to_string();
 
-    #[test]
-    #[allow(dead_code)]
-    fn daemon_change_rejected() {
-        let current = base();
-        let mut new = current.clone();
-        new.daemon.foreground = !current.daemon.foreground;
-        let err = diff_immutable_fields(&current, &new).unwrap_err();
-        assert!(err.contains("`daemon`"), "unexpected error: {err}");
+        assert_eq!(
+            restart_required_fields(&current, &new),
+            vec![
+                "engine",
+                "ipc",
+                "db",
+                "updater.default_provider",
+                "updater.provider",
+            ]
+        );
     }
 
     #[test]

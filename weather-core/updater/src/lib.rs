@@ -1,7 +1,5 @@
 mod catalog;
-mod client;
 mod provider;
-mod util;
 
 pub use catalog::{ProviderCity, ProviderProvince};
-pub use client::NmcUpdater;
+pub use provider::{ProviderFuture, WeatherFetch, WeatherProvider, create_weather_provider};

@@ -5,7 +5,7 @@ use weather_schema::{DEFAULT_ZMQ_PUB_ENDPOINT, DEFAULT_ZMQ_RPC_ENDPOINT};
 
 use crate::types::{AppConfig, ProviderConfig, StationConfig};
 
-/// 序列化默认配置为 TOML，用于初始化配置文件或 `--core-dump-default-config`。
+/// 序列化默认配置为 TOML，用于初始化配置文件或 `weather-tui config defaults`。
 ///
 /// # 示例
 ///
@@ -42,9 +42,6 @@ pub(crate) fn default_startup_timeout_ms() -> u64 {
 pub(crate) fn default_engine_lock_path() -> String {
     "engine.lock".to_string()
 }
-pub(crate) fn default_transport() -> String {
-    "tcp".to_string()
-}
 pub(crate) fn default_rpc_endpoint() -> String {
     DEFAULT_ZMQ_RPC_ENDPOINT.to_string()
 }
@@ -60,9 +57,6 @@ pub(crate) fn default_hmac_key() -> String {
 }
 pub(crate) fn default_db_path() -> String {
     "weather.db".to_string()
-}
-pub(crate) fn default_db_lock_path() -> String {
-    "weather.db.lock".to_string()
 }
 pub(crate) fn default_db_timezone() -> String {
     "Asia/Shanghai".to_string()
@@ -85,12 +79,6 @@ pub(crate) fn default_providers() -> Vec<ProviderConfig> {
         base_url: "https://www.nmc.cn".to_string(),
         request_timeout_seconds: default_request_timeout_seconds(),
     }]
-}
-pub(crate) fn default_service_backend() -> String {
-    "auto".to_string()
-}
-pub(crate) fn default_service_scope() -> String {
-    "user".to_string()
 }
 pub(crate) fn default_stations() -> Vec<StationConfig> {
     vec![StationConfig {

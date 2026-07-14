@@ -1,5 +1,4 @@
-use std::sync::atomic::Ordering;
-
+use prost::Message;
 use weather_schema::*;
 
 use crate::runtime::Engine;
@@ -15,7 +14,7 @@ impl Engine {
         if request.schema_version != SCHEMA_VERSION {
             return Self::rpc_error_response(
                 &request.request_id,
-                "SCHEMA_VERSION",
+                RpcErrorCode::SchemaVersion,
                 "unsupported schema version",
             );
         }
@@ -23,16 +22,28 @@ impl Engine {
         if let Some(key) = match weather_configure::resolve_hmac_key(&config) {
             Ok(opt) => opt,
             Err(err) => {
-                return Self::rpc_error_response(&request.request_id, "AUTH", err.to_string());
+                return Self::rpc_error_response(
+                    &request.request_id,
+                    RpcErrorCode::Auth,
+                    err.to_string(),
+                );
             }
         } {
             match weather_schema::verify_rpc_request_hmac(&request, &key) {
                 Ok(true) => {}
                 Ok(false) => {
-                    return Self::rpc_error_response(&request.request_id, "AUTH", "invalid hmac");
+                    return Self::rpc_error_response(
+                        &request.request_id,
+                        RpcErrorCode::Auth,
+                        "invalid hmac",
+                    );
                 }
                 Err(err) => {
-                    return Self::rpc_error_response(&request.request_id, "AUTH", err.to_string());
+                    return Self::rpc_error_response(
+                        &request.request_id,
+                        RpcErrorCode::Auth,
+                        err.to_string(),
+                    );
                 }
             }
         }
@@ -55,20 +66,62 @@ impl Engine {
             RpcKind::GetWeather => self.handle_get_weather(&request).await,
             RpcKind::FuzzyMatchStations => self.handle_fuzzy(&request).await,
             RpcKind::TriggerRefresh => self.handle_trigger_refresh(&request).await,
-            RpcKind::RestartEngine => {
-                self.restart.store(true, Ordering::SeqCst);
-                self.stop.store(true, Ordering::SeqCst);
-                self.accepted(&request.request_id, Empty {})
-            }
-            RpcKind::Shutdown => {
-                self.stop.store(true, Ordering::SeqCst);
-                self.accepted(&request.request_id, Empty {})
-            }
+            RpcKind::RestartEngine => self.accepted(&request.request_id, Empty {}),
+            RpcKind::Shutdown => self.handle_shutdown(&request),
             RpcKind::Unspecified => Self::rpc_error_response(
                 &request.request_id,
-                "BAD_REQUEST",
+                RpcErrorCode::BadRequest,
                 "rpc kind is unspecified",
             ),
         }
+    }
+
+    fn handle_shutdown(&self, request: &RpcRequest) -> RpcResponse {
+        let shutdown = match ShutdownRequest::decode(request.payload.as_slice()) {
+            Ok(shutdown) => shutdown,
+            Err(error) => {
+                return Self::rpc_error_response(
+                    &request.request_id,
+                    RpcErrorCode::BadRequest,
+                    format!("invalid shutdown payload: {error}"),
+                );
+            }
+        };
+        if !shutdown_owner_authorized(
+            self.launch.owner_token.as_deref(),
+            shutdown.owner_token.as_deref(),
+        ) {
+            return Self::rpc_error_response(
+                &request.request_id,
+                RpcErrorCode::OwnerMismatch,
+                "engine ownership changed before conditional shutdown",
+            );
+        }
+        self.accepted(&request.request_id, Empty {})
+    }
+}
+
+fn shutdown_owner_authorized(actual: Option<&str>, requested: Option<&str>) -> bool {
+    requested.is_none_or(|requested| actual == Some(requested))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_legacy_shutdown_payload_is_unconditional() {
+        let request = ShutdownRequest::decode(Empty {}.encode_to_vec().as_slice()).unwrap();
+
+        assert_eq!(request.owner_token, None);
+        assert!(shutdown_owner_authorized(Some("owner"), None));
+        assert!(shutdown_owner_authorized(None, None));
+    }
+
+    #[test]
+    fn conditional_shutdown_requires_the_current_owner() {
+        assert!(shutdown_owner_authorized(Some("owner"), Some("owner")));
+        assert!(!shutdown_owner_authorized(Some("winner"), Some("loser")));
+        assert!(!shutdown_owner_authorized(None, Some("owner")));
     }
 }

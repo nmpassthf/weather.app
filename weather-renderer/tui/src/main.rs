@@ -1,68 +1,107 @@
 mod cli;
 mod client;
 mod command;
+mod connection;
 mod daemon;
+mod pagination;
+mod presentation;
 mod render;
 mod search;
+mod terminal;
 mod tui;
 mod util;
 
-use std::ffi::OsString;
-
-use anyhow::{Context, Result};
-use clap::Parser;
+use anyhow::{Context, Result, bail};
 
 use crate::{
-    cli::{Cli, CommandKind, OutputFormat},
+    cli::{Cli, OutputFormat, parse_cli},
     client::EngineClient,
     command::run_command,
-    daemon::{DaemonProbeState, DaemonSupervisor},
+    connection::{ConnectionPlan, Endpoints, connection_plan},
+    daemon::{DaemonProbeState, DaemonSupervisor, EngineOwnership, probe_state_error},
     tui::run_interactive,
 };
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse_from(normalized_args());
-    let mut foreground = None;
-    let daemon = DaemonSupervisor::from_cli(&cli)?;
-    let probe = daemon.probe()?;
-    let rpc_endpoint = cli
-        .rpc_endpoint
-        .clone()
-        .or_else(|| cli.endpoint.clone())
-        .unwrap_or(probe.rpc_endpoint.clone());
-    let pub_endpoint = cli
-        .pub_endpoint
-        .clone()
-        .unwrap_or(probe.pub_endpoint.clone());
+    let cli = parse_cli();
+    let plan = connection_plan(&cli)?;
     let hmac_key = resolve_hmac_key(&cli)?;
-    if matches!(cli.command, Some(CommandKind::Kill)) {
-        if matches!(probe.state, DaemonProbeState::NotRunning) {
-            println!("engine is not running");
-            return Ok(());
-        }
-        let client = EngineClient::connect(rpc_endpoint, pub_endpoint, hmac_key).await?;
-        let _: weather_schema::Empty = client.shutdown().await?;
-        println!("engine shutdown accepted");
-        return Ok(());
+    match plan {
+        ConnectionPlan::Direct(endpoints) => run_direct(&cli, endpoints, hmac_key).await,
+        ConnectionPlan::Managed => run_managed(&cli, hmac_key).await,
     }
-    if matches!(probe.state, DaemonProbeState::NotRunning) {
-        foreground = Some(daemon.start_foreground()?);
-    }
-    let client = EngineClient::connect(rpc_endpoint, pub_endpoint, hmac_key)
+}
+
+async fn run_direct(cli: &Cli, endpoints: Endpoints, hmac_key: Option<[u8; 32]>) -> Result<()> {
+    let client = EngineClient::connect(endpoints.rpc, endpoints.publisher, hmac_key)
         .await
         .context("failed to connect engine")?;
-
-    let result = if should_start_tui(&cli) {
-        run_interactive(&client, &cli).await
-    } else {
-        run_command(&client, &cli).await
-    };
-    if foreground.is_some() {
-        let _ = client.shutdown().await;
+    if cli.stops_engine() {
+        let result = client.shutdown().await.map(|_: weather_schema::Empty| {
+            println!("engine shutdown accepted");
+        });
+        client.close().await;
+        return result;
     }
-    drop(foreground);
+    run_session(&client, cli, EngineOwnership::Direct).await
+}
+
+async fn run_managed(cli: &Cli, hmac_key: Option<[u8; 32]>) -> Result<()> {
+    let daemon = DaemonSupervisor::from_cli(cli)?;
+    let probe = daemon.probe().await?;
+    if cli.stops_engine() {
+        match probe.state {
+            DaemonProbeState::NotRunning => {
+                println!("engine is not running");
+                return Ok(());
+            }
+            DaemonProbeState::Running => {}
+            state => bail!(probe_state_error(state, probe.message.as_deref())),
+        }
+        let client = EngineClient::connect(
+            probe.rpc_endpoint.clone(),
+            probe.pub_endpoint.clone(),
+            hmac_key,
+        )
+        .await?;
+        let result = client.shutdown().await.map(|_: weather_schema::Empty| {
+            println!("engine shutdown accepted");
+        });
+        client.close().await;
+        return result;
+    }
+    let ready = daemon.ensure_ready(probe).await?;
+    let client =
+        EngineClient::connect(ready.probe.rpc_endpoint, ready.probe.pub_endpoint, hmac_key)
+            .await
+            .context("failed to connect engine")?;
+
+    run_session(&client, cli, ready.ownership).await
+}
+
+async fn run_session(client: &EngineClient, cli: &Cli, ownership: EngineOwnership) -> Result<()> {
+    let result = run_connected(client, cli).await;
+    if let EngineOwnership::Owned {
+        owner_token,
+        mut foreground,
+    } = ownership
+    {
+        if client.shutdown_if_owned(&owner_token).await.is_ok() {
+            foreground.mark_graceful_shutdown_requested();
+        }
+        drop(foreground);
+    }
+    client.close().await;
     result
+}
+
+async fn run_connected(client: &EngineClient, cli: &Cli) -> Result<()> {
+    if should_start_tui(cli) {
+        run_interactive(client, cli).await
+    } else {
+        run_command(client, cli).await
+    }
 }
 
 fn resolve_hmac_key(cli: &Cli) -> Result<Option<[u8; 32]>> {
@@ -87,21 +126,5 @@ fn resolve_hmac_key(cli: &Cli) -> Result<Option<[u8; 32]>> {
 }
 
 fn should_start_tui(cli: &Cli) -> bool {
-    cli.command.is_none()
-        && !cli.core_get_default_config
-        && !cli.core_get_config
-        && !cli.core_restart_engine
-        && matches!(cli.format, OutputFormat::Tui)
-}
-
-fn normalized_args() -> Vec<OsString> {
-    std::env::args_os()
-        .map(|arg| match arg.to_str() {
-            Some("-core-dump-default-config") => OsString::from("--core-get-default-config"),
-            Some("-core-show-current-config") => OsString::from("--core-get-config"),
-            Some("-core-show-currnet-config") => OsString::from("--core-get-config"),
-            Some("-core-restart-engine") => OsString::from("--core-restart-engine"),
-            _ => arg,
-        })
-        .collect()
+    !cli.has_action() && matches!(cli.format, OutputFormat::Tui)
 }

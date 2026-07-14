@@ -1,0 +1,11 @@
+{
+  "provinces": [
+    { "code": "A", "name": "Absolute", "url": "https://origin.example/a" },
+    { "code": "R", "name": "Root", "url": "/root" },
+    { "code": "P", "name": "Path", "url": "path/item" },
+    { "code": "S", "name": "Scheme", "url": "//cdn.example/item" }
+  ],
+  "cities": [
+    { "code": "C", "province": "Root", "city": "City", "url": "city/item" }
+  ]
+}

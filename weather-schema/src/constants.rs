@@ -12,6 +12,15 @@ pub const DEFAULT_ZMQ_RPC_ENDPOINT: &str = "tcp://127.0.0.1:44445";
 /// PUB/SUB 广播 socket 默认 endpoint。
 pub const DEFAULT_ZMQ_PUB_ENDPOINT: &str = "tcp://127.0.0.1:44444";
 
+/// RPC 列表/搜索接口允许的最大单页大小。
+pub const MAX_RPC_PAGE_SIZE: u32 = 256;
+
+/// RPC 列表/搜索接口允许的最大页偏移量。
+pub const MAX_RPC_PAGE_OFFSET: u32 = 100_000;
+
+const _: () = assert!(MAX_RPC_PAGE_SIZE > 0);
+const _: () = assert!(MAX_RPC_PAGE_OFFSET >= MAX_RPC_PAGE_SIZE);
+
 /// 天气快照广播 topic（单一）。
 ///
 /// 所有站点共用一个 topic，订阅方按 `WeatherSnapshot.station.unified_uuid`

@@ -69,9 +69,9 @@ IPC uses ZMQ by default, with protobuf payloads from `weather-schema`. JSON outp
 After a complete feature or bug fix, run at least:
 
 ```sh
-cargo fmt
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
-cargo clippy --all-targets --all-features
 ```
 
 For documentation-only or small explanatory changes, choose a lighter check based on the actual impact.

@@ -3,7 +3,6 @@ mod path;
 mod probe;
 mod run;
 mod service;
-mod time;
 
 use anyhow::Result;
 use clap::Parser;
@@ -19,7 +18,11 @@ use crate::{
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Run { config, foreground } => run(config, foreground).await,
+        Command::Run {
+            config,
+            foreground,
+            owner_token,
+        } => run(config, foreground, owner_token).await,
         Command::Probe { config, verbose } => probe(config, verbose).await,
         Command::Service { command } => match command {
             ServiceCommand::Install {
@@ -38,14 +41,14 @@ async fn main() -> Result<()> {
             } => reinstall_service(backend, system, path, config, !no_modification_service),
             ServiceCommand::Remove {
                 backend,
+                system,
+                path,
+                config,
                 with_data,
                 with_bin,
                 all,
-            } => uninstall_service(backend, with_data || all, with_bin || all),
+            } => uninstall_service(backend, system, path, config, with_data, with_bin, all),
         },
-        Command::Status => {
-            println!("weather-daemon status is exposed through engine ZMQ GET_ENGINE_STATUS");
-            Ok(())
-        }
+        Command::Status { config, verbose } => probe(config, verbose).await,
     }
 }

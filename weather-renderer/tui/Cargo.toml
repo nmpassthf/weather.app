@@ -13,9 +13,15 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 toml.workspace = true
-weather-configure = { path = "../../weather-core/conf" }
 weather-schema = { path = "../../weather-schema" }
 zeromq.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[build-dependencies]
+weather-build-support = { path = "../../weather-build-support" }
 
 [[bin]]
 name = "weather-tui"

@@ -37,16 +37,15 @@ weather-tui --format json once
 weather-tui once --refresh
 
 # Search for a station
-weather-tui search "北京"
+weather-tui stations search "北京"
 
 # Add or update the configured station through engine APIs
-weather-tui search "北京" --write
 weather-tui stations list
 weather-tui stations add "北京-北京市"
 
 # Show engine status or stop the active engine
-weather-tui status
-weather-tui kill
+weather-tui engine status
+weather-tui engine stop
 ```
 
 Use `-c/--config <path>` to select a config file. By default, the app uses
@@ -57,12 +56,16 @@ during normal operation.
 Useful config commands:
 
 ```sh
-weather-tui --core-get-default-config
-weather-tui --core-get-config
-weather-tui --core-restart-engine
+weather-tui config defaults
+weather-tui config show
+weather-tui engine restart
 ```
 
 ## Service Installation
+
+Service management currently supports systemd on Linux only. The `windows`
+backend name is retained so unsupported SCM operations fail with a clear error;
+`weather-daemon` does not yet implement a Windows SCM service dispatcher.
 
 Install the daemon as a user service:
 
@@ -95,8 +98,17 @@ weather-daemon service remove systemd
 weather-daemon service remove systemd --all
 ```
 
+Pass the same scope and path overrides when removing a custom installation:
+
+```sh
+weather-daemon service remove systemd --system --path /custom/weather \
+  --config /custom/weather/weather.toml --all
+```
+
 Use `--no-modification-service` when you want the installer to write files and
-print next steps without starting or modifying the service state.
+print next steps without starting or modifying the systemd service state. This
+flag does not enable the unsupported Windows SCM backend; Windows service
+commands fail before writing installation files.
 
 ## Build
 
@@ -115,15 +127,20 @@ make release-static
 Release artifacts are copied to:
 
 ```text
-target/release-lto-static/
+target/release-artifacts/<target-triple>/
 ```
+
+Cargo's original artifacts remain under
+`target/<target-triple>/release-lto-static/`. Packaging verifies that each copy
+matches its source, writes `SHA256SUMS`, and rejects dynamically linked Linux
+binaries.
 
 Recommended checks after code changes:
 
 ```sh
-cargo fmt
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
-cargo clippy --all-targets --all-features
 ```
 
 ## Updates
@@ -137,7 +154,7 @@ weather-tui once --refresh
 Update configured stations through the frontend commands:
 
 ```sh
-weather-tui search "<query>" --write
+weather-tui stations search "<query>"
 weather-tui stations add "<station>"
 weather-tui stations remove "<selector>"
 weather-tui stations enable "<selector>"
@@ -148,7 +165,39 @@ Update installed binaries by rebuilding and reinstalling the service:
 
 ```sh
 make release-static
-target/release-lto-static/weather-daemon service reinstall systemd
+target/release-artifacts/<target-triple>/weather-daemon service reinstall systemd
 ```
 
-For upstream API inspection or troubleshooting, use the scripts in `scripts/`.
+## NMC Diagnostic Scripts
+
+The executable scripts in `scripts/` make live NMC requests for upstream API
+inspection and troubleshooting. Their arguments and defaults are:
+
+| Script | Arguments | Defaults | Additional dependencies |
+| --- | --- | --- | --- |
+| `list_provinces.sh` | none | none | none |
+| `list_cities.sh` | `[province_code]` | `ABJ` | none |
+| `fetch_weather.sh` | `[station_id]` | `MjXfi` | none |
+| `inspect_nmc_capabilities.sh` | `[station_id] [province_code]` | `Wqsps ABJ` | Python 3, `sed`, `mktemp`, `rm` |
+| `explore_nmc_api.sh` | `[forecast_page_url] [station_id]` | `<base-url>/publish/forecast/ABJ/chaoyang.html MjXfi` | `sed`, `mktemp`, `rm` |
+
+All five scripts require a POSIX-compatible `sh` and `curl`. Run them directly,
+for example:
+
+```sh
+./scripts/list_provinces.sh
+./scripts/list_cities.sh ABJ
+./scripts/fetch_weather.sh MjXfi
+./scripts/inspect_nmc_capabilities.sh Wqsps ABJ
+./scripts/explore_nmc_api.sh \
+  https://www.nmc.cn/publish/forecast/ABJ/chaoyang.html MjXfi
+```
+
+`NMC_BASE_URL` selects the upstream origin and defaults to
+`https://www.nmc.cn`. Supply an origin without a trailing slash. It also
+controls the default forecast page used by `explore_nmc_api.sh`; an explicit
+first argument overrides that page URL.
+
+```sh
+NMC_BASE_URL=http://127.0.0.1:8080 ./scripts/fetch_weather.sh MjXfi
+```

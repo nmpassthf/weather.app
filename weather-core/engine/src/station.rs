@@ -1,5 +1,5 @@
-use weather_db::{ProviderCity, ProviderProvince, ProviderStation};
-use weather_schema::StationRef;
+use weather_db::{ProviderCity, ProviderStation};
+use weather_schema::{StationRef, canonical_station_name};
 
 pub(crate) fn merge_station(
     upstream: Option<StationRef>,
@@ -12,12 +12,15 @@ pub(crate) fn merge_station(
     if station.city.is_empty() {
         station.city = requested.city.clone();
     }
-    if station.name.is_empty() {
-        station.name = requested.name.clone();
-    }
-    if station.unified_uuid.is_empty() {
-        station.unified_uuid = requested.unified_uuid.clone();
-    }
+    // Provider metadata may use a slightly different administrative name.
+    // Public identity must stay tied to the canonical station requested by the
+    // client; otherwise cache keys and PUB subscription UUIDs can drift.
+    station.name = requested.name.clone();
+    station.unified_uuid = if requested.unified_uuid.is_empty() {
+        weather_schema::unified_station_uuid(&requested.name)
+    } else {
+        requested.unified_uuid.clone()
+    };
     station
 }
 
@@ -40,61 +43,15 @@ pub(crate) fn city_to_provider_station(
     }
 }
 
-pub(crate) fn push_matching_provinces(
-    target: &mut Vec<ProviderProvince>,
-    source: &[ProviderProvince],
-    hint: &str,
-) {
-    for province in source.iter().filter(|province| {
-        province.name == hint
-            || short_region_name(&province.name) == hint
-            || province.name.contains(hint)
-            || hint.contains(short_region_name(&province.name))
-    }) {
-        if !target
-            .iter()
-            .any(|item| item.provider_code == province.provider_code)
-        {
-            target.push(province.clone());
-        }
-    }
-}
-
 pub(crate) fn station_names(station: &ProviderStation) -> Vec<String> {
     vec![canonical_station_name(&station.province, &station.city)]
-}
-
-pub(crate) fn canonical_station_name(province: &str, city: &str) -> String {
-    let region = short_region_name(province);
-    let city_level = province;
-    let core = short_region_name(city_level);
-    if city == core || city == province {
-        format!("{region}-{city_level}")
-    } else {
-        format!("{region}-{city_level}-{city}")
-    }
-}
-
-pub(crate) fn short_region_name(value: &str) -> &str {
-    value
-        .strip_suffix('市')
-        .or_else(|| value.strip_suffix('省'))
-        .or_else(|| value.strip_suffix("自治区"))
-        .or_else(|| value.strip_suffix("特别行政区"))
-        .unwrap_or(value)
-}
-
-pub(crate) fn normalize_station_name(name: &str) -> String {
-    name.split('-')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weather_schema::short_region_name;
+
     #[test]
     fn short_region_name_strips_suffixes() {
         assert_eq!(short_region_name("北京市"), "北京");
@@ -136,8 +93,30 @@ mod tests {
     }
 
     #[test]
-    fn normalize_station_name_drops_empty_parts() {
-        assert_eq!(normalize_station_name(" 北京 -  - 朝阳 "), "北京-朝阳");
-        assert_eq!(normalize_station_name("北京-北京市"), "北京-北京市");
+    fn merge_station_keeps_requested_public_identity() {
+        let requested = ProviderStation {
+            provider_name: "nmc".to_string(),
+            display_name: "北京-北京市-朝阳".to_string(),
+            provider_station_id: "X".to_string(),
+            provider_province_code: "ABJ".to_string(),
+            province: "北京市".to_string(),
+            city: "朝阳".to_string(),
+            url: String::new(),
+            name: "北京-北京市-朝阳".to_string(),
+            unified_uuid: "requested-uuid".to_string(),
+        };
+        let upstream = StationRef {
+            province: "北京".to_string(),
+            city: "朝阳区".to_string(),
+            name: "provider-name".to_string(),
+            unified_uuid: "provider-uuid".to_string(),
+        };
+
+        let merged = merge_station(Some(upstream), &requested);
+
+        assert_eq!(merged.name, requested.name);
+        assert_eq!(merged.unified_uuid, requested.unified_uuid);
+        assert_eq!(merged.province, "北京");
+        assert_eq!(merged.city, "朝阳区");
     }
 }

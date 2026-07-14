@@ -1,7 +1,7 @@
 use prost::Message;
 use weather_schema::*;
 
-use crate::{runtime::Engine, time::now_ms};
+use crate::{handlers::RpcFailure, runtime::Engine};
 
 impl Engine {
     pub(crate) fn status(
@@ -10,17 +10,36 @@ impl Engine {
         rpc_endpoint: &str,
         pub_endpoint: &str,
     ) -> EngineStatus {
+        self.lifecycle_status(
+            mode,
+            rpc_endpoint,
+            pub_endpoint,
+            LifecycleState::Ready,
+            None,
+        )
+    }
+
+    pub(crate) fn lifecycle_status(
+        &self,
+        mode: &str,
+        rpc_endpoint: &str,
+        pub_endpoint: &str,
+        lifecycle_state: LifecycleState,
+        message: Option<String>,
+    ) -> EngineStatus {
         EngineStatus {
-            ready: true,
+            ready: lifecycle_state == LifecycleState::Ready,
             mode: mode.to_string(),
             rpc_endpoint: rpc_endpoint.to_string(),
             pub_endpoint: pub_endpoint.to_string(),
             config_path: self.config_path.display().to_string(),
             last_config_error: self.config.last_error(),
-            message: None,
+            message,
             engine_version: env!("CARGO_PKG_VERSION").to_string(),
             schema_version: SCHEMA_VERSION.to_string(),
             build_version: env!("BUILD_VERSION").to_string(),
+            instance_id: self.launch.instance_id.clone(),
+            lifecycle_state: lifecycle_state as i32,
         }
     }
 
@@ -67,7 +86,7 @@ impl Engine {
             schema_version: SCHEMA_VERSION.to_string(),
             request_id: request_id.to_string(),
             status: status as i32,
-            timestamp_unix_ms: now_ms(),
+            timestamp_unix_ms: unix_timestamp_ms().unwrap_or_default(),
             hmac_sha256: Vec::new(),
             payload: payload.encode_to_vec(),
             error,
@@ -80,20 +99,18 @@ impl Engine {
 
     pub(crate) fn rpc_error_response(
         request_id: &str,
-        code: impl Into<String>,
+        code: RpcErrorCode,
         message: impl Into<String>,
     ) -> RpcResponse {
+        let failure = RpcFailure::new(code, message).into_engine_error();
         RpcResponse {
             schema_version: SCHEMA_VERSION.to_string(),
             request_id: request_id.to_string(),
             status: ResponseStatus::Error as i32,
-            timestamp_unix_ms: now_ms(),
+            timestamp_unix_ms: unix_timestamp_ms().unwrap_or_default(),
             hmac_sha256: Vec::new(),
             payload: Vec::new(),
-            error: Some(EngineError {
-                code: code.into(),
-                message: message.into(),
-            }),
+            error: Some(failure),
         }
     }
 

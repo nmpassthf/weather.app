@@ -1,249 +1,515 @@
-use std::path::PathBuf;
-use std::str::FromStr;
+use std::{
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
-use weather_schema::{StationRef, WeatherSnapshot, unified_station_uuid};
+use chrono_tz::Tz;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use weather_schema::{
+    SCHEMA_VERSION, WeatherSnapshot, decode_message, encode_message, unified_station_uuid,
+    unix_timestamp_ms,
+};
 
-use crate::actor::{ProviderCity, ProviderProvince, ProviderStation, StoredSnapshot};
+use crate::{
+    actor::{
+        CatalogCache, ProviderCity, ProviderCityScopeCache, ProviderProvince, ProviderStation,
+        StoredSnapshot,
+    },
+    migration,
+    validation::{validate_provider_city_catalog, validate_provider_province_catalog},
+};
+
+pub(crate) const FETCH_LOG_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+pub(crate) const FETCH_LOG_MAX_ROWS: Option<u64> = Some(10_000);
+
+const CATALOG_PROVINCES: &str = "provinces";
+const CATALOG_CITIES: &str = "cities";
+const PROVINCE_SCOPE: &str = "";
+const DB_TIMEZONE_KEY: &str = "db_timezone";
+const TIMEZONE_SYNC_PENDING_KEY: &str = "timezone_config_sync_pending";
 
 pub(crate) struct DbInstance {
     conn: Connection,
+    timezone: Tz,
 }
 
 impl DbInstance {
     pub(crate) fn open(path: PathBuf, config_tz: &str) -> Result<Self> {
-        let conn = Connection::open(path).context("failed to open sqlite database")?;
-        let db = Self { conn };
-        db.migrate()?;
+        let timezone = parse_timezone(config_tz, "configured database timezone")?;
+        let mut conn = Connection::open(path).context("failed to open sqlite database")?;
+        conn.execute_batch(
+            r#"
+            PRAGMA journal_mode = WAL;
+            PRAGMA busy_timeout = 5000;
+            "#,
+        )
+        .context("failed to configure sqlite connection")?;
+        migration::migrate(&mut conn)?;
+        let mut db = Self { conn, timezone };
         db.ensure_timezone(config_tz)?;
         Ok(db)
     }
 
-    fn migrate(&self) -> Result<()> {
-        self.conn
-            .execute_batch(
-                r#"
-        PRAGMA journal_mode = WAL;
-        PRAGMA busy_timeout = 5000;
-        CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY);
-        CREATE TABLE IF NOT EXISTS provider_provinces(provider_code TEXT PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL, updated_at_unix_ms INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS provider_cities(provider_code TEXT PRIMARY KEY, provider_province_code TEXT NOT NULL, province TEXT NOT NULL, city TEXT NOT NULL, url TEXT NOT NULL, updated_at_unix_ms INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS public_stations(unified_uuid TEXT PRIMARY KEY, province TEXT, city TEXT, name TEXT NOT NULL DEFAULT '', updated_at_unix_ms INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS provider_station_mappings(provider TEXT NOT NULL, display_name TEXT NOT NULL, provider_station_id TEXT NOT NULL, provider_province_code TEXT NOT NULL, province TEXT NOT NULL, city TEXT NOT NULL, url TEXT NOT NULL, name TEXT NOT NULL, unified_uuid TEXT NOT NULL, updated_at_unix_ms INTEGER NOT NULL, PRIMARY KEY(provider, display_name));
-        CREATE INDEX IF NOT EXISTS idx_provider_station_mappings_uuid ON provider_station_mappings(provider, unified_uuid);
-        CREATE TABLE IF NOT EXISTS alerts(id INTEGER PRIMARY KEY AUTOINCREMENT, unified_uuid TEXT NOT NULL, alert_json TEXT NOT NULL, fetched_at_unix_ms INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS upstream_fetch_log(id INTEGER PRIMARY KEY AUTOINCREMENT, unified_uuid TEXT, endpoint TEXT NOT NULL, ok INTEGER NOT NULL, message TEXT, fetched_at_unix_ms INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS engine_state(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at_unix_ms INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS weather_snapshots_history(unified_uuid TEXT NOT NULL, date TEXT NOT NULL, station_name TEXT NOT NULL, snapshot_json TEXT NOT NULL, forecast_json TEXT NOT NULL, alerts_json TEXT NOT NULL, fetched_at_unix_ms INTEGER NOT NULL, PRIMARY KEY(unified_uuid, date));
-        CREATE INDEX IF NOT EXISTS idx_history_uuid_fetched ON weather_snapshots_history(unified_uuid, fetched_at_unix_ms DESC);
-        DROP TABLE IF EXISTS weather_snapshots;
-        DROP TABLE IF EXISTS forecast_days;
-        "#,
-            )
-            .context("failed to migrate sqlite schema")?;
-        Ok(())
-    }
-
-    /// 校验 DB 中记录的时区与 config 一致；首次启动写入 config 时区。
-    fn ensure_timezone(&self, config_tz: &str) -> Result<()> {
+    fn ensure_timezone(&mut self, config_tz: &str) -> Result<()> {
+        let config_timezone = parse_timezone(config_tz, "configured database timezone")?;
         let stored = self.get_db_timezone()?;
+        let pending = self.get_pending_timezone()?;
+        if let Some(pending) = pending {
+            let pending_timezone = parse_timezone(&pending, "pending database timezone")?;
+            let stored_timezone = stored
+                .as_deref()
+                .context("database timezone metadata is missing while timezone sync is pending")
+                .and_then(|stored| parse_timezone(stored, "stored database timezone"))?;
+            if stored_timezone != pending_timezone || config_timezone != pending_timezone {
+                bail!(
+                    "timezone sync pending `{pending}` does not match DB `{}` and config `{config_tz}`",
+                    stored.unwrap_or_else(|| "<missing>".to_string())
+                );
+            }
+            self.timezone = pending_timezone;
+            self.clear_pending_timezone(pending_timezone.name())?;
+            return Ok(());
+        }
+
         match stored {
-            None => {
-                self.set_db_timezone(config_tz)?;
+            None => self.set_db_timezone(config_timezone.name()),
+            Some(stored) => {
+                let stored_timezone = parse_timezone(&stored, "stored database timezone")?;
+                if stored_timezone != config_timezone {
+                    bail!(
+                        "DB timezone `{stored}` != config `{config_tz}`; call MIGRATE_DB_TIMEZONE RPC to migrate"
+                    );
+                }
+                self.timezone = stored_timezone;
                 Ok(())
             }
-            Some(stored) if stored == config_tz => Ok(()),
-            Some(stored) => bail!(
-                "DB timezone `{stored}` != config `{config_tz}`; call MIGRATE_DB_TIMEZONE RPC to migrate"
-            ),
         }
     }
 
     pub(crate) fn put_history_snapshot(
-        &self,
+        &mut self,
         snapshot: &WeatherSnapshot,
-        forecast_json: &str,
-        alerts_json: &str,
-        date: &str,
+        fetched_at_unix_ms: i64,
     ) -> Result<()> {
-        let station = snapshot.station.as_ref();
-        let uuid = station.map(|s| s.unified_uuid.clone()).unwrap_or_default();
-        let station_name = station.map(|s| s.name.clone()).unwrap_or_default();
-        let snapshot_json = serde_json::to_string(snapshot)?;
-        let now = now_ms();
-        self.conn.execute(
-            r#"INSERT INTO weather_snapshots_history(unified_uuid, date, station_name, snapshot_json, forecast_json, alerts_json, fetched_at_unix_ms)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-               ON CONFLICT(unified_uuid, date) DO UPDATE SET
-                 station_name = excluded.station_name,
-                 snapshot_json = excluded.snapshot_json,
-                 forecast_json = excluded.forecast_json,
-                 alerts_json = excluded.alerts_json,
-                 fetched_at_unix_ms = excluded.fetched_at_unix_ms"#,
-            params![uuid, date, station_name, snapshot_json, forecast_json, alerts_json, now],
-        )?;
-        if let Some(station) = station {
-            self.put_public_station(station)?;
+        let fetched_at = DateTime::<Utc>::from_timestamp_millis(fetched_at_unix_ms)
+            .with_context(|| format!("invalid fetched_at_unix_ms {fetched_at_unix_ms}"))?;
+        let date = fetched_at
+            .with_timezone(&self.timezone)
+            .format("%Y-%m-%d")
+            .to_string();
+        let station = snapshot
+            .station
+            .as_ref()
+            .context("weather snapshot is missing station")?;
+        if station.name.trim().is_empty() {
+            bail!("weather snapshot station name must not be empty");
         }
-        Ok(())
-    }
+        if station.unified_uuid.trim().is_empty() {
+            bail!("weather snapshot station unified_uuid must not be empty");
+        }
+        let canonical_uuid = unified_station_uuid(&station.name);
+        if station.unified_uuid != canonical_uuid {
+            bail!(
+                "weather snapshot station unified_uuid `{}` is not canonical for `{}`",
+                station.unified_uuid,
+                station.name
+            );
+        }
 
-    pub(crate) fn get_history_snapshot(
-        &self,
-        uuid: &str,
-        date: &str,
-    ) -> Result<Option<StoredSnapshot>> {
-        self.conn
-            .query_row(
-                "SELECT snapshot_json, fetched_at_unix_ms FROM weather_snapshots_history WHERE unified_uuid = ?1 AND date = ?2",
-                params![uuid, date],
-                |row| {
-                    let json: String = row.get(0)?;
-                    let fetched_at_unix_ms: i64 = row.get(1)?;
-                    Ok((json, fetched_at_unix_ms))
-                },
-            )
-            .optional()?
-            .map(|(json, fetched_at_unix_ms)| {
-                let snapshot = serde_json::from_str(&json)?;
-                Ok(StoredSnapshot {
-                    snapshot,
-                    fetched_at_unix_ms,
-                })
-            })
-            .transpose()
+        self.conn.execute(
+            r#"INSERT INTO weather_snapshots_history(
+                   unified_uuid, date, snapshot_schema_version, snapshot_proto, fetched_at_unix_ms
+               ) VALUES (?1, ?2, ?3, ?4, ?5)
+               ON CONFLICT(unified_uuid, date) DO UPDATE SET
+                 snapshot_schema_version = excluded.snapshot_schema_version,
+                 snapshot_proto = excluded.snapshot_proto,
+                 fetched_at_unix_ms = excluded.fetched_at_unix_ms
+               WHERE excluded.fetched_at_unix_ms >=
+                     weather_snapshots_history.fetched_at_unix_ms"#,
+            params![
+                station.unified_uuid,
+                date,
+                SCHEMA_VERSION,
+                encode_message(snapshot),
+                fetched_at_unix_ms
+            ],
+        )?;
+        Ok(())
     }
 
     pub(crate) fn get_latest_snapshot(&self, uuid: &str) -> Result<Option<StoredSnapshot>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT snapshot_json, fetched_at_unix_ms FROM weather_snapshots_history WHERE unified_uuid = ?1 ORDER BY fetched_at_unix_ms DESC",
-        )?;
-        let rows = stmt.query_map(params![uuid], |row| {
-            let json: String = row.get(0)?;
-            let fetched_at_unix_ms: i64 = row.get(1)?;
-            Ok((json, fetched_at_unix_ms))
-        })?;
-        for row in rows {
-            let (json, fetched_at_unix_ms) = row?;
-            if let Ok(snapshot) = serde_json::from_str(&json) {
-                return Ok(Some(StoredSnapshot {
-                    snapshot,
-                    fetched_at_unix_ms,
-                }));
-            }
+        let row = self
+            .conn
+            .query_row(
+                r#"SELECT date, snapshot_schema_version, snapshot_proto, fetched_at_unix_ms
+                   FROM weather_snapshots_history
+                   WHERE unified_uuid = ?1
+                   ORDER BY fetched_at_unix_ms DESC
+                   LIMIT 1"#,
+                params![uuid],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((date, schema_version, bytes, fetched_at_unix_ms)) = row else {
+            return Ok(None);
+        };
+        if schema_version != SCHEMA_VERSION {
+            bail!(
+                "snapshot cache row {uuid}/{date} uses unsupported schema `{schema_version}`; expected `{SCHEMA_VERSION}`"
+            );
         }
-        Ok(None)
+        let snapshot = decode_message(&bytes)
+            .with_context(|| format!("failed to decode snapshot cache row {uuid}/{date}"))?;
+        Ok(Some(StoredSnapshot {
+            snapshot,
+            fetched_at_unix_ms,
+        }))
     }
 
-    pub(crate) fn put_provider_provinces(&self, provinces: &[ProviderProvince]) -> Result<()> {
-        let now = now_ms();
-        for province in provinces {
-            self.conn.execute(
-                "INSERT OR REPLACE INTO provider_provinces(provider_code, name, url, updated_at_unix_ms) VALUES (?1, ?2, ?3, ?4)",
-                params![province.provider_code, province.name, province.url, now],
+    pub(crate) fn replace_provider_provinces(
+        &mut self,
+        provider: &str,
+        provinces: &[ProviderProvince],
+    ) -> Result<()> {
+        validate_provider(provider)?;
+        validate_provider_province_catalog(provinces)?;
+        let now = unix_timestamp_ms().unwrap_or_default();
+        let row_count = i64::try_from(provinces.len()).context("province row count overflow")?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM provider_provinces WHERE provider = ?1",
+            params![provider],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                r#"INSERT INTO provider_provinces(
+                       provider, provider_code, name, url, updated_at_unix_ms
+                   ) VALUES (?1, ?2, ?3, ?4, ?5)"#,
             )?;
+            for province in provinces {
+                stmt.execute(params![
+                    provider,
+                    province.provider_code,
+                    province.name,
+                    province.url,
+                    now
+                ])?;
+            }
         }
+        tx.execute(
+            r#"DELETE FROM provider_cities
+               WHERE provider = ?1
+                 AND NOT EXISTS (
+                     SELECT 1 FROM provider_provinces
+                     WHERE provider_provinces.provider = provider_cities.provider
+                       AND provider_provinces.provider_code = provider_cities.provider_province_code
+                 )"#,
+            params![provider],
+        )?;
+        tx.execute(
+            r#"DELETE FROM catalog_cache_state
+               WHERE provider = ?1 AND catalog_kind = 'cities'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM provider_provinces
+                     WHERE provider_provinces.provider = catalog_cache_state.provider
+                       AND provider_provinces.provider_code = catalog_cache_state.scope
+                 )"#,
+            params![provider],
+        )?;
+        tx.execute(
+            r#"DELETE FROM provider_station_mappings
+               WHERE provider = ?1
+                 AND NOT EXISTS (
+                     SELECT 1 FROM provider_provinces
+                     WHERE provider_provinces.provider = provider_station_mappings.provider
+                       AND provider_provinces.provider_code = provider_station_mappings.provider_province_code
+                 )"#,
+            params![provider],
+        )?;
+        upsert_catalog_state(
+            &tx,
+            provider,
+            CATALOG_PROVINCES,
+            PROVINCE_SCOPE,
+            now,
+            row_count,
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
-    pub(crate) fn get_provider_provinces(&self) -> Result<Vec<ProviderProvince>> {
+    pub(crate) fn get_provider_provinces(
+        &self,
+        provider: &str,
+    ) -> Result<Option<CatalogCache<ProviderProvince>>> {
+        validate_provider(provider)?;
+        let Some((fetched_at_unix_ms, expected_count)) =
+            self.get_catalog_state(provider, CATALOG_PROVINCES, PROVINCE_SCOPE)?
+        else {
+            return Ok(None);
+        };
         let mut stmt = self.conn.prepare(
-            "SELECT provider_code, name, url FROM provider_provinces ORDER BY provider_code",
+            r#"SELECT provider_code, name, url
+               FROM provider_provinces
+               WHERE provider = ?1
+               ORDER BY provider_code"#,
         )?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![provider], |row| {
             Ok(ProviderProvince {
                 provider_code: row.get(0)?,
                 name: row.get(1)?,
                 url: row.get(2)?,
             })
         })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Into::into)
-    }
-
-    pub(crate) fn resolve_provider_province_code(&self, province: &str) -> Result<String> {
-        let mut stmt = self.conn.prepare(
-            "SELECT provider_code FROM provider_provinces WHERE name = ?1 ORDER BY provider_code",
+        let items = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        validate_catalog_count(
+            provider,
+            CATALOG_PROVINCES,
+            PROVINCE_SCOPE,
+            expected_count,
+            items.len(),
         )?;
-        let rows = stmt
-            .query_map(params![province], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        match rows.as_slice() {
-            [code] => Ok(code.clone()),
-            [] => bail!("provider province `{province}` not found"),
-            codes => bail!(
-                "provider province `{province}` is ambiguous: {}",
-                codes.join(", ")
-            ),
-        }
+        Ok(Some(CatalogCache {
+            items,
+            fetched_at_unix_ms,
+        }))
     }
 
-    pub(crate) fn put_provider_cities(
-        &self,
+    pub(crate) fn replace_provider_cities(
+        &mut self,
+        provider: &str,
         provider_province_code: &str,
         cities: &[ProviderCity],
     ) -> Result<()> {
-        let now = now_ms();
-        for city in cities {
-            self.conn.execute(
-                "INSERT OR REPLACE INTO provider_cities(provider_code, provider_province_code, province, city, url, updated_at_unix_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![city.provider_code, provider_province_code, city.province, city.city, city.url, now],
+        validate_provider(provider)?;
+        validate_provider_city_catalog(provider_province_code, cities)?;
+        let now = unix_timestamp_ms().unwrap_or_default();
+        let row_count = i64::try_from(cities.len()).context("city row count overflow")?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Station mappings are derived from this city scope.  Invalidate them
+        // in the same transaction so a removed or remapped provider station ID
+        // cannot outlive its authoritative catalog replacement.
+        tx.execute(
+            r#"DELETE FROM provider_station_mappings
+               WHERE provider = ?1 AND provider_province_code = ?2"#,
+            params![provider, provider_province_code],
+        )?;
+        tx.execute(
+            "DELETE FROM provider_cities WHERE provider = ?1 AND provider_province_code = ?2",
+            params![provider, provider_province_code],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                r#"INSERT INTO provider_cities(
+                       provider, provider_code, provider_province_code,
+                       province, city, url, updated_at_unix_ms
+                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
             )?;
+            for city in cities {
+                stmt.execute(params![
+                    provider,
+                    city.provider_code,
+                    provider_province_code,
+                    city.province,
+                    city.city,
+                    city.url,
+                    now
+                ])?;
+            }
         }
+        upsert_catalog_state(
+            &tx,
+            provider,
+            CATALOG_CITIES,
+            provider_province_code,
+            now,
+            row_count,
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
     pub(crate) fn get_provider_cities(
         &self,
+        provider: &str,
         provider_province_code: &str,
-    ) -> Result<Vec<ProviderCity>> {
+    ) -> Result<Option<CatalogCache<ProviderCity>>> {
+        validate_provider(provider)?;
+        let Some((fetched_at_unix_ms, expected_count)) =
+            self.get_catalog_state(provider, CATALOG_CITIES, provider_province_code)?
+        else {
+            return Ok(None);
+        };
         let mut stmt = self.conn.prepare(
-            "SELECT provider_code, province, city, url FROM provider_cities WHERE provider_province_code = ?1 ORDER BY city",
+            r#"SELECT provider_code, provider_province_code, province, city, url
+               FROM provider_cities
+               WHERE provider = ?1 AND provider_province_code = ?2
+               ORDER BY city, provider_code"#,
         )?;
-        let rows = stmt.query_map(params![provider_province_code], |row| {
+        let rows = stmt.query_map(params![provider, provider_province_code], |row| {
             Ok(ProviderCity {
                 provider_code: row.get(0)?,
-                provider_province_code: provider_province_code.to_string(),
-                province: row.get(1)?,
-                city: row.get(2)?,
-                url: row.get(3)?,
+                provider_province_code: row.get(1)?,
+                province: row.get(2)?,
+                city: row.get(3)?,
+                url: row.get(4)?,
             })
         })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Into::into)
-    }
-
-    pub(crate) fn put_public_station(&self, station: &StationRef) -> Result<()> {
-        let uuid = if station.unified_uuid.is_empty() {
-            unified_station_uuid(&station.name)
-        } else {
-            station.unified_uuid.clone()
-        };
-        self.conn.execute(
-            "INSERT OR REPLACE INTO public_stations(unified_uuid, province, city, name, updated_at_unix_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![uuid, station.province, station.city, station.name, now_ms()],
+        let items = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        validate_catalog_count(
+            provider,
+            CATALOG_CITIES,
+            provider_province_code,
+            expected_count,
+            items.len(),
         )?;
-        Ok(())
+        Ok(Some(CatalogCache {
+            items,
+            fetched_at_unix_ms,
+        }))
     }
 
-    #[cfg(test)]
-    pub(crate) fn get_public_station_by_uuid(&self, uuid: &str) -> Result<Option<StationRef>> {
+    pub(crate) fn get_all_provider_city_scopes(
+        &self,
+        provider: &str,
+    ) -> Result<Vec<ProviderCityScopeCache>> {
+        validate_provider(provider)?;
+
+        let orphan_city = self
+            .conn
+            .query_row(
+                r#"SELECT provider_province_code, provider_code
+                   FROM provider_cities AS city
+                   WHERE provider = ?1
+                     AND NOT EXISTS (
+                         SELECT 1 FROM catalog_cache_state AS state
+                         WHERE state.provider = city.provider
+                           AND state.catalog_kind = 'cities'
+                           AND state.scope = city.provider_province_code
+                     )
+                   ORDER BY provider_province_code, provider_code
+                   LIMIT 1"#,
+                params![provider],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((scope, code)) = orphan_city {
+            bail!("provider city `{provider}/{scope}/{code}` has no matching catalog cache state");
+        }
+
+        let states = {
+            let mut stmt = self.conn.prepare(
+                r#"SELECT scope, fetched_at_unix_ms, row_count
+                   FROM catalog_cache_state
+                   WHERE provider = ?1 AND catalog_kind = 'cities'
+                   ORDER BY scope"#,
+            )?;
+            stmt.query_map(params![provider], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        let mut scopes = Vec::with_capacity(states.len());
+        let mut stmt = self.conn.prepare(
+            r#"SELECT provider_code, provider_province_code, province, city, url
+               FROM provider_cities
+               WHERE provider = ?1 AND provider_province_code = ?2
+               ORDER BY city, provider_code"#,
+        )?;
+        for (scope, fetched_at_unix_ms, expected_count) in states {
+            let items = stmt
+                .query_map(params![provider, scope], |row| {
+                    Ok(ProviderCity {
+                        provider_code: row.get(0)?,
+                        provider_province_code: row.get(1)?,
+                        province: row.get(2)?,
+                        city: row.get(3)?,
+                        url: row.get(4)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            validate_catalog_count(
+                provider,
+                CATALOG_CITIES,
+                &scope,
+                expected_count,
+                items.len(),
+            )?;
+            scopes.push(ProviderCityScopeCache {
+                provider_province_code: scope,
+                items,
+                fetched_at_unix_ms,
+            });
+        }
+        Ok(scopes)
+    }
+
+    fn get_catalog_state(
+        &self,
+        provider: &str,
+        kind: &str,
+        scope: &str,
+    ) -> Result<Option<(i64, i64)>> {
         self.conn
             .query_row(
-                "SELECT province, city, name, unified_uuid FROM public_stations WHERE unified_uuid = ?1",
-                params![uuid],
-                map_public_station_ref,
+                r#"SELECT fetched_at_unix_ms, row_count
+                   FROM catalog_cache_state
+                   WHERE provider = ?1 AND catalog_kind = ?2 AND scope = ?3"#,
+                params![provider, kind, scope],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(Into::into)
     }
 
-    pub(crate) fn put_provider_station_mapping(&self, station: &ProviderStation) -> Result<()> {
-        self.put_public_station(&station.public_ref())?;
+    pub(crate) fn put_provider_station_mapping(&mut self, station: &ProviderStation) -> Result<()> {
+        validate_provider(&station.provider_name)?;
+        if station.name.trim().is_empty() {
+            bail!("provider station name must not be empty");
+        }
+        if station.unified_uuid.trim().is_empty() {
+            bail!("provider station unified_uuid must not be empty");
+        }
+        let canonical_uuid = unified_station_uuid(&station.name);
+        if station.unified_uuid != canonical_uuid {
+            bail!(
+                "provider station unified_uuid `{}` is not canonical for `{}`",
+                station.unified_uuid,
+                station.name
+            );
+        }
         self.conn.execute(
-            "INSERT OR REPLACE INTO provider_station_mappings(provider, display_name, provider_station_id, provider_province_code, province, city, url, name, unified_uuid, updated_at_unix_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            r#"INSERT INTO provider_station_mappings(
+                   provider, display_name, provider_station_id, provider_province_code,
+                   province, city, url, name, unified_uuid, updated_at_unix_ms
+               ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+               ON CONFLICT(provider, display_name) DO UPDATE SET
+                 provider_station_id = excluded.provider_station_id,
+                 provider_province_code = excluded.provider_province_code,
+                 province = excluded.province,
+                 city = excluded.city,
+                 url = excluded.url,
+                 name = excluded.name,
+                 unified_uuid = excluded.unified_uuid,
+                 updated_at_unix_ms = excluded.updated_at_unix_ms"#,
             params![
                 station.provider_name,
                 station.display_name,
@@ -254,7 +520,7 @@ impl DbInstance {
                 station.url,
                 station.name,
                 station.unified_uuid,
-                now_ms()
+                unix_timestamp_ms().unwrap_or_default()
             ],
         )?;
         Ok(())
@@ -267,7 +533,10 @@ impl DbInstance {
     ) -> Result<Option<ProviderStation>> {
         self.conn
             .query_row(
-                "SELECT provider, display_name, provider_station_id, provider_province_code, province, city, url, name, unified_uuid FROM provider_station_mappings WHERE provider = ?1 AND display_name = ?2",
+                r#"SELECT provider, display_name, provider_station_id, provider_province_code,
+                          province, city, url, name, unified_uuid
+                   FROM provider_station_mappings
+                   WHERE provider = ?1 AND display_name = ?2"#,
                 params![provider, display_name],
                 map_provider_station,
             )
@@ -282,7 +551,11 @@ impl DbInstance {
     ) -> Result<Option<ProviderStation>> {
         self.conn
             .query_row(
-                "SELECT provider, display_name, provider_station_id, provider_province_code, province, city, url, name, unified_uuid FROM provider_station_mappings WHERE provider = ?1 AND unified_uuid = ?2 ORDER BY display_name LIMIT 1",
+                r#"SELECT provider, display_name, provider_station_id, provider_province_code,
+                          province, city, url, name, unified_uuid
+                   FROM provider_station_mappings
+                   WHERE provider = ?1 AND unified_uuid = ?2
+                   ORDER BY display_name LIMIT 1"#,
                 params![provider, uuid],
                 map_provider_station,
             )
@@ -293,97 +566,275 @@ impl DbInstance {
     pub(crate) fn get_db_timezone(&self) -> Result<Option<String>> {
         self.conn
             .query_row(
-                "SELECT value FROM engine_state WHERE key = 'db_timezone'",
-                [],
+                "SELECT value FROM engine_state WHERE key = ?1",
+                params![DB_TIMEZONE_KEY],
                 |row| row.get::<_, String>(0),
             )
             .optional()
             .map_err(Into::into)
     }
 
-    pub(crate) fn set_db_timezone(&self, tz: &str) -> Result<()> {
+    fn set_db_timezone(&mut self, timezone: &str) -> Result<()> {
+        let timezone = parse_timezone(timezone, "database timezone")?;
         self.conn.execute(
-            "INSERT OR REPLACE INTO engine_state(key, value, updated_at_unix_ms) VALUES ('db_timezone', ?1, ?2)",
-            params![tz, now_ms()],
+            r#"INSERT INTO engine_state(key, value, updated_at_unix_ms)
+               VALUES (?1, ?2, ?3)
+               ON CONFLICT(key) DO UPDATE SET
+                 value = excluded.value,
+                 updated_at_unix_ms = excluded.updated_at_unix_ms"#,
+            params![
+                DB_TIMEZONE_KEY,
+                timezone.name(),
+                unix_timestamp_ms().unwrap_or_default()
+            ],
         )?;
+        self.timezone = timezone;
         Ok(())
     }
 
-    /// 把历史表所有行的 date 列按 `new_timezone` 重算。
-    ///
-    /// PK 冲突（同 uuid 同新 date 已存在）时保留 `fetched_at_unix_ms` 较大者。
-    /// 整个迁移在单事务内完成，避免半迁移状态。返回受影响行数。
-    pub(crate) fn migrate_timezone(&self, old_tz: &str, new_tz: &str) -> Result<u64> {
-        if old_tz == new_tz {
+    pub(crate) fn migrate_timezone(&mut self, old_tz: &str, new_tz: &str) -> Result<u64> {
+        let old_timezone = parse_timezone(old_tz, "old database timezone")?;
+        let new_timezone = parse_timezone(new_tz, "new database timezone")?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pending = tx
+            .query_row(
+                "SELECT value FROM engine_state WHERE key = ?1",
+                params![TIMEZONE_SYNC_PENDING_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(pending) = pending {
+            bail!("timezone config sync to `{pending}` is already pending");
+        }
+        let stored = tx
+            .query_row(
+                "SELECT value FROM engine_state WHERE key = ?1",
+                params![DB_TIMEZONE_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .context("database timezone metadata is missing")?;
+        let stored_timezone = parse_timezone(&stored, "stored database timezone")?;
+        if stored_timezone != old_timezone {
+            bail!("DB timezone `{stored}` does not match requested old timezone `{old_tz}`");
+        }
+        if old_timezone == new_timezone {
+            tx.commit()?;
+            self.timezone = new_timezone;
             return Ok(0);
         }
-        let new_tz_obj = chrono_tz::Tz::from_str(new_tz)
-            .map_err(|_| anyhow::anyhow!("invalid new timezone `{new_tz}`"))?;
-        let mut rows = self.conn.prepare(
-            "SELECT unified_uuid, date, snapshot_json, forecast_json, alerts_json, fetched_at_unix_ms FROM weather_snapshots_history",
-        )?;
-        let entries: Vec<(String, String, String, String, String, i64)> = rows
-            .query_map([], |row| {
+
+        migration::validate_history_rebuild_schema(&tx)?;
+
+        // Keep only small key/timestamp metadata in Rust.  Snapshot protobufs
+        // are copied inside SQLite below, avoiding a full-history BLOB Vec and
+        // its corresponding memory spike.
+        let entries = {
+            let mut stmt = tx.prepare(
+                r#"SELECT unified_uuid, date, fetched_at_unix_ms
+                   FROM weather_snapshots_history
+                   ORDER BY unified_uuid, date"#,
+            )?;
+            stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(2)?,
                 ))
             })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        drop(rows);
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        };
 
-        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(
+            r#"
+            DROP TABLE IF EXISTS temp.weather_history_timezone_map;
+            CREATE TEMP TABLE weather_history_timezone_map(
+                unified_uuid TEXT NOT NULL,
+                old_date TEXT NOT NULL,
+                new_date TEXT NOT NULL,
+                fetched_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY(unified_uuid, old_date)
+            );
+            CREATE INDEX temp.idx_weather_history_timezone_target
+                ON weather_history_timezone_map(
+                    unified_uuid, new_date, fetched_at_unix_ms DESC, old_date DESC
+                );
+            "#,
+        )?;
+
         let mut rewritten = 0u64;
-        for (uuid, old_date, snapshot_json, forecast_json, alerts_json, fetched_at) in entries {
-            let dt = DateTime::<Utc>::from_timestamp_millis(fetched_at)
-                .ok_or_else(|| anyhow::anyhow!("invalid fetched_at_unix_ms {fetched_at}"))?;
-            let new_date = dt.with_timezone(&new_tz_obj).format("%Y-%m-%d").to_string();
-            if new_date == old_date {
-                continue;
+        {
+            let mut stmt = tx.prepare(
+                r#"INSERT INTO temp.weather_history_timezone_map(
+                       unified_uuid, old_date, new_date, fetched_at_unix_ms
+                   ) VALUES (?1, ?2, ?3, ?4)"#,
+            )?;
+            for (uuid, old_date, fetched_at) in entries {
+                let dt = DateTime::<Utc>::from_timestamp_millis(fetched_at)
+                    .with_context(|| format!("invalid fetched_at_unix_ms {fetched_at}"))?;
+                let new_date = dt
+                    .with_timezone(&new_timezone)
+                    .format("%Y-%m-%d")
+                    .to_string();
+                rewritten += u64::from(new_date != old_date);
+                stmt.execute(params![uuid, old_date, new_date, fetched_at])?;
             }
-            tx.execute(
-                r#"INSERT INTO weather_snapshots_history(unified_uuid, date, station_name, snapshot_json, forecast_json, alerts_json, fetched_at_unix_ms)
-                   VALUES (?1, ?2, '', ?3, ?4, ?5, ?6)
-                   ON CONFLICT(unified_uuid, date) DO UPDATE SET
-                     snapshot_json = CASE WHEN excluded.fetched_at_unix_ms > weather_snapshots_history.fetched_at_unix_ms THEN excluded.snapshot_json ELSE weather_snapshots_history.snapshot_json END,
-                     forecast_json = CASE WHEN excluded.fetched_at_unix_ms > weather_snapshots_history.fetched_at_unix_ms THEN excluded.forecast_json ELSE weather_snapshots_history.forecast_json END,
-                     alerts_json = CASE WHEN excluded.fetched_at_unix_ms > weather_snapshots_history.fetched_at_unix_ms THEN excluded.alerts_json ELSE weather_snapshots_history.alerts_json END,
-                     fetched_at_unix_ms = CASE WHEN excluded.fetched_at_unix_ms > weather_snapshots_history.fetched_at_unix_ms THEN excluded.fetched_at_unix_ms ELSE weather_snapshots_history.fetched_at_unix_ms END"#,
-                params![uuid, new_date, snapshot_json, forecast_json, alerts_json, fetched_at],
-            )?;
-            tx.execute(
-                "DELETE FROM weather_snapshots_history WHERE unified_uuid = ?1 AND date = ?2",
-                params![uuid, old_date],
-            )?;
-            rewritten += 1;
         }
+
+        let expected_count: i64 = tx.query_row(
+            r#"SELECT COUNT(*)
+               FROM (
+                   SELECT unified_uuid, new_date
+                   FROM temp.weather_history_timezone_map
+                   GROUP BY unified_uuid, new_date
+               )"#,
+            [],
+            |row| row.get(0),
+        )?;
+
+        tx.execute_batch(&format!(
+            "ALTER TABLE {} RENAME TO {};",
+            migration::HISTORY_TABLE_NAME,
+            migration::HISTORY_OLD_TABLE_NAME
+        ))?;
+        migration::create_history_table(&tx)?;
+        tx.execute_batch(&format!(
+            r#"INSERT INTO {history}(
+                   unified_uuid, date, snapshot_schema_version,
+                   snapshot_proto, fetched_at_unix_ms
+               )
+               SELECT source.unified_uuid,
+                      mapping.new_date,
+                      source.snapshot_schema_version,
+                      source.snapshot_proto,
+                      source.fetched_at_unix_ms
+               FROM {old} AS source
+               JOIN temp.weather_history_timezone_map AS mapping
+                 ON mapping.unified_uuid = source.unified_uuid
+                AND mapping.old_date = source.date
+               WHERE NOT EXISTS (
+                   SELECT 1
+                   FROM temp.weather_history_timezone_map AS newer
+                   WHERE newer.unified_uuid = mapping.unified_uuid
+                     AND newer.new_date = mapping.new_date
+                     AND (
+                         newer.fetched_at_unix_ms > mapping.fetched_at_unix_ms
+                         OR (
+                             newer.fetched_at_unix_ms = mapping.fetched_at_unix_ms
+                             AND newer.old_date > mapping.old_date
+                         )
+                     )
+               );"#,
+            history = migration::HISTORY_TABLE_NAME,
+            old = migration::HISTORY_OLD_TABLE_NAME,
+        ))?;
+        let staged_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM weather_snapshots_history",
+            [],
+            |row| row.get(0),
+        )?;
+        if staged_count != expected_count {
+            bail!(
+                "timezone migration staged {staged_count} history rows; expected {expected_count}"
+            );
+        }
+
+        tx.execute_batch(&format!(
+            "DROP TABLE {}; DROP TABLE temp.weather_history_timezone_map;",
+            migration::HISTORY_OLD_TABLE_NAME
+        ))?;
+        migration::create_history_index(&tx)?;
         tx.execute(
-            "INSERT OR REPLACE INTO engine_state(key, value, updated_at_unix_ms) VALUES ('db_timezone', ?1, ?2)",
-            params![new_tz, now_ms()],
+            r#"INSERT INTO engine_state(key, value, updated_at_unix_ms)
+               VALUES (?1, ?2, ?3)
+               ON CONFLICT(key) DO UPDATE SET
+                 value = excluded.value,
+                 updated_at_unix_ms = excluded.updated_at_unix_ms"#,
+            params![
+                DB_TIMEZONE_KEY,
+                new_timezone.name(),
+                unix_timestamp_ms().unwrap_or_default()
+            ],
+        )?;
+        tx.execute(
+            r#"INSERT INTO engine_state(key, value, updated_at_unix_ms)
+               VALUES (?1, ?2, ?3)
+               ON CONFLICT(key) DO UPDATE SET
+                 value = excluded.value,
+                 updated_at_unix_ms = excluded.updated_at_unix_ms"#,
+            params![
+                TIMEZONE_SYNC_PENDING_KEY,
+                new_timezone.name(),
+                unix_timestamp_ms().unwrap_or_default()
+            ],
         )?;
         tx.commit()?;
+        self.timezone = new_timezone;
         Ok(rewritten)
     }
 
+    pub(crate) fn get_pending_timezone(&self) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key = ?1",
+                params![TIMEZONE_SYNC_PENDING_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn clear_pending_timezone(&mut self, expected: &str) -> Result<()> {
+        let expected = parse_timezone(expected, "expected pending database timezone")?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pending = tx
+            .query_row(
+                "SELECT value FROM engine_state WHERE key = ?1",
+                params![TIMEZONE_SYNC_PENDING_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(pending) = pending {
+            let pending_timezone = parse_timezone(&pending, "pending database timezone")?;
+            if pending_timezone != expected {
+                bail!(
+                    "pending database timezone `{pending}` does not match expected `{}`",
+                    expected.name()
+                );
+            }
+            tx.execute(
+                "DELETE FROM engine_state WHERE key = ?1",
+                params![TIMEZONE_SYNC_PENDING_KEY],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn log_fetch(
-        &self,
+        &mut self,
         unified_uuid: Option<&str>,
         endpoint: &str,
         ok: bool,
         message: Option<&str>,
     ) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO upstream_fetch_log(unified_uuid, endpoint, ok, message, fetched_at_unix_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![unified_uuid, endpoint, if ok { 1 } else { 0 }, message, now_ms()],
+        let now = unix_timestamp_ms().unwrap_or_default();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            r#"INSERT INTO upstream_fetch_log(
+                   unified_uuid, endpoint, ok, message, fetched_at_unix_ms
+               ) VALUES (?1, ?2, ?3, ?4, ?5)"#,
+            params![unified_uuid, endpoint, i64::from(ok), message, now],
         )?;
+        prune_fetch_logs(&tx, now, FETCH_LOG_RETENTION_MS, FETCH_LOG_MAX_ROWS)?;
+        tx.commit()?;
         Ok(())
     }
 
-    /// 将 WAL 写回主 db 文件并截断 WAL,graceful shutdown 时调用。
     pub(crate) fn checkpoint(&self) -> Result<()> {
         self.conn
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
@@ -392,14 +843,120 @@ impl DbInstance {
     }
 }
 
-#[cfg(test)]
-fn map_public_station_ref(row: &rusqlite::Row<'_>) -> rusqlite::Result<StationRef> {
-    Ok(StationRef {
-        province: row.get(0)?,
-        city: row.get(1)?,
-        name: row.get(2)?,
-        unified_uuid: row.get(3)?,
-    })
+pub(crate) fn inspect_pending_timezone(path: &Path) -> Result<Option<String>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("failed to inspect database {}", path.display()))?;
+    let has_engine_state: bool = conn.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM sqlite_schema
+               WHERE type = 'table' AND name = 'engine_state'
+           )"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_engine_state {
+        return Ok(None);
+    }
+    let pending = conn
+        .query_row(
+            "SELECT value FROM engine_state WHERE key = ?1",
+            params![TIMEZONE_SYNC_PENDING_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(pending) = pending else {
+        return Ok(None);
+    };
+    let stored = conn
+        .query_row(
+            "SELECT value FROM engine_state WHERE key = ?1",
+            params![DB_TIMEZONE_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .context("database timezone metadata is missing while timezone sync is pending")?;
+    let pending_timezone = parse_timezone(&pending, "pending database timezone")?;
+    let stored_timezone = parse_timezone(&stored, "stored database timezone")?;
+    if pending_timezone != stored_timezone {
+        bail!("timezone sync pending `{pending}` does not match DB `{stored}`");
+    }
+    Ok(Some(pending_timezone.name().to_string()))
+}
+
+fn upsert_catalog_state(
+    conn: &Connection,
+    provider: &str,
+    kind: &str,
+    scope: &str,
+    fetched_at_unix_ms: i64,
+    row_count: i64,
+) -> Result<()> {
+    conn.execute(
+        r#"INSERT INTO catalog_cache_state(
+               provider, catalog_kind, scope, fetched_at_unix_ms, row_count
+           ) VALUES (?1, ?2, ?3, ?4, ?5)
+           ON CONFLICT(provider, catalog_kind, scope) DO UPDATE SET
+             fetched_at_unix_ms = excluded.fetched_at_unix_ms,
+             row_count = excluded.row_count"#,
+        params![provider, kind, scope, fetched_at_unix_ms, row_count],
+    )?;
+    Ok(())
+}
+
+fn validate_provider(provider: &str) -> Result<()> {
+    if provider.trim().is_empty() {
+        bail!("provider must not be empty");
+    }
+    Ok(())
+}
+
+fn parse_timezone(value: &str, label: &str) -> Result<Tz> {
+    Tz::from_str(value).map_err(|_| anyhow::anyhow!("invalid {label} `{value}`"))
+}
+
+fn validate_catalog_count(
+    provider: &str,
+    kind: &str,
+    scope: &str,
+    expected: i64,
+    actual: usize,
+) -> Result<()> {
+    let actual = i64::try_from(actual).context("catalog row count overflow")?;
+    if expected != actual {
+        bail!(
+            "catalog cache state mismatch for provider `{provider}` kind `{kind}` scope `{scope}`: expected {expected} rows, found {actual}"
+        );
+    }
+    Ok(())
+}
+
+fn prune_fetch_logs(
+    conn: &Connection,
+    now_unix_ms: i64,
+    retention_ms: i64,
+    max_rows: Option<u64>,
+) -> Result<()> {
+    let cutoff = now_unix_ms.saturating_sub(retention_ms.max(0));
+    conn.execute(
+        "DELETE FROM upstream_fetch_log WHERE fetched_at_unix_ms < ?1",
+        params![cutoff],
+    )?;
+    if let Some(max_rows) = max_rows {
+        let offset = i64::try_from(max_rows).context("fetch log row limit exceeds i64")?;
+        conn.execute(
+            r#"DELETE FROM upstream_fetch_log
+               WHERE id IN (
+                   SELECT id FROM upstream_fetch_log
+                   ORDER BY fetched_at_unix_ms DESC, id DESC
+                   LIMIT -1 OFFSET ?1
+               )"#,
+            params![offset],
+        )?;
+    }
+    Ok(())
 }
 
 fn map_provider_station(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderStation> {
@@ -416,31 +973,17 @@ fn map_provider_station(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderSta
     })
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use weather_schema::StationRef;
 
+    fn temp_db_with_timezone(timezone: &str) -> DbInstance {
+        DbInstance::open(PathBuf::from(":memory:"), timezone).unwrap()
+    }
+
     fn temp_db() -> DbInstance {
-        let path = std::env::temp_dir().join(format!(
-            "weather-db-test-{}-{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_file(&path);
-        let db = DbInstance::open(path.clone(), "Asia/Shanghai").unwrap();
-        std::fs::remove_file(path).ok();
-        db
+        temp_db_with_timezone("Asia/Shanghai")
     }
 
     fn sample_station(name: &str) -> StationRef {
@@ -459,242 +1002,679 @@ mod tests {
         }
     }
 
-    fn sample_provider_station(name: &str) -> ProviderStation {
-        ProviderStation {
-            provider_name: "nmc".to_string(),
-            display_name: name.to_string(),
-            provider_station_id: "nmc-code".to_string(),
-            provider_province_code: "ABJ".to_string(),
-            province: "北京市".to_string(),
-            city: "朝阳".to_string(),
-            url: String::new(),
+    fn sample_province(code: &str, name: &str) -> ProviderProvince {
+        ProviderProvince {
+            provider_code: code.to_string(),
             name: name.to_string(),
-            unified_uuid: unified_station_uuid(name),
+            url: format!("/publish/forecast/{code}"),
         }
     }
 
-    fn sample_provider_province(provider_code: &str, name: &str) -> ProviderProvince {
-        ProviderProvince {
-            provider_code: provider_code.to_string(),
-            name: name.to_string(),
-            url: format!("/publish/forecast/{provider_code}"),
+    fn sample_city(code: &str, province_code: &str, city: &str) -> ProviderCity {
+        ProviderCity {
+            provider_code: code.to_string(),
+            provider_province_code: province_code.to_string(),
+            province: "测试省".to_string(),
+            city: city.to_string(),
+            url: format!("/{code}"),
         }
+    }
+
+    fn sample_provider_station(
+        provider: &str,
+        province_code: &str,
+        provider_station_id: &str,
+    ) -> ProviderStation {
+        let name = format!("测试-{province_code}-{provider_station_id}");
+        ProviderStation {
+            provider_name: provider.to_string(),
+            display_name: name.clone(),
+            provider_station_id: provider_station_id.to_string(),
+            provider_province_code: province_code.to_string(),
+            province: "测试省".to_string(),
+            city: provider_station_id.to_string(),
+            url: format!("/{provider_station_id}"),
+            unified_uuid: unified_station_uuid(&name),
+            name,
+        }
+    }
+
+    fn history_schema_signature(db: &DbInstance) -> Vec<(String, String, String)> {
+        db.conn
+            .prepare(
+                r#"SELECT type, name, coalesce(sql, '')
+                   FROM sqlite_schema
+                   WHERE tbl_name = 'weather_snapshots_history'
+                   ORDER BY type, name"#,
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    }
+
+    fn insert_history_row(
+        db: &DbInstance,
+        uuid: &str,
+        date: &str,
+        snapshot: &WeatherSnapshot,
+        fetched_at: i64,
+    ) {
+        db.conn
+            .execute(
+                r#"INSERT INTO weather_snapshots_history(
+                       unified_uuid, date, snapshot_schema_version,
+                       snapshot_proto, fetched_at_unix_ms
+                   ) VALUES (?1, ?2, ?3, ?4, ?5)"#,
+                params![
+                    uuid,
+                    date,
+                    SCHEMA_VERSION,
+                    encode_message(snapshot),
+                    fetched_at
+                ],
+            )
+            .unwrap();
     }
 
     #[test]
-    fn history_upsert_same_day_overwrites() {
+    fn protobuf_history_round_trips_and_rejects_bad_uuid() {
+        let mut db = temp_db();
+        let snapshot = sample_snapshot("北京-北京市-朝阳");
+        let uuid = snapshot.station.as_ref().unwrap().unified_uuid.clone();
+        let fetched_at = DateTime::parse_from_rfc3339("2026-06-23T23:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        db.put_history_snapshot(&snapshot, fetched_at).unwrap();
+        let stored = db.get_latest_snapshot(&uuid).unwrap().unwrap();
+        assert_eq!(stored.snapshot.station.unwrap().unified_uuid, uuid);
+        assert_eq!(stored.fetched_at_unix_ms, fetched_at);
+        let stored_date: String = db
+            .conn
+            .query_row(
+                "SELECT date FROM weather_snapshots_history WHERE unified_uuid = ?1",
+                params![uuid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_date, "2026-06-24");
+
+        let mut empty = snapshot.clone();
+        empty.station.as_mut().unwrap().unified_uuid.clear();
+        assert!(db.put_history_snapshot(&empty, fetched_at).is_err());
+
+        let mut wrong = snapshot;
+        wrong.station.as_mut().unwrap().unified_uuid = "not-canonical".to_string();
+        assert!(db.put_history_snapshot(&wrong, fetched_at).is_err());
+        assert!(db.put_history_snapshot(&wrong, i64::MAX).is_err());
+    }
+
+    #[test]
+    fn persisted_protobuf_fixture_remains_wire_compatible() {
+        const NAME: &str = "fixture";
+        const UUID: &str = "3c78571a-ca24-58e6-a804-266dbda1eaa8";
+        // Hard-coded weather.schema.v1 bytes, intentionally not produced by the
+        // generated encoder in this test:
+        // WeatherSnapshot { station: { province: "P", city: "C",
+        // name: "fixture", unified_uuid: UUID }, stale: true }.
+        const SNAPSHOT_PROTO: &[u8] = b"\x0a\x35\x0a\x01P\x12\x01C\x1a\x07fixture\x22\x243c78571a-ca24-58e6-a804-266dbda1eaa8\x48\x01";
+
+        assert_eq!(unified_station_uuid(NAME), UUID);
+        let db = temp_db();
+        db.conn
+            .execute(
+                r#"INSERT INTO weather_snapshots_history(
+                       unified_uuid, date, snapshot_schema_version,
+                       snapshot_proto, fetched_at_unix_ms
+                   ) VALUES (?1, '2026-06-23', 'weather.schema.v1', ?2, 42)"#,
+                params![UUID, SNAPSHOT_PROTO],
+            )
+            .unwrap();
+
+        let stored = db.get_latest_snapshot(UUID).unwrap().unwrap();
+        let station = stored.snapshot.station.unwrap();
+        assert_eq!(station.province, "P");
+        assert_eq!(station.city, "C");
+        assert_eq!(station.name, NAME);
+        assert_eq!(station.unified_uuid, UUID);
+        assert!(stored.snapshot.stale);
+        assert_eq!(stored.fetched_at_unix_ms, 42);
+    }
+
+    #[test]
+    fn older_same_day_snapshot_cannot_overwrite_newer_history() {
+        let mut db = temp_db_with_timezone("UTC");
+        let name = "北京-北京市-朝阳";
+        let uuid = unified_station_uuid(name);
+        let older_at = DateTime::parse_from_rfc3339("2026-06-23T01:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let newer_at = DateTime::parse_from_rfc3339("2026-06-23T02:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let mut older = sample_snapshot(name);
+        older.stale = true;
+        let newer = sample_snapshot(name);
+
+        db.put_history_snapshot(&newer, newer_at).unwrap();
+        db.put_history_snapshot(&older, older_at).unwrap();
+
+        let stored = db.get_latest_snapshot(&uuid).unwrap().unwrap();
+        assert_eq!(stored.fetched_at_unix_ms, newer_at);
+        assert!(!stored.snapshot.stale);
+    }
+
+    #[test]
+    fn corrupted_protobuf_reports_row_identity() {
         let db = temp_db();
         let uuid = unified_station_uuid("北京-北京市-朝阳");
-        let snap1 = sample_snapshot("北京-北京市-朝阳");
-        db.put_history_snapshot(&snap1, "f1", "a1", "2026-06-23")
+        db.conn
+            .execute(
+                r#"INSERT INTO weather_snapshots_history(
+                       unified_uuid, date, snapshot_schema_version,
+                       snapshot_proto, fetched_at_unix_ms
+                   ) VALUES (?1, '2026-06-23', ?2, X'FFFF', 1)"#,
+                params![uuid, SCHEMA_VERSION],
+            )
             .unwrap();
-        let snap2 = sample_snapshot("北京-北京市-朝阳");
-        db.put_history_snapshot(&snap2, "f2", "a2", "2026-06-23")
+
+        let err = db.get_latest_snapshot(&uuid).unwrap_err().to_string();
+        assert!(err.contains(&uuid), "{err}");
+        assert!(err.contains("2026-06-23"), "{err}");
+    }
+
+    #[test]
+    fn provider_catalogs_are_isolated_and_empty_is_cached() {
+        let mut db = temp_db();
+        db.replace_provider_provinces("nmc", &[sample_province("X", "NMC")])
             .unwrap();
-        let stored = db
-            .get_history_snapshot(&uuid, "2026-06-23")
-            .unwrap()
+        db.replace_provider_provinces("other", &[sample_province("X", "Other")])
             .unwrap();
         assert_eq!(
-            stored.snapshot.station.as_ref().unwrap().name,
-            "北京-北京市-朝阳"
+            db.get_provider_provinces("nmc").unwrap().unwrap().items[0].name,
+            "NMC"
+        );
+        assert_eq!(
+            db.get_provider_provinces("other").unwrap().unwrap().items[0].name,
+            "Other"
+        );
+
+        db.replace_provider_cities("nmc", "X", &[]).unwrap();
+        let empty = db.get_provider_cities("nmc", "X").unwrap().unwrap();
+        assert!(empty.items.is_empty());
+        assert!(empty.fetched_at_unix_ms > 0);
+        assert!(db.get_provider_cities("other", "X").unwrap().is_none());
+    }
+
+    #[test]
+    fn all_city_scopes_include_empty_caches_in_canonical_order() {
+        let mut db = temp_db();
+        db.replace_provider_provinces(
+            "nmc",
+            &[sample_province("B", "Beta"), sample_province("A", "Alpha")],
+        )
+        .unwrap();
+        db.replace_provider_provinces("other", &[sample_province("A", "Other")])
+            .unwrap();
+        db.replace_provider_cities(
+            "nmc",
+            "B",
+            &[
+                sample_city("B2", "B", "Zulu"),
+                sample_city("B1", "B", "Alpha"),
+            ],
+        )
+        .unwrap();
+        db.replace_provider_cities("nmc", "A", &[]).unwrap();
+        db.replace_provider_cities("other", "A", &[sample_city("O1", "A", "Other")])
+            .unwrap();
+
+        let scopes = db.get_all_provider_city_scopes("nmc").unwrap();
+
+        assert_eq!(
+            scopes
+                .iter()
+                .map(|scope| scope.provider_province_code.as_str())
+                .collect::<Vec<_>>(),
+            ["A", "B"]
+        );
+        assert!(scopes[0].items.is_empty());
+        assert!(scopes[0].fetched_at_unix_ms > 0);
+        assert_eq!(
+            scopes[1]
+                .items
+                .iter()
+                .map(|city| city.provider_code.as_str())
+                .collect::<Vec<_>>(),
+            ["B1", "B2"]
         );
     }
 
     #[test]
-    fn get_latest_returns_max_fetched() {
-        let db = temp_db();
-        let uuid = unified_station_uuid("北京-北京市-朝阳");
-        db.put_history_snapshot(
-            &sample_snapshot("北京-北京市-朝阳"),
-            "f1",
-            "a1",
-            "2026-06-22",
-        )
-        .unwrap();
-        // 第二行稍后写入，fetched_at_unix_ms 自然更大（now_ms 递增）
-        db.put_history_snapshot(
-            &sample_snapshot("北京-北京市-朝阳"),
-            "f2",
-            "a2",
-            "2026-06-23",
-        )
-        .unwrap();
-        let latest = db.get_latest_snapshot(&uuid).unwrap().unwrap();
-        assert!(latest.fetched_at_unix_ms > 0);
+    fn all_city_scopes_reject_count_mismatches_and_rows_without_state() {
+        let mut mismatched = temp_db();
+        mismatched
+            .replace_provider_provinces("nmc", &[sample_province("A", "Alpha")])
+            .unwrap();
+        mismatched
+            .replace_provider_cities("nmc", "A", &[sample_city("A1", "A", "Alpha")])
+            .unwrap();
+        mismatched
+            .conn
+            .execute(
+                r#"UPDATE catalog_cache_state SET row_count = 2
+                   WHERE provider = 'nmc' AND catalog_kind = 'cities' AND scope = 'A'"#,
+                [],
+            )
+            .unwrap();
+        let mismatch = mismatched
+            .get_all_provider_city_scopes("nmc")
+            .unwrap_err()
+            .to_string();
+        assert!(mismatch.contains("scope `A`"), "{mismatch}");
+
+        let orphan_city = temp_db();
+        orphan_city
+            .conn
+            .execute(
+                r#"INSERT INTO provider_cities(
+                       provider, provider_code, provider_province_code,
+                       province, city, url, updated_at_unix_ms
+                   ) VALUES ('nmc', 'A1', 'A', 'Alpha', 'City', '/A1', 1)"#,
+                [],
+            )
+            .unwrap();
+        let city_error = orphan_city
+            .get_all_provider_city_scopes("nmc")
+            .unwrap_err()
+            .to_string();
+        assert!(city_error.contains("no matching catalog cache state"));
+
+        let independent_scope = temp_db();
+        independent_scope
+            .conn
+            .execute(
+                r#"INSERT INTO catalog_cache_state(
+                       provider, catalog_kind, scope, fetched_at_unix_ms, row_count
+                   ) VALUES ('nmc', 'cities', 'A', 1, 0)"#,
+                [],
+            )
+            .unwrap();
+        let scopes = independent_scope
+            .get_all_provider_city_scopes("nmc")
+            .unwrap();
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0].provider_province_code, "A");
+        assert!(scopes[0].items.is_empty());
     }
 
     #[test]
-    fn get_latest_ignores_unreadable_snapshot_cache_row() {
-        let db = temp_db();
-        let uuid = unified_station_uuid("北京-北京市-朝阳");
+    fn replace_removes_stale_rows_and_orphaned_city_scopes() {
+        let mut db = temp_db();
+        db.replace_provider_provinces(
+            "nmc",
+            &[sample_province("A", "A"), sample_province("B", "B")],
+        )
+        .unwrap();
+        db.replace_provider_cities("nmc", "A", &[sample_city("A1", "A", "A1")])
+            .unwrap();
+        db.replace_provider_cities(
+            "nmc",
+            "B",
+            &[sample_city("B1", "B", "B1"), sample_city("B2", "B", "B2")],
+        )
+        .unwrap();
+        db.replace_provider_cities("nmc", "B", &[sample_city("B2", "B", "B2")])
+            .unwrap();
+        assert_eq!(
+            db.get_provider_cities("nmc", "B")
+                .unwrap()
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+
+        db.replace_provider_provinces("nmc", &[sample_province("B", "B")])
+            .unwrap();
+        assert!(db.get_provider_cities("nmc", "A").unwrap().is_none());
+        let provinces = db.get_provider_provinces("nmc").unwrap().unwrap().items;
+        assert_eq!(provinces, vec![sample_province("B", "B")]);
+    }
+
+    #[test]
+    fn catalog_replace_invalidates_derived_station_mappings_in_the_same_scope() {
+        let mut db = temp_db();
+        db.replace_provider_provinces(
+            "nmc",
+            &[sample_province("A", "A"), sample_province("B", "B")],
+        )
+        .unwrap();
+        db.replace_provider_cities("nmc", "A", &[sample_city("A1", "A", "A1")])
+            .unwrap();
+        db.replace_provider_cities("nmc", "B", &[sample_city("B1", "B", "B1")])
+            .unwrap();
+        let station_a = sample_provider_station("nmc", "A", "A1");
+        let station_b = sample_provider_station("nmc", "B", "B1");
+        let other = sample_provider_station("other", "A", "OTHER");
+        db.put_provider_station_mapping(&station_a).unwrap();
+        db.put_provider_station_mapping(&station_b).unwrap();
+        db.put_provider_station_mapping(&other).unwrap();
+
+        db.replace_provider_cities("nmc", "B", &[sample_city("B2", "B", "B2")])
+            .unwrap();
+        assert!(
+            db.get_provider_station_by_name("nmc", &station_b.display_name)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_provider_station_by_name("nmc", &station_a.display_name)
+                .unwrap()
+                .is_some()
+        );
+
+        db.put_provider_station_mapping(&station_b).unwrap();
+        db.replace_provider_provinces("nmc", &[sample_province("B", "B")])
+            .unwrap();
+        assert!(
+            db.get_provider_station_by_name("nmc", &station_a.display_name)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_provider_station_by_name("nmc", &station_b.display_name)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.get_provider_station_by_name("other", &other.display_name)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn failed_replace_rolls_back_rows_and_cache_state() {
+        let mut db = temp_db();
+        db.replace_provider_provinces("nmc", &[sample_province("OLD", "Old")])
+            .unwrap();
+        let old_timestamp = db
+            .get_provider_provinces("nmc")
+            .unwrap()
+            .unwrap()
+            .fetched_at_unix_ms;
         db.conn
-            .execute(
-                r#"INSERT INTO weather_snapshots_history(unified_uuid, date, station_name, snapshot_json, forecast_json, alerts_json, fetched_at_unix_ms)
-                   VALUES (?1, '2026-06-29', '北京-北京市-朝阳', '{"climate":{"raw_json":"{}"}}', '{}', '{}', 1)"#,
-                params![uuid],
+            .execute_batch(
+                r#"CREATE TRIGGER fail_provider_insert
+                   BEFORE INSERT ON provider_provinces
+                   WHEN NEW.provider_code = 'FAIL'
+                   BEGIN SELECT RAISE(ABORT, 'injected'); END;"#,
             )
             .unwrap();
 
-        let latest = db.get_latest_snapshot(&uuid).unwrap();
-
-        assert!(latest.is_none());
+        let result = db.replace_provider_provinces(
+            "nmc",
+            &[
+                sample_province("GOOD", "Good"),
+                sample_province("FAIL", "Fail"),
+            ],
+        );
+        assert!(result.is_err());
+        let cached = db.get_provider_provinces("nmc").unwrap().unwrap();
+        assert_eq!(cached.items[0].provider_code, "OLD");
+        assert_eq!(cached.fetched_at_unix_ms, old_timestamp);
     }
 
     #[test]
-    fn timezone_first_init_writes_config_tz() {
-        let path = std::env::temp_dir().join(format!(
-            "weather-db-tz-init-{}-{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_file(&path);
-        {
-            let db = DbInstance::open(path.clone(), "Asia/Shanghai").unwrap();
-            assert_eq!(
-                db.get_db_timezone().unwrap().as_deref(),
-                Some("Asia/Shanghai")
-            );
-        }
-        std::fs::remove_file(path).ok();
-    }
-
-    #[test]
-    fn timezone_mismatch_rejects_startup() {
-        let path = std::env::temp_dir().join(format!(
-            "weather-db-tz-mismatch-{}-{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_file(&path);
-        {
-            let _db = DbInstance::open(path.clone(), "Asia/Shanghai").unwrap();
-        }
-        let err = match DbInstance::open(path.clone(), "UTC") {
-            Ok(_) => panic!("expected timezone mismatch to reject startup"),
-            Err(e) => e,
-        };
-        assert!(err.to_string().contains("Asia/Shanghai"));
-        assert!(err.to_string().contains("UTC"));
-        std::fs::remove_file(path).ok();
-    }
-
-    #[test]
-    fn migrate_timezone_rewrites_date() {
-        let db = temp_db();
-        let uuid = unified_station_uuid("北京-北京市-朝阳");
-        let snap = sample_snapshot("北京-北京市-朝阳");
-        let snap_json = serde_json::to_string(&snap).unwrap();
-        // UTC 2026-06-23 22:00 = Shanghai 2026-06-24 06:00，按 Shanghai 算 date=06-24
-        let fetched_at = DateTime::<Utc>::from_timestamp(1_782_252_000, 0)
+    fn timezone_staging_preserves_chained_moves() {
+        let mut db = temp_db_with_timezone("UTC");
+        let name = "北京-北京市-朝阳";
+        let uuid = unified_station_uuid(name);
+        let snapshot = sample_snapshot(name);
+        let first = DateTime::parse_from_rfc3339("2026-06-23T23:00:00Z")
             .unwrap()
             .timestamp_millis();
-        db.conn
-            .execute(
-                r#"INSERT INTO weather_snapshots_history(unified_uuid, date, station_name, snapshot_json, forecast_json, alerts_json, fetched_at_unix_ms)
-                   VALUES (?1, '2026-06-24', '北京-北京市-朝阳', ?2, '{}', '{}', ?3)"#,
-                params![uuid, snap_json, fetched_at],
+        let second = DateTime::parse_from_rfc3339("2026-06-24T23:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        insert_history_row(&db, &uuid, "2026-06-23", &snapshot, first);
+        insert_history_row(&db, &uuid, "2026-06-24", &snapshot, second);
+
+        assert_eq!(db.migrate_timezone("UTC", "Asia/Shanghai").unwrap(), 2);
+        let dates: Vec<String> = db
+            .conn
+            .prepare("SELECT date FROM weather_snapshots_history ORDER BY date")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(dates, vec!["2026-06-24", "2026-06-25"]);
+
+        let after_migration = sample_snapshot("迁移后站点");
+        let after_uuid = after_migration
+            .station
+            .as_ref()
+            .unwrap()
+            .unified_uuid
+            .clone();
+        db.put_history_snapshot(&after_migration, first).unwrap();
+        let date: String = db
+            .conn
+            .query_row(
+                "SELECT date FROM weather_snapshots_history WHERE unified_uuid = ?1",
+                params![after_uuid],
+                |row| row.get(0),
             )
             .unwrap();
-        let rewritten = db.migrate_timezone("Asia/Shanghai", "UTC").unwrap();
-        assert!(rewritten >= 1);
-        let stored = db.get_history_snapshot(&uuid, "2026-06-24").unwrap();
-        assert!(stored.is_none(), "old date row should be gone");
-        let new_row = db.get_history_snapshot(&uuid, "2026-06-23").unwrap();
-        assert!(new_row.is_some(), "new date row should exist");
+        assert_eq!(date, "2026-06-24");
+    }
+
+    #[test]
+    fn timezone_rebuild_preserves_the_canonical_history_schema() {
+        let mut db = temp_db_with_timezone("UTC");
+        let before = history_schema_signature(&db);
+        let snapshot = sample_snapshot("北京-北京市-朝阳");
+        let fetched_at = DateTime::parse_from_rfc3339("2026-06-23T23:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        db.put_history_snapshot(&snapshot, fetched_at).unwrap();
+
+        db.migrate_timezone("UTC", "Asia/Shanghai").unwrap();
+
+        assert_eq!(history_schema_signature(&db), before);
+    }
+
+    #[test]
+    fn timezone_rebuild_rejects_extra_history_schema_objects_without_changes() {
+        let mut db = temp_db_with_timezone("UTC");
+        let name = "北京-北京市-朝阳";
+        let uuid = unified_station_uuid(name);
+        let fetched_at = DateTime::parse_from_rfc3339("2026-06-23T23:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        insert_history_row(&db, &uuid, "2026-06-23", &sample_snapshot(name), fetched_at);
+        db.conn
+            .execute(
+                "CREATE INDEX extra_history_date ON weather_snapshots_history(date)",
+                [],
+            )
+            .unwrap();
+
+        let err = db
+            .migrate_timezone("UTC", "Asia/Shanghai")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("extra schema objects"), "{err}");
+        assert_eq!(db.get_db_timezone().unwrap().as_deref(), Some("UTC"));
+        assert_eq!(db.get_pending_timezone().unwrap(), None);
+        let date: String = db
+            .conn
+            .query_row("SELECT date FROM weather_snapshots_history", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(date, "2026-06-23");
+    }
+
+    #[test]
+    fn timezone_inputs_are_validated_before_state_changes() {
+        assert!(DbInstance::open(PathBuf::from(":memory:"), "Not/A/Zone").is_err());
+
+        let mut db = temp_db_with_timezone("UTC");
+        assert!(db.set_db_timezone("Not/A/Zone").is_err());
+        assert_eq!(db.get_db_timezone().unwrap().as_deref(), Some("UTC"));
+        assert!(db.migrate_timezone("Not/A/Zone", "Asia/Shanghai").is_err());
         assert_eq!(db.get_db_timezone().unwrap().as_deref(), Some("UTC"));
     }
 
     #[test]
-    fn public_station_by_uuid_round_trip() {
-        let db = temp_db();
-        let station = sample_station("北京-北京市-朝阳");
-        db.put_public_station(&station).unwrap();
-        let got = db
-            .get_public_station_by_uuid(&station.unified_uuid)
-            .unwrap()
-            .unwrap();
-        assert_eq!(got.name, "北京-北京市-朝阳");
-        assert_eq!(got.unified_uuid, station.unified_uuid);
+    fn timezone_pending_marker_is_written_only_for_real_migration() {
+        let mut db = temp_db_with_timezone("UTC");
+
+        assert_eq!(db.migrate_timezone("UTC", "UTC").unwrap(), 0);
+        assert_eq!(db.get_pending_timezone().unwrap(), None);
+
+        db.migrate_timezone("UTC", "Asia/Shanghai").unwrap();
+        assert_eq!(
+            db.get_pending_timezone().unwrap().as_deref(),
+            Some("Asia/Shanghai")
+        );
+        assert_eq!(db.timezone, chrono_tz::Asia::Shanghai);
+        db.clear_pending_timezone("Asia/Shanghai").unwrap();
+        assert_eq!(db.get_pending_timezone().unwrap(), None);
     }
 
     #[test]
-    fn provider_station_mapping_round_trip_by_uuid() {
-        let db = temp_db();
-        let station = sample_provider_station("北京-北京市-朝阳");
-        db.put_provider_station_mapping(&station).unwrap();
+    fn pending_timezone_inspection_reads_committed_wal_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("weather.db");
+        let mut db = DbInstance::open(path.clone(), "UTC").unwrap();
 
-        let got = db
-            .get_provider_station_by_uuid("nmc", &station.unified_uuid)
-            .unwrap()
-            .unwrap();
+        db.migrate_timezone("UTC", "Asia/Shanghai").unwrap();
 
-        assert_eq!(got.provider_station_id, "nmc-code");
-        assert_eq!(got.provider_province_code, "ABJ");
-        assert_eq!(got.public_ref().unified_uuid, station.unified_uuid);
-    }
-
-    #[test]
-    fn provider_province_name_resolves_to_internal_code() {
-        let db = temp_db();
-        db.put_provider_provinces(&[sample_provider_province("ABJ", "北京市")])
-            .unwrap();
-
-        let got = db.resolve_provider_province_code("北京市").unwrap();
-
-        assert_eq!(got, "ABJ");
-    }
-
-    #[test]
-    fn provider_province_name_resolution_reports_missing_name() {
-        let db = temp_db();
-
-        let err = db.resolve_provider_province_code("不存在").unwrap_err();
-
-        assert!(
-            err.to_string()
-                .contains("provider province `不存在` not found")
+        // Keep the writer open and do not checkpoint: startup recovery must be
+        // able to observe a committed marker that still resides in the WAL.
+        assert_eq!(
+            inspect_pending_timezone(&path).unwrap().as_deref(),
+            Some("Asia/Shanghai")
         );
     }
 
     #[test]
-    fn provider_province_name_resolution_reports_ambiguous_name() {
-        let db = temp_db();
-        db.put_provider_provinces(&[
-            sample_provider_province("AAA", "重复省"),
-            sample_provider_province("BBB", "重复省"),
-        ])
-        .unwrap();
+    fn mismatched_pending_timezone_is_rejected_before_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("weather.db");
+        {
+            let db = DbInstance::open(path.clone(), "UTC").unwrap();
+            db.conn
+                .execute(
+                    r#"INSERT INTO engine_state(key, value, updated_at_unix_ms)
+                       VALUES (?1, 'Asia/Shanghai', ?2)"#,
+                    params![
+                        TIMEZONE_SYNC_PENDING_KEY,
+                        unix_timestamp_ms().unwrap_or_default()
+                    ],
+                )
+                .unwrap();
+        }
 
-        let err = db.resolve_provider_province_code("重复省").unwrap_err();
-
-        assert!(
-            err.to_string()
-                .contains("provider province `重复省` is ambiguous")
-        );
+        assert!(inspect_pending_timezone(&path).is_err());
+        assert!(DbInstance::open(path, "Asia/Shanghai").is_err());
     }
 
     #[test]
-    fn fetch_log_uses_unified_uuid_column() {
-        let db = temp_db();
-        let uuid = unified_station_uuid("北京-北京市-朝阳");
-        db.log_fetch(Some(&uuid), "rest/weather", true, None)
-            .unwrap();
+    fn timezone_collision_keeps_latest_complete_snapshot() {
+        let mut db = temp_db_with_timezone("America/Adak");
+        let name = "北京-北京市-朝阳";
+        let uuid = unified_station_uuid(name);
+        let mut older = sample_snapshot(name);
+        older.stale = true;
+        let newer = sample_snapshot(name);
+        let older_at = DateTime::parse_from_rfc3339("2026-06-24T08:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let newer_at = DateTime::parse_from_rfc3339("2026-06-24T10:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        insert_history_row(&db, &uuid, "2026-06-23", &older, older_at);
+        insert_history_row(&db, &uuid, "2026-06-24", &newer, newer_at);
 
-        let stored: String = db
+        assert_eq!(db.migrate_timezone("America/Adak", "UTC").unwrap(), 1);
+        let stored = db.get_latest_snapshot(&uuid).unwrap().unwrap();
+        assert_eq!(stored.fetched_at_unix_ms, newer_at);
+        assert!(!stored.snapshot.stale);
+        let count: i64 = db
             .conn
             .query_row(
-                "SELECT unified_uuid FROM upstream_fetch_log WHERE endpoint = 'rest/weather'",
+                "SELECT COUNT(*) FROM weather_snapshots_history",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(stored, uuid);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn timezone_failure_rolls_back_table_and_metadata() {
+        let mut db = temp_db_with_timezone("UTC");
+        let name = "北京-北京市-朝阳";
+        let uuid = unified_station_uuid(name);
+        let fetched_at = DateTime::parse_from_rfc3339("2026-06-23T23:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        insert_history_row(&db, &uuid, "2026-06-23", &sample_snapshot(name), fetched_at);
+        db.conn
+            .execute_batch(
+                r#"CREATE TRIGGER fail_timezone_update
+                   BEFORE UPDATE ON engine_state
+                   WHEN NEW.key = 'db_timezone'
+                   BEGIN SELECT RAISE(ABORT, 'injected'); END;"#,
+            )
+            .unwrap();
+
+        assert!(db.migrate_timezone("UTC", "Asia/Shanghai").is_err());
+        assert_eq!(db.get_db_timezone().unwrap().as_deref(), Some("UTC"));
+        let date: String = db
+            .conn
+            .query_row("SELECT date FROM weather_snapshots_history", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(date, "2026-06-23");
+    }
+
+    #[test]
+    fn fetch_log_retention_prunes_by_age_and_optional_row_limit() {
+        let mut db = temp_db();
+        let now = unix_timestamp_ms().unwrap_or_default();
+        for (index, timestamp) in [now - FETCH_LOG_RETENTION_MS - 1, now - 2, now - 1, now]
+            .into_iter()
+            .enumerate()
+        {
+            db.conn
+                .execute(
+                    r#"INSERT INTO upstream_fetch_log(
+                           endpoint, ok, fetched_at_unix_ms
+                       ) VALUES (?1, 1, ?2)"#,
+                    params![format!("endpoint-{index}"), timestamp],
+                )
+                .unwrap();
+        }
+        prune_fetch_logs(&db.conn, now, FETCH_LOG_RETENTION_MS, Some(2)).unwrap();
+        let endpoints: Vec<String> = db
+            .conn
+            .prepare("SELECT endpoint FROM upstream_fetch_log ORDER BY fetched_at_unix_ms")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(endpoints, vec!["endpoint-2", "endpoint-3"]);
+
+        db.log_fetch(None, "current", true, None).unwrap();
     }
 }

@@ -76,6 +76,26 @@ mod tests {
     }
 
     #[test]
+    fn fixed_outputs_preserve_the_v1_station_identity_space() {
+        assert_eq!(
+            unified_station_uuid("北京-北京市-朝阳"),
+            "4e77ce74-4c4d-5eb4-b81f-073d1f1b8979"
+        );
+        assert_eq!(
+            unified_station_uuid("湖北-湖北省-武汉"),
+            "29481a49-a728-53c8-9a4e-49bc3b138c89"
+        );
+        assert_eq!(
+            unified_station_uuid(""),
+            "f4c6ef55-abd4-5015-b1f4-7175ce636a9d"
+        );
+        assert_eq!(
+            unified_station_uuid("fixture"),
+            "3c78571a-ca24-58e6-a804-266dbda1eaa8"
+        );
+    }
+
+    #[test]
     fn distinct_for_different_input() {
         assert_ne!(
             unified_station_uuid("北京-北京市-朝阳"),

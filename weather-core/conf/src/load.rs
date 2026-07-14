@@ -1,12 +1,79 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
+use serde::Deserialize;
 use toml::Value;
 
 use crate::{
-    AppConfig, ComponentKind, ComponentRegistry, SUPPORTED_CONFIG_VERSION, default_config_toml,
+    AppConfig, DbConfig, EngineConfig, IpcConfig, SUPPORTED_CONFIG_VERSION, StationConfig,
+    UpdaterConfig, normalize_config_stations, normalize_station_name, write_config_atomic,
 };
+
+const FIRST_CONFIG_VERSION: u32 = 1;
+
+struct ConfigMigration {
+    /// Version produced by this migration.
+    version: u32,
+    name: &'static str,
+    apply: fn(&mut Value) -> Result<()>,
+}
+
+const CONFIG_MIGRATIONS: &[ConfigMigration] = &[ConfigMigration {
+    version: 2,
+    name: "remove legacy runtime fields",
+    apply: migrate_v1_to_v2,
+}];
+
+#[derive(Debug)]
+struct LoadedConfig {
+    config: AppConfig,
+    source_version: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyAppConfigV1 {
+    config_version: u32,
+    engine: EngineConfig,
+    ipc: LegacyIpcConfigV1,
+    db: LegacyDbConfigV1,
+    updater: UpdaterConfig,
+    daemon: LegacyDaemonConfigV1,
+    stations: Vec<StationConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyIpcConfigV1 {
+    transport: String,
+    rpc_endpoint: String,
+    pub_endpoint: String,
+    hmac: String,
+    hmac_key: String,
+    hmac_env_key_name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyDbConfigV1 {
+    path: String,
+    #[serde(rename = "lock_path")]
+    _lock_path: String,
+    timezone: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyDaemonConfigV1 {
+    #[serde(rename = "service_backend")]
+    _service_backend: String,
+    #[serde(rename = "foreground")]
+    _foreground: bool,
+    #[serde(rename = "service_scope")]
+    _service_scope: String,
+}
 
 /// 按 `ipc.hmac` 模式解析出实际 HMAC key。
 ///
@@ -35,7 +102,10 @@ pub fn resolve_hmac_key(config: &AppConfig) -> Result<Option<[u8; 32]>> {
 }
 
 pub fn load_or_default(path: &Path) -> Result<AppConfig> {
-    if path.exists() {
+    if path
+        .try_exists()
+        .with_context(|| format!("failed to inspect config {}", path.display()))?
+    {
         load_from_path(path)
     } else {
         let config = AppConfig::default();
@@ -45,124 +115,201 @@ pub fn load_or_default(path: &Path) -> Result<AppConfig> {
 }
 
 pub fn ensure_config_file(path: &Path) -> Result<()> {
-    if path.exists() {
+    if path
+        .try_exists()
+        .with_context(|| format!("failed to inspect config {}", path.display()))?
+    {
         return Ok(());
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create config directory {}", parent.display()))?;
     }
-    std::fs::write(path, default_config_toml())
-        .with_context(|| format!("failed to write default config {}", path.display()))?;
-    ComponentRegistry::for_config_path(path)?.record(ComponentKind::Config, path)?;
-    Ok(())
+    let config = AppConfig::default();
+    validate(&config)?;
+    write_config_atomic(path, &config)
+        .with_context(|| format!("failed to write default config {}", path.display()))
 }
 
 pub fn load_from_path(path: &Path) -> Result<AppConfig> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
-    validate_toml_compatibility(&content)
-        .map_err(|err| anyhow::anyhow!("config {} is incompatible: {err}", path.display()))?;
-    let config: AppConfig = toml::from_str(&content)
-        .with_context(|| format!("failed to parse TOML config {}", path.display()))?;
+    let loaded = load_from_str(&content)
+        .map_err(|err| anyhow::anyhow!("config {} is incompatible: {err:#}", path.display()))?;
+    validate(&loaded.config)?;
+    Ok(loaded.config)
+}
+
+/// Load, migrate and normalize the configuration after the engine owns its
+/// singleton lock. A legacy document is replaced atomically only after every
+/// migration and validation step succeeds.
+pub fn load_for_engine_startup(path: &Path) -> Result<AppConfig> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read config {}", path.display()))?;
+    let LoadedConfig {
+        mut config,
+        source_version,
+    } = load_from_str(&content)
+        .map_err(|err| anyhow::anyhow!("config {} is incompatible: {err:#}", path.display()))?;
+    let normalized = normalize_config_stations(&mut config);
     validate(&config)?;
+    if source_version != SUPPORTED_CONFIG_VERSION || normalized {
+        write_config_atomic(path, &config)?;
+    }
     Ok(config)
 }
 
-pub fn validate_toml_compatibility(content: &str) -> Result<()> {
-    let actual: Value = toml::from_str(content).context("failed to parse TOML config")?;
-    let supported: Value =
-        toml::from_str(&default_config_toml()).context("failed to parse default config")?;
-    let actual_version = actual
-        .get("config_version")
-        .and_then(Value::as_integer)
-        .and_then(|value| u32::try_from(value).ok());
-    let mut missing = Vec::new();
-    let mut extra = Vec::new();
-    collect_field_diff("", &supported, &actual, &mut missing, &mut extra);
-    missing.sort();
-    missing.dedup();
-    extra.sort();
-    extra.dedup();
+fn load_from_str(content: &str) -> Result<LoadedConfig> {
+    let value: Value = toml::from_str(content).context("failed to parse TOML config")?;
+    let source_version = config_version(&value)?;
+    let migrated = run_config_migrations(value, SUPPORTED_CONFIG_VERSION, CONFIG_MIGRATIONS)?;
+    let config: AppConfig = migrated
+        .try_into()
+        .context("failed to deserialize current config shape")?;
+    Ok(LoadedConfig {
+        config,
+        source_version,
+    })
+}
 
-    if actual_version != Some(SUPPORTED_CONFIG_VERSION) {
+fn run_config_migrations(
+    mut value: Value,
+    target_version: u32,
+    migrations: &[ConfigMigration],
+) -> Result<Value> {
+    validate_migration_registry(target_version, migrations)?;
+    let source_version = config_version(&value)?;
+    if source_version < FIRST_CONFIG_VERSION {
         bail!(
-            "config version incompatible: file config_version={}, engine supports {}\n{}",
-            actual_version
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "<missing>".to_string()),
-            SUPPORTED_CONFIG_VERSION,
-            format_field_diff(&missing, &extra)
+            "config_version {source_version} predates the earliest supported version {FIRST_CONFIG_VERSION}"
         );
     }
-    if !missing.is_empty() || !extra.is_empty() {
+    if source_version > target_version {
+        bail!("config_version {source_version} is newer than supported version {target_version}");
+    }
+
+    for migration in migrations
+        .iter()
+        .filter(|migration| migration.version > source_version)
+    {
+        (migration.apply)(&mut value).with_context(|| {
+            format!(
+                "config migration to v{} ({}) failed",
+                migration.version, migration.name
+            )
+        })?;
+        set_config_version(&mut value, migration.version).with_context(|| {
+            format!(
+                "config migration to v{} ({}) produced an invalid document",
+                migration.version, migration.name
+            )
+        })?;
+    }
+
+    Ok(value)
+}
+
+fn validate_migration_registry(target_version: u32, migrations: &[ConfigMigration]) -> Result<()> {
+    if target_version < FIRST_CONFIG_VERSION {
+        bail!("invalid target config version {target_version}");
+    }
+    let expected_len = usize::try_from(target_version - FIRST_CONFIG_VERSION)
+        .context("target config version does not fit in usize")?;
+    if migrations.len() != expected_len {
         bail!(
-            "unsupported config fields\n{}",
-            format_field_diff(&missing, &extra)
+            "config migration registry must contain {expected_len} steps through v{target_version}, found {}",
+            migrations.len()
         );
+    }
+    for (index, migration) in migrations.iter().enumerate() {
+        let expected = FIRST_CONFIG_VERSION + u32::try_from(index)? + 1;
+        if migration.version != expected {
+            bail!(
+                "config migration registry gap: expected target v{expected}, found v{} ({})",
+                migration.version,
+                migration.name
+            );
+        }
     }
     Ok(())
 }
 
-fn collect_field_diff(
-    prefix: &str,
-    supported: &Value,
-    actual: &Value,
-    missing: &mut Vec<String>,
-    extra: &mut Vec<String>,
-) {
-    match (supported, actual) {
-        (Value::Table(supported), Value::Table(actual)) => {
-            for (key, supported_value) in supported {
-                let path = join_path(prefix, key);
-                match actual.get(key) {
-                    Some(actual_value) => {
-                        collect_field_diff(&path, supported_value, actual_value, missing, extra)
-                    }
-                    None => missing.push(path),
-                }
-            }
-            for key in actual.keys() {
-                if !supported.contains_key(key) {
-                    extra.push(join_path(prefix, key));
-                }
-            }
-        }
-        (Value::Array(supported), Value::Array(actual)) => {
-            if let Some(supported_item) = supported.first() {
-                for actual_item in actual {
-                    collect_field_diff(prefix, supported_item, actual_item, missing, extra);
-                }
-            }
-        }
-        _ => {}
-    }
+fn config_version(value: &Value) -> Result<u32> {
+    let raw = value
+        .as_table()
+        .context("config root must be a TOML table")?
+        .get("config_version")
+        .context("missing required config_version")?
+        .as_integer()
+        .context("config_version must be a non-negative integer")?;
+    u32::try_from(raw).context("config_version must fit in u32")
 }
 
-fn join_path(prefix: &str, key: &str) -> String {
-    if prefix.is_empty() {
-        key.to_string()
-    } else {
-        format!("{prefix}.{key}")
-    }
+fn set_config_version(value: &mut Value, version: u32) -> Result<()> {
+    let table = value
+        .as_table_mut()
+        .context("config root must remain a TOML table")?;
+    table.insert(
+        "config_version".to_string(),
+        Value::Integer(i64::from(version)),
+    );
+    Ok(())
 }
 
-fn format_field_diff(missing: &[String], extra: &[String]) -> String {
-    let mut lines = Vec::new();
-    if !missing.is_empty() {
-        lines.push("missing fields:".to_string());
-        lines.extend(missing.iter().map(|field| format!("  - {field}")));
+fn migrate_v1_to_v2(value: &mut Value) -> Result<()> {
+    let legacy: LegacyAppConfigV1 = value
+        .clone()
+        .try_into()
+        .context("invalid v1 config shape")?;
+    let LegacyAppConfigV1 {
+        config_version,
+        engine,
+        ipc,
+        db,
+        updater,
+        daemon,
+        stations,
+    } = legacy;
+    let LegacyIpcConfigV1 {
+        transport,
+        rpc_endpoint,
+        pub_endpoint,
+        hmac,
+        hmac_key,
+        hmac_env_key_name,
+    } = ipc;
+    if transport != "tcp" {
+        bail!("only legacy ipc.transport = \"tcp\" can be migrated");
     }
-    if !extra.is_empty() {
-        lines.push("extra fields:".to_string());
-        lines.extend(extra.iter().map(|field| format!("  - {field}")));
-    }
-    if lines.is_empty() {
-        lines.push("missing fields:".to_string());
-        lines.push("  - <none>".to_string());
-        lines.push("extra fields:".to_string());
-        lines.push("  - <none>".to_string());
-    }
-    lines.join("\n")
+    let LegacyDbConfigV1 {
+        path,
+        _lock_path: _,
+        timezone,
+    } = db;
+    let LegacyDaemonConfigV1 {
+        _service_backend: _,
+        _foreground: _,
+        _service_scope: _,
+    } = daemon;
+    let current = AppConfig {
+        config_version,
+        engine,
+        ipc: IpcConfig {
+            rpc_endpoint,
+            pub_endpoint,
+            hmac,
+            hmac_key,
+            hmac_env_key_name,
+        },
+        db: DbConfig { path, timezone },
+        updater,
+        stations,
+    };
+    *value = Value::try_from(current).context("failed to construct v2 config")?;
+    Ok(())
 }
 
 pub fn validate(config: &AppConfig) -> Result<()> {
@@ -172,9 +319,6 @@ pub fn validate(config: &AppConfig) -> Result<()> {
             config.config_version,
             SUPPORTED_CONFIG_VERSION
         );
-    }
-    if config.ipc.transport != "tcp" {
-        bail!("only ipc.transport = \"tcp\" is implemented in this build");
     }
     if !config.ipc.rpc_endpoint.starts_with("tcp://") {
         bail!("ipc.rpc_endpoint must be a tcp:// endpoint");
@@ -228,9 +372,14 @@ pub fn validate(config: &AppConfig) -> Result<()> {
     {
         bail!("updater.default_provider must match a configured provider");
     }
+    let mut station_names = HashSet::new();
     for station in &config.stations {
-        if station.enabled && station.name.trim().is_empty() {
-            bail!("enabled station.name must not be empty");
+        let normalized = normalize_station_name(&station.name);
+        if normalized.is_empty() {
+            bail!("station.name must not be empty");
+        }
+        if !station_names.insert(normalized.clone()) {
+            bail!("duplicate station.name `{normalized}` after normalization");
         }
     }
     Ok(())
@@ -239,7 +388,10 @@ pub fn validate(config: &AppConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{AppConfig, IpcConfig};
+    use crate::{
+        default_config_toml,
+        types::{AppConfig, IpcConfig},
+    };
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -262,9 +414,68 @@ mod tests {
         ))
     }
 
+    fn legacy_v1_value() -> Value {
+        let mut value: Value = toml::from_str(&default_config_toml()).unwrap();
+        let root = value.as_table_mut().unwrap();
+        root.insert("config_version".to_string(), Value::Integer(1));
+        root.get_mut("ipc")
+            .and_then(Value::as_table_mut)
+            .unwrap()
+            .insert("transport".to_string(), Value::String("tcp".to_string()));
+        root.get_mut("db")
+            .and_then(Value::as_table_mut)
+            .unwrap()
+            .insert(
+                "lock_path".to_string(),
+                Value::String("weather.db.lock".to_string()),
+            );
+        root.insert(
+            "daemon".to_string(),
+            Value::Table(toml::toml! {
+                service_backend = "auto"
+                foreground = true
+                service_scope = "user"
+            }),
+        );
+        value
+    }
+
+    fn legacy_v1_toml() -> String {
+        toml::to_string_pretty(&legacy_v1_value()).unwrap()
+    }
+
+    fn synthetic_v3_migration(_value: &mut Value) -> Result<()> {
+        Ok(())
+    }
+
+    fn failing_v3_migration(value: &mut Value) -> Result<()> {
+        value
+            .as_table_mut()
+            .unwrap()
+            .insert("partial".to_string(), Value::Boolean(true));
+        bail!("injected migration failure")
+    }
+
     #[test]
     fn valid_config_passes() {
         assert!(validate(&base_config()).is_ok());
+    }
+
+    #[test]
+    fn ensuring_config_has_no_component_manifest_side_effect() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("weather.toml");
+
+        ensure_config_file(&path).unwrap();
+
+        assert!(path.is_file());
+        assert!(!directory.path().join("component-manifest.toml").exists());
+        assert!(
+            !directory
+                .path()
+                .join("component-manifest.toml.lock")
+                .exists()
+        );
     }
 
     #[test]
@@ -277,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_missing_config_version_with_field_diff() {
+    fn load_rejects_missing_config_version() {
         let path = temp_config_path("missing-version");
         let mut content = default_config_toml();
         content = content
@@ -287,79 +498,215 @@ mod tests {
             .join("\n");
         std::fs::write(&path, content).unwrap();
 
-        let err = load_from_path(&path).unwrap_err().to_string();
+        let err = load_from_path(&path).unwrap_err();
 
         let _ = std::fs::remove_file(&path);
-        assert!(err.contains("config version incompatible"), "{err}");
-        assert!(err.contains("file config_version=<missing>"), "{err}");
-        assert!(err.contains("missing fields:"), "{err}");
-        assert!(err.contains("config_version"), "{err}");
+        assert!(format!("{err:#}").contains("missing required config_version"));
     }
 
     #[test]
-    fn load_rejects_old_enable_hmac_field_as_extra() {
-        let path = temp_config_path("old-hmac");
-        let mut value: toml::Value = toml::from_str(&default_config_toml()).unwrap();
+    fn current_shape_rejects_unknown_fields() {
+        let path = temp_config_path("current-unknown");
+        let mut value: Value = toml::from_str(&default_config_toml()).unwrap();
         value
             .get_mut("ipc")
-            .and_then(toml::Value::as_table_mut)
+            .and_then(Value::as_table_mut)
             .unwrap()
             .insert("enable_hmac".to_string(), toml::Value::Boolean(true));
         std::fs::write(&path, toml::to_string_pretty(&value).unwrap()).unwrap();
 
-        let err = load_from_path(&path).unwrap_err().to_string();
+        let err = load_from_path(&path).unwrap_err();
 
         let _ = std::fs::remove_file(&path);
-        assert!(err.contains("unsupported config fields"), "{err}");
-        assert!(err.contains("extra fields:"), "{err}");
-        assert!(err.contains("ipc.enable_hmac"), "{err}");
+        assert!(format!("{err:#}").contains("unknown field `enable_hmac`"));
     }
 
     #[test]
-    fn load_rejects_missing_required_nested_field() {
-        let path = temp_config_path("missing-nested");
-        let mut value: toml::Value = toml::from_str(&default_config_toml()).unwrap();
+    fn legacy_v1_shape_rejects_missing_fields() {
+        let path = temp_config_path("legacy-missing");
+        let mut value = legacy_v1_value();
         value
             .get_mut("ipc")
-            .and_then(toml::Value::as_table_mut)
+            .and_then(Value::as_table_mut)
             .unwrap()
             .remove("hmac_env_key_name");
         std::fs::write(&path, toml::to_string_pretty(&value).unwrap()).unwrap();
 
-        let err = load_from_path(&path).unwrap_err().to_string();
+        let err = load_from_path(&path).unwrap_err();
 
         let _ = std::fs::remove_file(&path);
-        assert!(err.contains("unsupported config fields"), "{err}");
-        assert!(err.contains("missing fields:"), "{err}");
-        assert!(err.contains("ipc.hmac_env_key_name"), "{err}");
+        assert!(format!("{err:#}").contains("missing field `hmac_env_key_name`"));
     }
 
     #[test]
-    fn load_rejects_extra_array_table_field() {
-        let path = temp_config_path("extra-array-field");
-        let mut value: toml::Value = toml::from_str(&default_config_toml()).unwrap();
+    fn legacy_v1_shape_rejects_unknown_fields() {
+        let path = temp_config_path("legacy-unknown");
+        let mut value = legacy_v1_value();
+        value
+            .get_mut("daemon")
+            .and_then(Value::as_table_mut)
+            .unwrap()
+            .insert("unexpected".to_string(), Value::Boolean(true));
+        std::fs::write(&path, toml::to_string_pretty(&value).unwrap()).unwrap();
+
+        let err = load_from_path(&path).unwrap_err();
+
+        let _ = std::fs::remove_file(&path);
+        assert!(format!("{err:#}").contains("unknown field `unexpected`"));
+    }
+
+    #[test]
+    fn legacy_v1_rejects_non_tcp_transport() {
+        let mut value = legacy_v1_value();
+        value
+            .get_mut("ipc")
+            .and_then(Value::as_table_mut)
+            .unwrap()
+            .insert("transport".to_string(), Value::String("ipc".to_string()));
+
+        let err = load_from_str(&toml::to_string_pretty(&value).unwrap()).unwrap_err();
+
+        assert!(format!("{err:#}").contains("legacy ipc.transport"));
+    }
+
+    #[test]
+    fn legacy_v1_load_is_read_only() {
+        let path = temp_config_path("legacy-read-only");
+        let content = legacy_v1_toml();
+        std::fs::write(&path, &content).unwrap();
+
+        let loaded = load_from_path(&path).unwrap();
+
+        assert_eq!(loaded, AppConfig::default());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn engine_startup_persists_migration_and_normalization_once() {
+        let path = temp_config_path("legacy-engine-startup");
+        let mut value = legacy_v1_value();
         value
             .get_mut("stations")
-            .and_then(toml::Value::as_array_mut)
+            .and_then(Value::as_array_mut)
             .unwrap()[0]
             .as_table_mut()
             .unwrap()
-            .insert("legacy".to_string(), toml::Value::Boolean(true));
+            .insert(
+                "name".to_string(),
+                Value::String(" 北京 - 北京市 ".to_string()),
+            );
         std::fs::write(&path, toml::to_string_pretty(&value).unwrap()).unwrap();
 
-        let err = load_from_path(&path).unwrap_err().to_string();
+        let loaded = load_for_engine_startup(&path).unwrap();
+        let persisted = std::fs::read_to_string(&path).unwrap();
 
-        let _ = std::fs::remove_file(&path);
-        assert!(err.contains("unsupported config fields"), "{err}");
-        assert!(err.contains("extra fields:"), "{err}");
-        assert!(err.contains("stations.legacy"), "{err}");
+        assert_eq!(loaded.config_version, SUPPORTED_CONFIG_VERSION);
+        assert_eq!(loaded.stations[0].name, "北京-北京市");
+        assert!(!persisted.contains("transport ="));
+        assert!(!persisted.contains("lock_path = \"weather.db.lock\""));
+        assert!(!persisted.contains("[daemon]"));
+        assert!(persisted.contains("lock_path = \"engine.lock\""));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn rejects_non_tcp_transport() {
-        let mut config = base_config();
-        config.ipc.transport = "ipc".to_string();
-        assert!(validate(&config).is_err());
+    fn migration_runner_accepts_an_appended_contiguous_step() {
+        let migrations = [
+            ConfigMigration {
+                version: 2,
+                name: "v2",
+                apply: migrate_v1_to_v2,
+            },
+            ConfigMigration {
+                version: 3,
+                name: "v3",
+                apply: synthetic_v3_migration,
+            },
+        ];
+
+        let migrated = run_config_migrations(legacy_v1_value(), 3, &migrations).unwrap();
+
+        assert_eq!(config_version(&migrated).unwrap(), 3);
+    }
+
+    #[test]
+    fn migration_runner_rejects_registry_gaps() {
+        let migrations = [
+            ConfigMigration {
+                version: 2,
+                name: "v2",
+                apply: migrate_v1_to_v2,
+            },
+            ConfigMigration {
+                version: 4,
+                name: "v4",
+                apply: synthetic_v3_migration,
+            },
+        ];
+
+        let err = run_config_migrations(legacy_v1_value(), 3, &migrations).unwrap_err();
+
+        assert!(err.to_string().contains("registry gap"), "{err:#}");
+    }
+
+    #[test]
+    fn failed_migration_does_not_expose_partial_mutation() {
+        let migrations = [
+            ConfigMigration {
+                version: 2,
+                name: "v2",
+                apply: migrate_v1_to_v2,
+            },
+            ConfigMigration {
+                version: 3,
+                name: "failing v3",
+                apply: failing_v3_migration,
+            },
+        ];
+        let original: Value = toml::from_str(&default_config_toml()).unwrap();
+
+        assert!(run_config_migrations(original.clone(), 3, &migrations).is_err());
+        assert!(original.get("partial").is_none());
+    }
+
+    #[test]
+    fn rejects_future_missing_and_invalid_versions() {
+        let mut future: Value = toml::from_str(&default_config_toml()).unwrap();
+        set_config_version(&mut future, SUPPORTED_CONFIG_VERSION + 1).unwrap();
+        assert!(
+            format!(
+                "{:#}",
+                run_config_migrations(future, SUPPORTED_CONFIG_VERSION, CONFIG_MIGRATIONS,)
+                    .unwrap_err()
+            )
+            .contains("newer than supported")
+        );
+
+        let mut missing: Value = toml::from_str(&default_config_toml()).unwrap();
+        missing.as_table_mut().unwrap().remove("config_version");
+        assert!(
+            format!(
+                "{:#}",
+                run_config_migrations(missing, SUPPORTED_CONFIG_VERSION, CONFIG_MIGRATIONS,)
+                    .unwrap_err()
+            )
+            .contains("missing required config_version")
+        );
+
+        let mut invalid: Value = toml::from_str(&default_config_toml()).unwrap();
+        invalid.as_table_mut().unwrap().insert(
+            "config_version".to_string(),
+            Value::String("two".to_string()),
+        );
+        assert!(
+            format!(
+                "{:#}",
+                run_config_migrations(invalid, SUPPORTED_CONFIG_VERSION, CONFIG_MIGRATIONS,)
+                    .unwrap_err()
+            )
+            .contains("non-negative integer")
+        );
     }
 
     #[test]
@@ -424,6 +771,39 @@ mod tests {
             enabled: true,
         }];
         assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_disabled_station() {
+        let mut config = base_config();
+        config.stations = vec![crate::types::StationConfig {
+            name: " -  - ".to_string(),
+            enabled: false,
+        }];
+
+        let err = validate(&config).unwrap_err().to_string();
+
+        assert!(err.contains("station.name must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn rejects_station_duplicates_after_normalization() {
+        let mut config = base_config();
+        config.stations = vec![
+            crate::types::StationConfig {
+                name: "北京 - 北京市 - 朝阳".to_string(),
+                enabled: true,
+            },
+            crate::types::StationConfig {
+                name: "北京-北京市-朝阳".to_string(),
+                enabled: false,
+            },
+        ];
+
+        let err = validate(&config).unwrap_err().to_string();
+
+        assert!(err.contains("duplicate station.name"), "{err}");
+        assert!(err.contains("北京-北京市-朝阳"), "{err}");
     }
 
     #[test]
