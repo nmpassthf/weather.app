@@ -4,7 +4,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicI64, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -512,7 +512,11 @@ async fn wait_for_internal_terminal(
     events: &mut tokio::sync::broadcast::Receiver<(String, EventEnvelope)>,
     uuid: &str,
 ) -> Result<()> {
-    for _ in 0..20_000 {
+    // The caller pauses Tokio time, so use wall-clock time while yielding to
+    // the refresh task and DB actor. A fixed yield count can be exhausted
+    // before those tasks are scheduled on a loaded CI runner.
+    let deadline = Instant::now() + WAIT_TIMEOUT;
+    loop {
         match events.try_recv() {
             Ok((topic, envelope))
                 if topic == TOPIC_ENGINE_REFRESH && envelope.kind == EventKind::Refresh as i32 =>
@@ -534,8 +538,10 @@ async fn wait_for_internal_terminal(
                 bail!("internal event channel closed before refresh terminal");
             }
         }
+        if Instant::now() >= deadline {
+            bail!("refresh terminal was not observed within {WAIT_TIMEOUT:?}");
+        }
     }
-    bail!("refresh terminal was not observed within bounded yields")
 }
 
 #[tokio::test]
