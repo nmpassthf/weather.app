@@ -272,9 +272,21 @@ body::before {
 .chart-interaction-hint { opacity: 0.78; }
 .history-chart[data-inspecting="true"] .chart-line { filter: drop-shadow(0 0 3px color-mix(in srgb, var(--accent), transparent 52%)); }
 .extra-content { display: grid; grid-template-columns: 1.3fr 1fr; gap: 18px; }
-.climate-block { padding: 16px; border-radius: 14px; background: var(--surface-muted); }
-.climate-months { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; margin-top: 12px; }
-.climate-months span { color: var(--muted); font-size: 10px; }
+.climate-block { min-width: 0; padding: 16px; border-radius: 14px; background: var(--surface-muted); }
+.climate-header { display: flex; min-width: 0; align-items: end; justify-content: space-between; gap: 12px; }
+.climate-header > div { display: grid; gap: 4px; }
+.climate-header h3 { margin: 0; font-size: 13px; }
+.climate-period { min-width: 0; overflow: hidden; color: var(--muted); font-size: 9px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+.climate-months { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; margin: 12px 0 0; padding: 0; list-style: none; }
+.climate-month { min-width: 0; padding: 9px; border: 1px solid color-mix(in srgb, var(--line), transparent 24%); border-radius: 10px; background: color-mix(in srgb, var(--surface-solid), transparent 45%); }
+.climate-month-label { display: block; color: var(--text); font-size: 11px; font-variant-numeric: tabular-nums; }
+.climate-values { display: grid; gap: 5px; margin: 8px 0 0; }
+.climate-values > div { display: flex; min-width: 0; align-items: baseline; justify-content: space-between; gap: 5px; }
+.climate-values dt { overflow: hidden; color: var(--muted); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.climate-values dd { flex: 0 0 auto; margin: 0; color: var(--text); font-size: 9px; font-weight: 750; font-variant-numeric: tabular-nums; }
+.climate-values [data-metric="high"] dd { color: var(--danger); }
+.climate-values [data-metric="low"] dd { color: var(--accent); }
+.climate-values [data-metric="rain"] dd { color: color-mix(in srgb, var(--accent), var(--text) 25%); }
 .radar-block { position: relative; min-height: 160px; overflow: hidden; border-radius: 14px; background: var(--surface-muted); color: white; }
 .radar-block img { width: 100%; height: 100%; min-height: 160px; object-fit: cover; transition: transform 180ms ease, filter 180ms ease; }
 .radar-block span { position: absolute; right: 12px; bottom: 12px; left: 12px; padding: 8px; border-radius: 8px; background: rgba(13, 38, 51, 0.7); font-size: 11px; }

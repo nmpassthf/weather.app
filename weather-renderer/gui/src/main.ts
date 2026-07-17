@@ -60,6 +60,7 @@ const activity: Array<{ time: string; message: string; level: string }> = [];
 const SEARCH_DEBOUNCE_MS = 220;
 const STATION_SUMMARY_CONCURRENCY = 2;
 const RESOURCE_URL_CACHE_SIZE = 10;
+const climateNumberFormat = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 1 });
 const resourceUrls = new Map<string, string>();
 const resourceRequests = new Map<string, Promise<string>>();
 let radarRenderToken = 0;
@@ -1549,6 +1550,25 @@ function bindDailyTemperatureChartInteractions(
   };
 }
 
+function climatePeriodLabel(input: string | null | undefined): string {
+  const period = input?.trim().replace(/\s*(?:气候)?常年值\s*$/u, "").trim();
+  if (!period) return "—";
+  const yearRange = period.match(/^(\d{4})\s*(?:-|–|—|~|至)\s*(\d{4})(?:年)?$/u);
+  return yearRange ? `${yearRange[1]}—${yearRange[2]}` : period;
+}
+
+function climateMonthLabel(input: number | null | undefined): string {
+  return typeof input === "number" && Number.isInteger(input) && input >= 1 && input <= 12
+    ? `${input}月`
+    : "—";
+}
+
+function climateValue(input: number | null | undefined, suffix: string): string {
+  return typeof input === "number" && Number.isFinite(input)
+    ? `${climateNumberFormat.format(input)}${suffix}`
+    : "—";
+}
+
 function renderExtra(weather: WeatherSnapshot | null, placeholder = false): void {
   closeImageViewer(false);
   dailyTemperatureInteractionCleanup?.();
@@ -1557,18 +1577,50 @@ function renderExtra(weather: WeatherSnapshot | null, placeholder = false): void
   const renderToken = ++radarRenderToken;
   const target = element<HTMLDivElement>("extra-content");
   target.replaceChildren();
-  const climate = document.createElement("div");
+  const climate = document.createElement("section");
   climate.className = "climate-block";
-  const climateTitle = document.createElement("strong");
-  climateTitle.textContent = placeholder ? "—" : weather?.climate?.period || "气候常年值";
-  climate.append(climateTitle);
+  const climateHeader = document.createElement("header");
+  climateHeader.className = "climate-header";
+  const climateHeading = document.createElement("div");
+  const climateKicker = document.createElement("span");
+  climateKicker.className = "section-kicker";
+  climateKicker.textContent = "气候资料";
+  const climateTitle = document.createElement("h3");
+  climateTitle.textContent = "气候常年值";
+  climateHeading.append(climateKicker, climateTitle);
+  const climatePeriod = document.createElement("small");
+  climatePeriod.className = "climate-period";
+  climatePeriod.textContent = placeholder ? "—" : climatePeriodLabel(weather?.climate?.period);
+  climateHeader.append(climateHeading, climatePeriod);
+  climate.append(climateHeader);
   const months = placeholder ? Array.from({ length: 12 }, () => null) : weather?.climate?.month ?? [];
   if (months.length) {
-    const list = document.createElement("div");
+    const list = document.createElement("ol");
     list.className = "climate-months";
     for (const month of months.slice(0, 12)) {
-      const item = document.createElement("span");
-      item.textContent = `${month?.month ?? "—"}月 ${value(month?.average_max_temperature, "°", 0)}/${value(month?.average_min_temperature, "°", 0)}`;
+      const item = document.createElement("li");
+      item.className = "climate-month";
+      const monthLabel = document.createElement("strong");
+      monthLabel.className = "climate-month-label";
+      monthLabel.textContent = climateMonthLabel(month?.month);
+      const values = document.createElement("dl");
+      values.className = "climate-values";
+      const metrics = [
+        ["平均高温", climateValue(month?.average_max_temperature, "°"), "high"],
+        ["平均低温", climateValue(month?.average_min_temperature, "°"), "low"],
+        ["降水", climateValue(month?.precipitation, " mm"), "rain"],
+      ] as const;
+      for (const [label, metric, kind] of metrics) {
+        const row = document.createElement("div");
+        row.dataset.metric = kind;
+        const name = document.createElement("dt");
+        name.textContent = label;
+        const reading = document.createElement("dd");
+        reading.textContent = metric;
+        row.append(name, reading);
+        values.append(row);
+      }
+      item.append(monthLabel, values);
       list.append(item);
     }
     climate.append(list);
