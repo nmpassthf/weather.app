@@ -21,7 +21,7 @@ use zeromq::{
     DealerRecvHalf, DealerSendHalf, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage,
 };
 
-pub(crate) use self::failure::RemoteRpcError;
+pub use self::failure::RemoteRpcError;
 use self::{
     failure::ClientFailure,
     pending::{PendingLease, PendingRegistry, RegisterError},
@@ -29,12 +29,15 @@ use self::{
 };
 use crate::pagination::PageCursor;
 
-const ENGINE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+// Network-backed engine RPCs use a provider-derived server budget. Keep the
+// transport deadline above that budget while ordinary RPCs still terminate at
+// the engine's shorter configured timeout.
+const ENGINE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const RPC_SEND_QUEUE: usize = 64;
 
 /// 引擎客户端：DEALER 走 RPC，SUB 订阅 PUB 事件。
 #[derive(Clone)]
-pub(crate) struct EngineClient {
+pub struct EngineClient {
     inner: Arc<ClientInner>,
 }
 
@@ -54,12 +57,12 @@ impl Drop for ClientInner {
 
 /// 解析后的事件，附带 topic。
 #[derive(Debug, Clone)]
-pub(crate) struct EngineEvent {
+pub struct EngineEvent {
     pub topic: String,
     pub envelope: EventEnvelope,
 }
 
-pub(crate) fn require_config(
+pub fn require_config(
     config: Option<weather_schema::AppConfig>,
     operation: &str,
 ) -> Result<weather_schema::AppConfig> {
@@ -68,7 +71,7 @@ pub(crate) fn require_config(
 
 impl EngineClient {
     /// 连接到 RPC 与 PUB endpoint，启动收发后台任务。
-    pub(crate) async fn connect(
+    pub async fn connect(
         rpc_endpoint: String,
         pub_endpoint: String,
         hmac_key: Option<[u8; 32]>,
@@ -113,7 +116,7 @@ impl EngineClient {
     }
 
     /// 订阅引擎事件流。
-    pub(crate) fn subscribe_events(&self) -> broadcast::Receiver<EngineEvent> {
+    pub fn subscribe_events(&self) -> broadcast::Receiver<EngineEvent> {
         self.inner
             .events
             .lock()
@@ -122,19 +125,19 @@ impl EngineClient {
     }
 
     /// 关闭共享客户端会话并等待所有 socket task 退出。
-    pub(crate) async fn close(&self) {
+    pub async fn close(&self) {
         self.inner.session.close().await;
     }
 
-    pub(crate) async fn status(&self) -> Result<EngineStatus> {
+    pub async fn status(&self) -> Result<EngineStatus> {
         self.request(RpcKind::GetEngineStatus, Empty {}).await
     }
 
-    pub(crate) async fn shutdown(&self) -> Result<Empty> {
+    pub async fn shutdown(&self) -> Result<Empty> {
         self.request(RpcKind::Shutdown, Empty {}).await
     }
 
-    pub(crate) async fn shutdown_if_owned(&self, owner_token: &str) -> Result<Empty> {
+    pub async fn shutdown_if_owned(&self, owner_token: &str) -> Result<Empty> {
         self.request(
             RpcKind::Shutdown,
             ShutdownRequest {
@@ -144,7 +147,7 @@ impl EngineClient {
         .await
     }
 
-    pub(crate) async fn configured_stations(
+    pub async fn configured_stations(
         &self,
         offset: u32,
         page_size: u32,
@@ -159,19 +162,19 @@ impl EngineClient {
         .await
     }
 
-    pub(crate) async fn all_configured_stations(&self) -> Result<ListConfiguredStationsResponse> {
+    pub async fn all_configured_stations(&self) -> Result<ListConfiguredStationsResponse> {
         collect_configured_stations(|offset, page_size| self.configured_stations(offset, page_size))
             .await
     }
 
     /// 拉取 engine 当前 config（`defaults=true` 拿默认模板）。
-    pub(crate) async fn get_config(&self, defaults: bool) -> Result<GetConfigResponse> {
+    pub async fn get_config(&self, defaults: bool) -> Result<GetConfigResponse> {
         self.request(RpcKind::GetConfig, GetConfigRequest { defaults })
             .await
     }
 
     /// 下发整份 config，engine validate + 锁定不可变字段 + 持久化后返回最终值。
-    pub(crate) async fn update_config(
+    pub async fn update_config(
         &self,
         config: weather_schema::AppConfig,
     ) -> Result<UpdateConfigResponse> {
@@ -185,7 +188,7 @@ impl EngineClient {
     }
 
     /// 发送一个 RPC 请求并等待响应。
-    pub(crate) async fn request<Req, Resp>(&self, kind: RpcKind, payload: Req) -> Result<Resp>
+    pub async fn request<Req, Resp>(&self, kind: RpcKind, payload: Req) -> Result<Resp>
     where
         Req: Message,
         Resp: Message + Default,
@@ -197,7 +200,7 @@ impl EngineClient {
             if Instant::now() >= deadline {
                 return Err(request_timeout_error(timeout));
             }
-            let request_id = correlation_id("tui-request");
+            let request_id = correlation_id("renderer-request");
             match self.inner.pending.register(request_id.clone()) {
                 Ok(lease) => break (request_id, lease),
                 Err(RegisterError::Collision) => continue,
@@ -535,6 +538,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn one_deadline_covers_queue_and_response_wait() {
+        let request_timeout = Duration::from_secs(30);
         let pending = PendingRegistry::new();
         let lease = pending.register("request".to_string()).unwrap();
         let (rpc_send, mut outbox) = mpsc::channel(1);
@@ -543,8 +547,8 @@ mod tests {
             rpc_send,
             vec![1],
             lease,
-            Instant::now() + ENGINE_REQUEST_TIMEOUT,
-            ENGINE_REQUEST_TIMEOUT,
+            Instant::now() + request_timeout,
+            request_timeout,
         ));
         tokio::task::yield_now().await;
 

@@ -118,8 +118,7 @@ impl PanelFocus {
                 .snapshot
                 .as_ref()
                 .and_then(|snapshot| snapshot.real.as_ref())
-                .and_then(|real| real.alert.as_ref())
-                .is_none(),
+                .is_none_or(|real| real.alerts.is_empty()),
             _ => false,
         }
     }

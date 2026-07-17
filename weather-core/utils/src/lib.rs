@@ -127,6 +127,63 @@ impl JsonHttpClient {
             .with_context(|| format!("failed to parse JSON response from {url}"))?;
         Ok((url, body))
     }
+
+    pub async fn get_binary_url(&self, url: &Url, max_bytes: usize) -> Result<(String, Vec<u8>)> {
+        if max_bytes == 0 {
+            anyhow::bail!("binary response limit must be greater than zero");
+        }
+        let mut attempt = 1;
+        let mut retry_delay = INITIAL_CONNECT_RETRY_DELAY;
+        let response = loop {
+            match self.client.get(url.clone()).send().await {
+                Ok(response) => break response,
+                Err(err) if err.is_connect() && attempt < MAX_CONNECT_ATTEMPTS => {
+                    tokio::time::sleep(retry_delay).await;
+                    attempt += 1;
+                    retry_delay = retry_delay.saturating_mul(2);
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("binary request failed for {url} after {attempt} attempts")
+                    });
+                }
+            }
+        };
+        let mut response = response
+            .error_for_status()
+            .with_context(|| format!("HTTP status error for {url}"))?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_bytes as u64)
+        {
+            anyhow::bail!("binary response from {url} exceeds {max_bytes} bytes");
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("application/octet-stream")
+            .to_ascii_lowercase();
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .with_context(|| format!("failed to read binary response from {url}"))?
+        {
+            let next_len = body
+                .len()
+                .checked_add(chunk.len())
+                .context("binary response size overflow")?;
+            if next_len > max_bytes {
+                anyhow::bail!("binary response from {url} exceeds {max_bytes} bytes");
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok((content_type, body))
+    }
 }
 
 fn proxy_environment_value(uppercase: &str, lowercase: &str) -> Option<String> {

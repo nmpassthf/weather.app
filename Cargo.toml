@@ -10,6 +10,8 @@ members = [
   "weather-core/updater",
   "weather-core/engine",
   "weather-core/daemon",
+  "weather-renderer/common",
+  "weather-renderer/gui/src-tauri",
   "weather-renderer/tui",
 ]
 
@@ -51,3 +53,5 @@ url = "2.5"
 uuid = { version = "1.23", features = ["v4"] }
 zeromq = "0.6"
 crossterm = "0.29"
+tauri = { version = "2.8", features = ["devtools"] }
+tauri-build = "2.4"

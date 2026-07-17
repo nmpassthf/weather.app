@@ -4,7 +4,8 @@
 
 This is a Rust 2024 workspace organized around three top-level layers: protocol, core backend, and frontend renderers. The root `Cargo.toml` manages all crates. The current main binaries are:
 
-- `weather-tui`: the current user-facing CLI/TUI frontend implementation.
+- `weather-tui`: the user-facing CLI/TUI frontend implementation.
+- `weather-gui`: the Tauri desktop frontend implementation.
 - `weather-daemon`: the local engine daemon and foreground supervisor.
 
 `Makefile` is mainly for static release builds. `scripts/` contains NMC upstream inspection scripts. `todo/` and `docs/superpowers/` are historical design and planning material; current code structure takes priority.
@@ -41,7 +42,7 @@ Process and service management layer. Daemon provides `run`, `probe`, and `servi
 
 ### `weather-renderer`
 
-Public frontend family, not a synonym for TUI. `weather-renderer/tui` is only the current implementation; its crate and binary name is `weather-tui`. Future GUI, Web, or CUI variants should also live under the renderer family and work through schema/engine interfaces.
+Public frontend family, not a synonym for TUI. `weather-renderer/common` owns the engine client, pagination, and daemon supervision shared by renderers. `weather-renderer/tui` provides the `weather-tui` binary, while `weather-renderer/gui` provides the Tauri-based `weather-gui` desktop app. Both work through schema/engine interfaces.
 
 ## Runtime Relationship
 

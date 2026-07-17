@@ -1,15 +1,14 @@
 mod cli;
-mod client;
 mod command;
 mod connection;
-mod daemon;
-mod pagination;
 mod presentation;
 mod render;
 mod search;
 mod terminal;
 mod tui;
 mod util;
+
+use weather_renderer_common::{client, daemon, pagination};
 
 use anyhow::{Context, Result, bail};
 
@@ -48,7 +47,7 @@ async fn run_direct(cli: &Cli, endpoints: Endpoints, hmac_key: Option<[u8; 32]>)
 }
 
 async fn run_managed(cli: &Cli, hmac_key: Option<[u8; 32]>) -> Result<()> {
-    let daemon = DaemonSupervisor::from_cli(cli)?;
+    let daemon = DaemonSupervisor::new(cli.daemon_exe.clone(), cli.config.clone())?;
     let probe = daemon.probe().await?;
     if cli.stops_engine() {
         match probe.state {

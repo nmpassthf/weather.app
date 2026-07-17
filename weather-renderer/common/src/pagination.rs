@@ -6,13 +6,13 @@ use weather_schema::{MAX_RPC_PAGE_OFFSET, MAX_RPC_PAGE_SIZE};
 const MAX_PAGINATED_REQUESTS: u32 = MAX_RPC_PAGE_OFFSET / MAX_RPC_PAGE_SIZE + 2;
 
 #[derive(Debug, Default)]
-pub(crate) struct PageCursor {
+pub struct PageCursor {
     offset: u32,
     request_count: u32,
 }
 
 impl PageCursor {
-    pub(crate) fn request(&mut self, page_size: u32) -> Result<(u32, u32)> {
+    pub fn request(&mut self, page_size: u32) -> Result<(u32, u32)> {
         if page_size == 0 || page_size > MAX_RPC_PAGE_SIZE {
             bail!("RPC page size {page_size} is outside 1..={MAX_RPC_PAGE_SIZE}");
         }
@@ -29,7 +29,7 @@ impl PageCursor {
         Ok((self.offset, page_size))
     }
 
-    pub(crate) fn advance(&mut self, has_more: bool, next_offset: u32) -> Result<bool> {
+    pub fn advance(&mut self, has_more: bool, next_offset: u32) -> Result<bool> {
         if !has_more {
             return Ok(false);
         }
@@ -47,7 +47,7 @@ impl PageCursor {
     }
 }
 
-pub(crate) fn page_size_for_target(target: usize) -> u32 {
+pub fn page_size_for_target(target: usize) -> u32 {
     target.clamp(1, MAX_RPC_PAGE_SIZE as usize) as u32
 }
 

@@ -1,5 +1,6 @@
 use std::fmt::Write as _;
 
+use weather_renderer_common::{local_today, multi_day_datetime_label};
 use weather_schema::*;
 
 use crate::{
@@ -25,6 +26,7 @@ pub(crate) fn render_status(status: &EngineStatus) -> String {
 
 pub(crate) fn render_weather(snapshot: &WeatherSnapshot) -> String {
     let weather = WeatherView::new(snapshot);
+    let today = local_today();
     let mut out = String::new();
     if let Some(station) = &snapshot.station {
         writeln!(out, "{}", station_label(station)).ok();
@@ -62,9 +64,20 @@ pub(crate) fn render_weather(snapshot: &WeatherSnapshot) -> String {
         )
         .ok();
         writeln!(out, "日出/日落: {} / {}", current.sunrise, current.sunset).ok();
-        if let Some(alert) = &weather.alert {
+        for (index, alert) in weather.alerts.iter().enumerate() {
             writeln!(out).ok();
-            writeln!(out, "预警: {}", alert.alert).ok();
+            writeln!(
+                out,
+                "预警 {}（{}）: {}",
+                index + 1,
+                if alert.inherited {
+                    "父级站点"
+                } else {
+                    "当前站点"
+                },
+                alert.alert
+            )
+            .ok();
             if let Some(content) = &alert.issue_content {
                 writeln!(out, "内容: {content}").ok();
             }
@@ -136,7 +149,7 @@ pub(crate) fn render_weather(snapshot: &WeatherSnapshot) -> String {
             writeln!(
                 out,
                 "{}  温度 {}  湿度 {}  1h雨量 {}  24h雨量 {}  风速 {}",
-                text(chart.time.as_deref()),
+                multi_day_datetime_label(text(chart.time.as_deref()), today),
                 degrees(chart.temperature),
                 percent(chart.humidity),
                 mm(chart.rain_1h),
@@ -377,7 +390,7 @@ mod tests {
                 wind_speed: Some(5.1),
                 sunrise: Some("04:50".to_string()),
                 sunset: Some("19:47".to_string()),
-                alert: None,
+                alerts: Vec::new(),
                 temperature_diff: Some(1.2),
                 air_pressure: Some(1001.0),
                 comfort_index: Some("3".to_string()),
@@ -453,6 +466,7 @@ mod tests {
                 title: Some("华北雷达".to_string()),
                 image_url: Some("https://www.nmc.cn/radar.png".to_string()),
                 page_url: Some("https://www.nmc.cn/radar.html".to_string()),
+                image_resource_id: None,
             }),
             stale: false,
             debug: None,
@@ -477,12 +491,12 @@ mod tests {
     fn weather_output_keeps_alert_text_unsplit() {
         let rendered = render_weather(&WeatherSnapshot {
             real: Some(ObservedWeather {
-                alert: Some(WeatherAlert {
+                alerts: vec![WeatherAlert {
                     alert: Some("雷电黄色预警".to_string()),
                     issue_content: Some("预计有雷阵雨；伴有阵风".to_string()),
                     prevention: Some("减少户外活动；远离高处".to_string()),
                     ..Default::default()
-                }),
+                }],
                 ..Default::default()
             }),
             ..Default::default()

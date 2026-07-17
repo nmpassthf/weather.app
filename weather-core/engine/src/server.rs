@@ -48,6 +48,9 @@ struct RpcReply {
 const RESPONSE_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 const MIN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+const UPSTREAM_RPC_OVERHEAD: Duration = Duration::from_secs(2);
+const WEATHER_UPSTREAM_STAGES: u32 = 6;
+const CATALOG_UPSTREAM_STAGES: u32 = 8;
 
 pub(crate) async fn run_engine_sockets(
     engine: Engine,
@@ -610,8 +613,10 @@ async fn process_request(
         Ok(request) => {
             let kind = RpcKind::try_from(request.kind).unwrap_or(RpcKind::Unspecified);
             let request_id = request.request_id.clone();
+            let config = engine.config.get();
+            let effective_timeout = request_timeout_for(&config, kind, request_timeout);
             let response = match tokio::time::timeout(
-                request_timeout,
+                effective_timeout,
                 engine.handle_rpc_request(request, &mode, &rpc_endpoint, &pub_endpoint),
             )
             .await
@@ -620,7 +625,7 @@ async fn process_request(
                 Err(_) => Engine::rpc_error_response(
                     &request_id,
                     RpcErrorCode::Timeout,
-                    format!("rpc request timed out after {request_timeout:?}"),
+                    format!("rpc request timed out after {effective_timeout:?}"),
                 ),
             };
             let exit = accepted_exit(kind, &response);
@@ -640,6 +645,34 @@ async fn process_request(
         response,
         exit,
     }
+}
+
+fn request_timeout_for(
+    config: &weather_configure::AppConfig,
+    kind: RpcKind,
+    configured: Duration,
+) -> Duration {
+    let upstream_stages = match kind {
+        RpcKind::GetWeather | RpcKind::TriggerRefresh => WEATHER_UPSTREAM_STAGES,
+        RpcKind::ListProvinces => 1,
+        RpcKind::ListCities
+        | RpcKind::FuzzyMatchStations
+        | RpcKind::BatchListRegions
+        | RpcKind::ResolveStationUuid => CATALOG_UPSTREAM_STAGES,
+        _ => return configured,
+    };
+    let provider_timeout = config
+        .updater
+        .provider
+        .iter()
+        .find(|provider| provider.name == config.updater.default_provider)
+        .map(|provider| Duration::from_secs(provider.request_timeout_seconds.max(1)))
+        .unwrap_or(configured);
+    configured.max(
+        provider_timeout
+            .saturating_mul(upstream_stages)
+            .saturating_add(UPSTREAM_RPC_OVERHEAD),
+    )
 }
 
 fn payload_exceeds_limit(len: usize) -> bool {
@@ -729,7 +762,71 @@ async fn wait_for_signal() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use tokio::sync::Semaphore;
+    use weather_configure::{AppConfig, write_config_atomic};
+    use weather_updater::{
+        ProviderCity, ProviderFuture, ProviderProvince, WeatherFetch, WeatherProvider,
+    };
+
     use super::*;
+    use crate::runtime::EngineRuntime;
+
+    struct SlowColdStartProvider {
+        weather_started: AtomicUsize,
+        weather_release: Arc<Semaphore>,
+    }
+
+    impl WeatherProvider for SlowColdStartProvider {
+        fn provider_name(&self) -> &str {
+            "cold-start-test"
+        }
+
+        fn provinces(&self) -> ProviderFuture<'_, Vec<ProviderProvince>> {
+            Box::pin(async {
+                Ok(vec![ProviderProvince {
+                    provider_code: "P1".to_string(),
+                    name: "北京市".to_string(),
+                    url: "/province".to_string(),
+                }])
+            })
+        }
+
+        fn cities<'a>(
+            &'a self,
+            provider_province_code: &'a str,
+        ) -> ProviderFuture<'a, Vec<ProviderCity>> {
+            Box::pin(async move {
+                Ok(vec![ProviderCity {
+                    provider_code: "A".to_string(),
+                    provider_province_code: provider_province_code.to_string(),
+                    province: "北京市".to_string(),
+                    city: "北京".to_string(),
+                    url: "/city".to_string(),
+                }])
+            })
+        }
+
+        fn weather<'a>(
+            &'a self,
+            _provider_station_id: &'a str,
+            _include_debug: bool,
+        ) -> ProviderFuture<'a, WeatherFetch> {
+            self.weather_started.fetch_add(1, Ordering::SeqCst);
+            let release = self.weather_release.clone();
+            Box::pin(async move {
+                release.acquire().await.unwrap().forget();
+                Ok(WeatherFetch {
+                    snapshot: WeatherSnapshot::default(),
+                    warnings: Vec::new(),
+                })
+            })
+        }
+    }
 
     #[test]
     fn only_accepted_shutdown_and_restart_responses_request_exit() {
@@ -781,6 +878,96 @@ mod tests {
             cleanup_timeout(Duration::from_secs(60)),
             MAX_CLEANUP_TIMEOUT
         );
+    }
+
+    #[test]
+    fn network_backed_requests_outlive_the_short_control_rpc_timeout() {
+        let config = weather_configure::AppConfig::default();
+        let configured = Duration::from_secs(3);
+
+        assert_eq!(
+            request_timeout_for(&config, RpcKind::GetWeather, configured),
+            Duration::from_secs(122)
+        );
+        assert_eq!(
+            request_timeout_for(&config, RpcKind::ListProvinces, configured),
+            Duration::from_secs(22)
+        );
+        assert_eq!(
+            request_timeout_for(&config, RpcKind::FuzzyMatchStations, configured),
+            Duration::from_secs(162)
+        );
+        assert_eq!(
+            request_timeout_for(&config, RpcKind::Ping, configured),
+            configured
+        );
+        assert_eq!(
+            request_timeout_for(&config, RpcKind::GetResource, configured),
+            configured
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_weather_refresh_is_not_cancelled_by_the_control_rpc_timeout() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("weather.toml");
+        let mut config = AppConfig::default();
+        config.engine.request_timeout_ms = 1;
+        config.db.path = directory.path().join("weather.db").display().to_string();
+        config.updater.default_provider = "cold-start-test".to_string();
+        config.updater.provider[0].name = "cold-start-test".to_string();
+        config.updater.provider[0].request_timeout_seconds = 1;
+        write_config_atomic(&config_path, &config).unwrap();
+
+        let release = Arc::new(Semaphore::new(0));
+        let provider = Arc::new(SlowColdStartProvider {
+            weather_started: AtomicUsize::new(0),
+            weather_release: release.clone(),
+        });
+        let runtime = EngineRuntime::start_with_provider(config_path, provider.clone())
+            .await
+            .unwrap();
+        let engine = runtime.test_engine();
+        let request = RpcRequest {
+            schema_version: SCHEMA_VERSION.to_string(),
+            request_id: "cold-start-weather".to_string(),
+            kind: RpcKind::GetWeather as i32,
+            timestamp_unix_ms: 0,
+            hmac_sha256: Vec::new(),
+            payload: GetWeatherRequest {
+                unified_uuid: unified_station_uuid("北京-北京市"),
+                refresh: true,
+                include_debug: false,
+            }
+            .encode_to_vec(),
+        };
+        let task = tokio::spawn(process_request(
+            engine.clone(),
+            Bytes::from_static(b"cold-start-client"),
+            Bytes::from(request.encode_to_vec()),
+            "test".to_string(),
+            "tcp://127.0.0.1:1".to_string(),
+            "tcp://127.0.0.1:2".to_string(),
+            Duration::from_millis(1),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while provider.weather_started.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cold weather request did not reach the provider");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!task.is_finished(), "request used the 1ms control timeout");
+
+        release.add_permits(1);
+        let reply = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("cold weather request did not finish")
+            .unwrap();
+        assert_eq!(reply.response.status, ResponseStatus::Ok as i32);
+        engine.db.shutdown().await.unwrap();
     }
 
     #[tokio::test]

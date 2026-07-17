@@ -88,7 +88,7 @@ pub(super) fn map_real(
                 "real.sunriseSunset.sunset",
                 context,
             ),
-            alert,
+            alerts: alert.into_iter().collect(),
             temperature_diff: value::fixed_f64(
                 weather.and_then(|weather| weather.temperature_diff.as_ref()),
                 "real.weather.temperatureDiff",
@@ -199,6 +199,8 @@ fn map_alert(raw: Option<Value>, context: &mut MappingContext<'_>) -> Option<Wea
         ),
         icon_url: value::resource_url(warning.pic.as_ref(), "real.warn.pic", context),
         icon_name: value::fixed_string(warning.pic2.as_ref(), "real.warn.pic2", context),
+        icon_resource_id: None,
+        inherited: false,
     })
 }
 

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 180" role="img" aria-label="晴天占位图">
+  <defs><radialGradient id="s"><stop stop-color="#FFF4A0"/><stop offset="1" stop-color="#FFC347"/></radialGradient></defs>
+  <g stroke="#FFC347" stroke-width="7" stroke-linecap="round"><path d="M90 18v16M90 146v16M18 90h16M146 90h16M39 39l12 12M129 129l12 12M141 39l-12 12M51 129l-12 12"/></g>
+  <circle cx="90" cy="90" r="43" fill="url(#s)"/>
+</svg>

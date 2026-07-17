@@ -13,6 +13,7 @@ use weather_manifest::{ComponentKind, ComponentManifest};
 use weather_schema::{
     ENGINE_LOCK_METADATA_VERSION, EngineLockMetadata, correlation_id, unix_timestamp_ms,
 };
+use weather_updater::ProviderResource;
 use weather_updater::{WeatherProvider, create_weather_provider};
 
 use crate::{
@@ -20,6 +21,7 @@ use crate::{
     lifecycle::EngineControl,
     lock::LockGuard,
     lock::resolve_relative,
+    resource_cache::ResourceManager,
     server::{EventSink, run_engine_sockets},
     singleflight::Singleflight,
     time::{SystemWeatherClock, WeatherClock},
@@ -40,6 +42,8 @@ pub(crate) struct Engine {
     pub(crate) db: DbActor,
     pub(crate) provider: Arc<dyn WeatherProvider>,
     pub(crate) weather_singleflight: Singleflight<(String, bool), weather_schema::WeatherSnapshot>,
+    pub(crate) resource_singleflight: Singleflight<String, ProviderResource>,
+    pub(crate) resources: ResourceManager,
     pub(crate) catalog: CatalogCoordinator,
     pub(crate) sink: EventSink,
     pub(crate) control: EngineControl,
@@ -182,6 +186,8 @@ impl EngineRuntime {
                 db,
                 provider,
                 weather_singleflight: Singleflight::default(),
+                resource_singleflight: Singleflight::default(),
+                resources: ResourceManager::default(),
                 catalog: CatalogCoordinator::default(),
                 sink,
                 control: EngineControl::new(),

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 260" role="img" aria-label="雷达图占位图">
+  <rect width="480" height="260" rx="24" fill="#173A4B"/>
+  <g transform="translate(240 130)" fill="none" stroke="#65B9CB" stroke-opacity=".45"><circle r="36"/><circle r="72"/><circle r="108"/><path d="M-130 0h260M0-130v260M-92-92 92 92M92-92-92 92"/></g>
+  <path d="M240 130 327 75a103 103 0 0 1 16 79Z" fill="#60D6A7" fill-opacity=".5"/>
+  <circle cx="240" cy="130" r="7" fill="#C9F3FF"/>
+  <text x="24" y="234" fill="#BEE7F0" font-family="system-ui,sans-serif" font-size="14">RADAR · 暂无图像</text>
+</svg>

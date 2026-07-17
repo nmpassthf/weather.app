@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use weather_configure::{NetworkConfig, ProviderConfig};
 use weather_schema::DebugPayload;
 
-use crate::{ProviderCity, ProviderProvince, WeatherFetch};
+use crate::{ProviderCity, ProviderProvince, ProviderResource, WeatherFetch};
 
 use super::{ProviderFuture, WeatherProvider};
 use dto::decode_weather_response;
@@ -78,6 +78,16 @@ impl WeatherProvider for NmcProvider {
                 });
             }
             Ok(WeatherFetch { snapshot, warnings })
+        })
+    }
+
+    fn resource<'a>(&'a self, source_url: &'a str) -> ProviderFuture<'a, ProviderResource> {
+        Box::pin(async move {
+            let (content_type, bytes) = self.transport.resource(source_url).await?;
+            Ok(ProviderResource {
+                content_type,
+                bytes: bytes.into(),
+            })
         })
     }
 }

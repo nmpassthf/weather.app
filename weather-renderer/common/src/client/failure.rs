@@ -46,7 +46,7 @@ impl fmt::Display for ClientFailure {
 impl Error for ClientFailure {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RemoteRpcError {
+pub struct RemoteRpcError {
     wire_code: Option<String>,
     known_code: Option<RpcErrorCode>,
     message: String,

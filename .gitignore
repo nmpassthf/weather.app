@@ -3,3 +3,8 @@
 /.weather
 superpowers/
 *.prd.*
+/weather-renderer/gui/node_modules
+/weather-renderer/gui/dist
+/weather-renderer/gui/src-tauri/gen
+/weather-renderer/gui/src-tauri/resources/bin/weather-daemon
+/weather-renderer/gui/src-tauri/resources/bin/weather-daemon.exe

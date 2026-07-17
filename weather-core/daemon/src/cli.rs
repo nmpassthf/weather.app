@@ -31,6 +31,11 @@ pub(crate) enum Command {
         #[arg(long)]
         verbose: bool,
     },
+    /// Gracefully stop the active daemon for this configuration.
+    Stop {
+        #[arg(long, short = 'c')]
+        config: Option<PathBuf>,
+    },
     Service {
         #[command(subcommand)]
         command: ServiceCommand,
@@ -283,5 +288,18 @@ mod tests {
             Some(std::path::Path::new("/tmp/weather.toml"))
         );
         assert!(verbose);
+    }
+
+    #[test]
+    fn parses_stop_config() {
+        let cli = Cli::parse_from(["weather-daemon", "stop", "--config", "/tmp/weather.toml"]);
+
+        let Command::Stop { config } = cli.command else {
+            panic!("expected stop command");
+        };
+        assert_eq!(
+            config.as_deref(),
+            Some(std::path::Path::new("/tmp/weather.toml"))
+        );
     }
 }

@@ -115,7 +115,11 @@ impl Engine {
             )? {
                 let mut snapshot = stored.snapshot;
                 snapshot.station = Some(merge_station(snapshot.station.take(), &station));
-                return Ok(snapshot);
+                let _ = self
+                    .apply_cached_municipality_air(&mut snapshot, &station)
+                    .await;
+                let _ = self.apply_parent_alerts(&mut snapshot, &station).await;
+                return Ok(self.prepare_snapshot_resources(snapshot));
             }
         }
 
@@ -135,7 +139,7 @@ impl Engine {
             };
             completion.complete(outcome);
         }
-        result
+        result.map(|snapshot| self.prepare_snapshot_resources(snapshot))
     }
 
     async fn fetch_weather_uncached(
@@ -161,6 +165,13 @@ impl Engine {
                 if let Err(err) = self.persist_snapshot(snapshot_for_storage).await {
                     warnings.push(format!("cache write failed: {err:#}"));
                 }
+                if let Err(err) = self
+                    .apply_cached_municipality_air(&mut snapshot, &station)
+                    .await
+                {
+                    warnings.push(format!("municipality air fallback failed: {err:#}"));
+                }
+                let _ = self.apply_parent_alerts(&mut snapshot, &station).await;
                 let persisted_warning = warning_summary(&warnings);
                 if let Err(err) = self
                     .db
@@ -210,6 +221,12 @@ impl Engine {
                         stored.snapshot.station =
                             Some(merge_station(stored.snapshot.station.take(), &station));
                         stored.snapshot.stale = true;
+                        let _ = self
+                            .apply_cached_municipality_air(&mut stored.snapshot, &station)
+                            .await;
+                        let _ = self
+                            .apply_parent_alerts(&mut stored.snapshot, &station)
+                            .await;
                         Ok(stored.snapshot)
                     }
                     Ok(None) => Err(err),
@@ -226,6 +243,85 @@ impl Engine {
         self.db
             .put_history_snapshot(snapshot, fetched_at_unix_ms)
             .await
+    }
+
+    fn prepare_snapshot_resources(&self, mut snapshot: WeatherSnapshot) -> WeatherSnapshot {
+        if let Some(radar) = snapshot.radar.as_mut() {
+            if let Some(image_url) = radar.image_url.take() {
+                radar.image_resource_id = self.resources.register(&image_url);
+            }
+            radar.page_url = None;
+        }
+        if let Some(real) = snapshot.real.as_mut() {
+            for alert in &mut real.alerts {
+                if let Some(icon_url) = alert.icon_url.take() {
+                    alert.icon_resource_id = self.resources.register(&icon_url);
+                }
+                alert.url = None;
+            }
+        }
+        snapshot
+    }
+
+    async fn apply_parent_alerts(
+        &self,
+        snapshot: &mut WeatherSnapshot,
+        station: &ProviderStation,
+    ) -> Result<bool> {
+        let Some(parent_name) = parent_station_name(&station.name) else {
+            return Ok(false);
+        };
+        let parent_uuid = unified_station_uuid(&parent_name);
+        let Some(stored) = self.db.get_latest_snapshot(parent_uuid).await? else {
+            return Ok(false);
+        };
+        let config = self.config.get();
+        if !cached_snapshot_is_fresh(
+            stored.fetched_at_unix_ms,
+            self.weather_now_unix_ms(),
+            config.updater.weather_ttl_seconds,
+            &config.db.timezone,
+        )? {
+            return Ok(false);
+        }
+        let parent_alerts = stored
+            .snapshot
+            .real
+            .map(|real| real.alerts)
+            .unwrap_or_default();
+        Ok(merge_parent_alerts(snapshot, parent_alerts))
+    }
+
+    async fn apply_cached_municipality_air(
+        &self,
+        snapshot: &mut WeatherSnapshot,
+        station: &ProviderStation,
+    ) -> Result<bool> {
+        if snapshot.air.is_some() {
+            return Ok(false);
+        }
+        let Some(parent_name) = municipality_air_parent_name(&station.province, &station.city)
+        else {
+            return Ok(false);
+        };
+        let parent_uuid = unified_station_uuid(&parent_name);
+        let Some(stored) = self.db.get_latest_snapshot(parent_uuid).await? else {
+            return Ok(false);
+        };
+        let config = self.config.get();
+        if !cached_snapshot_is_fresh(
+            stored.fetched_at_unix_ms,
+            self.weather_now_unix_ms(),
+            config.updater.weather_ttl_seconds,
+            &config.db.timezone,
+        )? {
+            return Ok(false);
+        }
+        let Some(air) = stored.snapshot.air else {
+            return Ok(false);
+        };
+        snapshot.air = Some(air);
+        Ok(true)
     }
 
     /// 按 `unified_uuid` 反查 StationRef。
@@ -289,6 +385,47 @@ fn first_enabled_station_name(config: &weather_configure::AppConfig) -> Option<&
         .iter()
         .find(|station| station.enabled)
         .map(|station| station.name.as_str())
+}
+
+fn municipality_air_parent_name(province: &str, city: &str) -> Option<String> {
+    if !province.ends_with('市') {
+        return None;
+    }
+    let municipality = short_region_name(province);
+    if municipality.is_empty() || city == municipality || city == province {
+        return None;
+    }
+    Some(canonical_station_name(province, municipality))
+}
+
+fn merge_parent_alerts(snapshot: &mut WeatherSnapshot, parent_alerts: Vec<WeatherAlert>) -> bool {
+    if parent_alerts.is_empty() {
+        return false;
+    }
+    let alerts = &mut snapshot
+        .real
+        .get_or_insert_with(ObservedWeather::default)
+        .alerts;
+    let initial_len = alerts.len();
+    for mut parent_alert in parent_alerts {
+        parent_alert.inherited = true;
+        if !alerts
+            .iter()
+            .any(|current| same_alert(current, &parent_alert))
+        {
+            alerts.push(parent_alert);
+        }
+    }
+    alerts.len() != initial_len
+}
+
+fn same_alert(left: &WeatherAlert, right: &WeatherAlert) -> bool {
+    left.alert == right.alert
+        && left.province == right.province
+        && left.city == right.city
+        && left.issue_content == right.issue_content
+        && left.signal_type == right.signal_type
+        && left.signal_level == right.signal_level
 }
 
 fn cached_snapshot_is_fresh(
@@ -563,6 +700,16 @@ mod tests {
     }
 
     #[test]
+    fn municipality_air_parent_only_applies_to_district_stations() {
+        assert_eq!(
+            municipality_air_parent_name("北京市", "朝阳").as_deref(),
+            Some("北京-北京市")
+        );
+        assert_eq!(municipality_air_parent_name("北京市", "北京"), None);
+        assert_eq!(municipality_air_parent_name("浙江省", "杭州"), None);
+    }
+
+    #[test]
     fn cached_snapshot_requires_age_strictly_below_ttl() {
         let fetched = 1_000_000;
 
@@ -582,6 +729,254 @@ mod tests {
 
         assert!(!cached_snapshot_is_fresh(fetched, now, 60, "Asia/Shanghai").unwrap());
         assert!(cached_snapshot_is_fresh(now - 1_000, now, 60, "Asia/Shanghai").unwrap());
+    }
+
+    #[test]
+    fn parent_alerts_follow_current_alerts_and_are_deduplicated() {
+        let current = WeatherAlert {
+            alert: Some("朝阳区雷电预警".to_string()),
+            city: Some("朝阳".to_string()),
+            signal_level: Some("黄色".to_string()),
+            ..Default::default()
+        };
+        let duplicate = WeatherAlert {
+            alert: Some("北京市高温预警".to_string()),
+            province: Some("北京市".to_string()),
+            city: Some("北京".to_string()),
+            signal_level: Some("橙色".to_string()),
+            ..Default::default()
+        };
+        let parent_only = WeatherAlert {
+            alert: Some("北京市暴雨预警".to_string()),
+            province: Some("北京市".to_string()),
+            city: Some("北京".to_string()),
+            signal_level: Some("蓝色".to_string()),
+            ..Default::default()
+        };
+        let mut snapshot = WeatherSnapshot {
+            real: Some(ObservedWeather {
+                alerts: vec![current.clone(), duplicate.clone()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(merge_parent_alerts(
+            &mut snapshot,
+            vec![duplicate, parent_only.clone()]
+        ));
+
+        let alerts = snapshot.real.unwrap().alerts;
+        assert_eq!(alerts.len(), 3);
+        assert_eq!(alerts[0], current);
+        assert!(!alerts[0].inherited);
+        assert!(!alerts[1].inherited);
+        assert_eq!(alerts[2].alert, parent_only.alert);
+        assert!(alerts[2].inherited);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn outbound_snapshot_replaces_remote_urls_with_registered_resource_ids() {
+        let (_directory, _runtime, engine, _provider, _uuid) = blocking_runtime().await;
+        let snapshot = WeatherSnapshot {
+            real: Some(ObservedWeather {
+                alerts: vec![WeatherAlert {
+                    url: Some("https://provider.example/alert.html".to_string()),
+                    icon_url: Some("https://provider.example/alert.png".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            radar: Some(RadarInfo {
+                image_url: Some("https://provider.example/radar.png".to_string()),
+                page_url: Some("https://provider.example/radar.html".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let outbound = engine.prepare_snapshot_resources(snapshot);
+        let alert = outbound.real.unwrap().alerts.remove(0);
+        let radar = outbound.radar.unwrap();
+
+        assert!(alert.url.is_none());
+        assert!(alert.icon_url.is_none());
+        assert_eq!(
+            engine
+                .resources
+                .source_url(alert.icon_resource_id.as_deref().unwrap())
+                .as_deref(),
+            Some("https://provider.example/alert.png")
+        );
+        assert!(radar.image_url.is_none());
+        assert!(radar.page_url.is_none());
+        assert_eq!(
+            engine
+                .resources
+                .source_url(radar.image_resource_id.as_deref().unwrap())
+                .as_deref(),
+            Some("https://provider.example/radar.png")
+        );
+        engine.db.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn district_snapshot_uses_only_fresh_municipality_air_cache() {
+        let (_directory, _runtime, engine, _provider, _uuid) = blocking_runtime().await;
+        let now = engine.weather_now_unix_ms();
+        let config = engine.config.get();
+        let parent_name = "北京-北京市".to_string();
+        let parent_uuid = unified_station_uuid(&parent_name);
+        let parent_snapshot = |aqi| WeatherSnapshot {
+            station: Some(StationRef {
+                province: "北京市".to_string(),
+                city: "北京".to_string(),
+                name: parent_name.clone(),
+                unified_uuid: parent_uuid.clone(),
+            }),
+            air: Some(AirQuality {
+                aqi: Some(aqi),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let child_name = "北京-北京市-朝阳".to_string();
+        let child_station = ProviderStation {
+            provider_name: "blocking-test".to_string(),
+            display_name: child_name.clone(),
+            provider_station_id: "CY".to_string(),
+            provider_province_code: "ABJ".to_string(),
+            province: "北京市".to_string(),
+            city: "朝阳".to_string(),
+            url: "test://chaoyang".to_string(),
+            unified_uuid: unified_station_uuid(&child_name),
+            name: child_name,
+        };
+
+        engine
+            .db
+            .put_history_snapshot(
+                parent_snapshot(30.0),
+                now - config.updater.weather_ttl_seconds as i64 * 1_000,
+            )
+            .await
+            .unwrap();
+        let mut child = WeatherSnapshot::default();
+        assert!(
+            !engine
+                .apply_cached_municipality_air(&mut child, &child_station)
+                .await
+                .unwrap()
+        );
+        assert!(child.air.is_none());
+
+        engine
+            .db
+            .put_history_snapshot(parent_snapshot(44.0), now - 1_000)
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .apply_cached_municipality_air(&mut child, &child_station)
+                .await
+                .unwrap()
+        );
+        assert_eq!(child.air.and_then(|air| air.aqi), Some(44.0));
+        engine.db.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn district_inherits_fresh_parent_alerts_without_mutating_parent_cache() {
+        let (_directory, _runtime, engine, _provider, _uuid) = blocking_runtime().await;
+        let now = engine.weather_now_unix_ms();
+        let parent_name = "北京-北京市".to_string();
+        let parent_uuid = unified_station_uuid(&parent_name);
+        let parent_station = ProviderStation {
+            provider_name: "blocking-test".to_string(),
+            display_name: parent_name.clone(),
+            provider_station_id: "BJ".to_string(),
+            provider_province_code: "ABJ".to_string(),
+            province: "北京市".to_string(),
+            city: "北京".to_string(),
+            url: "test://beijing".to_string(),
+            name: parent_name.clone(),
+            unified_uuid: parent_uuid.clone(),
+        };
+        engine
+            .db
+            .put_provider_station_mapping(parent_station)
+            .await
+            .unwrap();
+        engine
+            .db
+            .put_history_snapshot(
+                WeatherSnapshot {
+                    station: Some(StationRef {
+                        province: "北京市".to_string(),
+                        city: "北京".to_string(),
+                        name: parent_name,
+                        unified_uuid: parent_uuid.clone(),
+                    }),
+                    real: Some(ObservedWeather {
+                        alerts: vec![WeatherAlert {
+                            alert: Some("北京市暴雨蓝色预警".to_string()),
+                            province: Some("北京市".to_string()),
+                            city: Some("北京".to_string()),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                now - 1_000,
+            )
+            .await
+            .unwrap();
+        let child_name = "北京-北京市-朝阳".to_string();
+        let child_station = ProviderStation {
+            provider_name: "blocking-test".to_string(),
+            display_name: child_name.clone(),
+            provider_station_id: "CY".to_string(),
+            provider_province_code: "ABJ".to_string(),
+            province: "北京市".to_string(),
+            city: "朝阳".to_string(),
+            url: "test://chaoyang".to_string(),
+            unified_uuid: unified_station_uuid(&child_name),
+            name: child_name,
+        };
+        let mut child = WeatherSnapshot {
+            real: Some(ObservedWeather {
+                alerts: vec![WeatherAlert {
+                    alert: Some("朝阳区雷电黄色预警".to_string()),
+                    city: Some("朝阳".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(
+            engine
+                .apply_parent_alerts(&mut child, &child_station)
+                .await
+                .unwrap()
+        );
+        let alerts = &child.real.as_ref().unwrap().alerts;
+        assert_eq!(alerts.len(), 2);
+        assert_eq!(alerts[0].alert.as_deref(), Some("朝阳区雷电黄色预警"));
+        assert!(!alerts[0].inherited);
+        assert_eq!(alerts[1].alert.as_deref(), Some("北京市暴雨蓝色预警"));
+        assert!(alerts[1].inherited);
+
+        let stored_parent = engine
+            .db
+            .get_latest_snapshot(parent_uuid)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!stored_parent.snapshot.real.unwrap().alerts[0].inherited);
+        engine.db.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,3 +1,5 @@
+use chrono::NaiveDate;
+use weather_renderer_common::{local_today, multi_day_date_label};
 use weather_schema::{ForecastDay, TemperatureChart, WeatherAlert, WeatherSnapshot};
 
 use crate::util::{degrees, hectopascal, meter_per_second, mm, percent, text, wind_summary};
@@ -6,7 +8,7 @@ use crate::util::{degrees, hectopascal, meter_per_second, mm, percent, text, win
 pub(crate) struct WeatherView {
     pub current: Option<CurrentWeatherView>,
     pub forecast: Option<ForecastView>,
-    pub alert: Option<AlertView>,
+    pub alerts: Vec<AlertView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +56,7 @@ pub(crate) struct ForecastDayView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AlertView {
     pub alert: String,
+    pub inherited: bool,
     pub issue_content: Option<String>,
     pub prevention: Option<String>,
     pub lines: Vec<String>,
@@ -61,20 +64,24 @@ pub(crate) struct AlertView {
 
 impl WeatherView {
     pub(crate) fn new(snapshot: &WeatherSnapshot) -> Self {
-        let today = snapshot
+        Self::new_at(snapshot, local_today())
+    }
+
+    fn new_at(snapshot: &WeatherSnapshot, calendar_today: NaiveDate) -> Self {
+        let forecast_today = snapshot
             .predict
             .as_ref()
             .and_then(|predict| predict.days.first());
-        let temperature_chart = matching_temperature_chart(snapshot, today);
+        let temperature_chart = matching_temperature_chart(snapshot, forecast_today);
         let current = snapshot.real.as_ref().map(|real| {
-            let high_temperature = today
+            let high_temperature = forecast_today
                 .map(|day| forecast_degrees(day.day_temperature.as_deref()))
                 .filter(|value| value != "-")
                 .or_else(|| {
                     temperature_chart
                         .and_then(|chart| chart.max_temperature.map(|value| degrees(Some(value))))
                 });
-            let low_temperature = today
+            let low_temperature = forecast_today
                 .map(|day| forecast_degrees(day.night_temperature.as_deref()))
                 .filter(|value| value != "-")
                 .or_else(|| {
@@ -114,26 +121,30 @@ impl WeatherView {
         });
         let forecast = snapshot.predict.as_ref().map(|predict| ForecastView {
             publish_time: text(predict.publish_time.as_deref()).to_string(),
-            days: predict.days.iter().map(ForecastDayView::new).collect(),
+            days: predict
+                .days
+                .iter()
+                .map(|day| ForecastDayView::new(day, calendar_today))
+                .collect(),
         });
-        let alert = snapshot
+        let alerts = snapshot
             .real
             .as_ref()
-            .and_then(|real| real.alert.as_ref())
-            .map(AlertView::new);
+            .map(|real| real.alerts.iter().map(AlertView::new).collect())
+            .unwrap_or_default();
 
         Self {
             current,
             forecast,
-            alert,
+            alerts,
         }
     }
 }
 
 impl ForecastDayView {
-    fn new(day: &ForecastDay) -> Self {
+    fn new(day: &ForecastDay, today: NaiveDate) -> Self {
         Self {
-            date: day.date.clone(),
+            date: multi_day_date_label(&day.date, today),
             day_info: text(day.day_info.as_deref()).to_string(),
             night_info: text(day.night_info.as_deref()).to_string(),
             day_temperature: text(day.day_temperature.as_deref()).to_string(),
@@ -148,12 +159,18 @@ impl AlertView {
     fn new(alert: &WeatherAlert) -> Self {
         let title = text(alert.alert.as_deref()).to_string();
         let signal_level = text(alert.signal_level.as_deref()).to_string();
-        let mut lines = vec![format!("{title} {signal_level}")];
+        let source = if alert.inherited {
+            "父级站点"
+        } else {
+            "当前站点"
+        };
+        let mut lines = vec![format!("[{source}] {title} {signal_level}")];
         lines.extend(split_alert_lines(alert.issue_content.as_deref()));
         lines.extend(split_alert_lines(alert.prevention.as_deref()));
 
         Self {
             alert: title,
+            inherited: alert.inherited,
             issue_content: alert.issue_content.clone(),
             prevention: alert.prevention.clone(),
             lines,
@@ -227,21 +244,75 @@ mod tests {
 
     #[test]
     fn forecast_wind_prefers_day_and_night_then_legacy_values() {
-        let combined = ForecastDayView::new(&ForecastDay {
-            day_wind_direct: Some("North".to_string()),
-            day_wind_power: Some("3".to_string()),
-            night_wind_direct: Some("West".to_string()),
-            night_wind_power: Some("2".to_string()),
-            ..Default::default()
-        });
+        let today = NaiveDate::from_ymd_opt(2026, 7, 17).unwrap();
+        let combined = ForecastDayView::new(
+            &ForecastDay {
+                day_wind_direct: Some("North".to_string()),
+                day_wind_power: Some("3".to_string()),
+                night_wind_direct: Some("West".to_string()),
+                night_wind_power: Some("2".to_string()),
+                ..Default::default()
+            },
+            today,
+        );
         assert_eq!(combined.wind, "North3/West2");
 
-        let legacy = ForecastDayView::new(&ForecastDay {
-            wind_direct: Some("South".to_string()),
-            wind_power: Some("1".to_string()),
-            ..Default::default()
-        });
+        let legacy = ForecastDayView::new(
+            &ForecastDay {
+                wind_direct: Some("South".to_string()),
+                wind_power: Some("1".to_string()),
+                ..Default::default()
+            },
+            today,
+        );
         assert_eq!(legacy.wind, "South1");
+    }
+
+    #[test]
+    fn forecast_dates_use_relative_weekday_and_concrete_labels() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 17).unwrap();
+        let snapshot = WeatherSnapshot {
+            predict: Some(ForecastReport {
+                days: [
+                    "2026-07-15",
+                    "2026-07-16",
+                    "2026-07-17",
+                    "2026-07-18",
+                    "2026-07-19",
+                    "2026-07-24",
+                    "2026-07-25",
+                ]
+                .into_iter()
+                .map(|date| ForecastDay {
+                    date: date.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let labels = WeatherView::new_at(&snapshot, today)
+            .forecast
+            .unwrap()
+            .days
+            .into_iter()
+            .map(|day| day.date)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            labels,
+            [
+                "2026-07-15",
+                "昨天",
+                "今天",
+                "明天",
+                "星期日",
+                "星期五",
+                "2026-07-25",
+            ]
+        );
     }
 
     #[test]
@@ -286,25 +357,25 @@ mod tests {
         let prevention = "减少户外活动；远离高处。";
         let view = WeatherView::new(&WeatherSnapshot {
             real: Some(ObservedWeather {
-                alert: Some(WeatherAlert {
+                alerts: vec![WeatherAlert {
                     alert: Some("雷电黄色预警".to_string()),
                     signal_level: Some("黄色".to_string()),
                     issue_content: Some(issue_content.to_string()),
                     prevention: Some(prevention.to_string()),
                     ..Default::default()
-                }),
+                }],
                 ..Default::default()
             }),
             ..Default::default()
         });
 
-        let alert = view.alert.unwrap();
+        let alert = view.alerts.into_iter().next().unwrap();
         assert_eq!(alert.issue_content.as_deref(), Some(issue_content));
         assert_eq!(alert.prevention.as_deref(), Some(prevention));
         assert_eq!(
             alert.lines,
             vec![
-                "雷电黄色预警 黄色",
+                "[当前站点] 雷电黄色预警 黄色",
                 "预计有雷阵雨",
                 "伴有阵风",
                 "请注意防范。",

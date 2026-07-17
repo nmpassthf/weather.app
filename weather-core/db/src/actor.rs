@@ -66,6 +66,12 @@ pub(crate) enum DbCommand {
         uuid: String,
         reply: oneshot::Sender<Result<Option<StoredSnapshot>>>,
     },
+    GetHistorySnapshotPage {
+        uuid: String,
+        before_date: Option<String>,
+        page_size: usize,
+        reply: oneshot::Sender<Result<StoredSnapshotPage>>,
+    },
     ReplaceProviderProvinces {
         provider: String,
         provinces: Vec<ProviderProvince>,
@@ -127,8 +133,15 @@ pub(crate) enum DbCommand {
 
 #[derive(Debug)]
 pub struct StoredSnapshot {
+    pub date: String,
     pub snapshot: WeatherSnapshot,
     pub fetched_at_unix_ms: i64,
+}
+
+#[derive(Debug)]
+pub struct StoredSnapshotPage {
+    pub snapshots: Vec<StoredSnapshot>,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -443,6 +456,21 @@ impl DbActor {
             .await
     }
 
+    pub async fn get_history_snapshot_page(
+        &self,
+        uuid: String,
+        before_date: Option<String>,
+        page_size: usize,
+    ) -> Result<StoredSnapshotPage> {
+        self.call(|reply| DbCommand::GetHistorySnapshotPage {
+            uuid,
+            before_date,
+            page_size,
+            reply,
+        })
+        .await
+    }
+
     pub async fn replace_provider_provinces(
         &self,
         provider: &str,
@@ -716,6 +744,9 @@ impl DbCommand {
             Self::GetLatestSnapshot { reply, .. } => {
                 let _ = reply.send(rejected_command(message));
             }
+            Self::GetHistorySnapshotPage { reply, .. } => {
+                let _ = reply.send(rejected_command(message));
+            }
             Self::GetProviderProvinces { reply, .. } => {
                 let _ = reply.send(rejected_command(message));
             }
@@ -757,6 +788,16 @@ fn handle(db: &mut DbInstance, cmd: DbCommand) -> Option<Arc<str>> {
         }
         DbCommand::GetLatestSnapshot { uuid, reply } => {
             let _ = reply.send(db.get_latest_snapshot(&uuid));
+            None
+        }
+        DbCommand::GetHistorySnapshotPage {
+            uuid,
+            before_date,
+            page_size,
+            reply,
+        } => {
+            let _ =
+                reply.send(db.get_history_snapshot_page(&uuid, before_date.as_deref(), page_size));
             None
         }
         DbCommand::ReplaceProviderProvinces {

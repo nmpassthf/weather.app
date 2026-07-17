@@ -17,6 +17,12 @@ pub struct WeatherFetch {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ProviderResource {
+    pub content_type: String,
+    pub bytes: Arc<[u8]>,
+}
+
 pub trait WeatherProvider: Send + Sync {
     fn provider_name(&self) -> &str;
     fn provinces(&self) -> ProviderFuture<'_, Vec<ProviderProvince>>;
@@ -29,6 +35,10 @@ pub trait WeatherProvider: Send + Sync {
         provider_station_id: &'a str,
         include_debug: bool,
     ) -> ProviderFuture<'a, WeatherFetch>;
+
+    fn resource<'a>(&'a self, _source_url: &'a str) -> ProviderFuture<'a, ProviderResource> {
+        Box::pin(async { bail!("provider does not support remote resources") })
+    }
 }
 
 pub fn create_weather_provider(config: &UpdaterConfig) -> Result<Arc<dyn WeatherProvider>> {

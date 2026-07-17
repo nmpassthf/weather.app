@@ -3,6 +3,7 @@ mod path;
 mod probe;
 mod run;
 mod service;
+mod stop;
 
 use anyhow::Result;
 use clap::Parser;
@@ -12,6 +13,7 @@ use crate::{
     probe::probe,
     run::run,
     service::{install_service, reinstall_service, uninstall_service},
+    stop::stop,
 };
 
 #[tokio::main]
@@ -50,5 +52,6 @@ async fn main() -> Result<()> {
             } => uninstall_service(backend, system, path, config, with_data, with_bin, all),
         },
         Command::Status { config, verbose } => probe(config, verbose).await,
+        Command::Stop { config } => stop(config).await,
     }
 }

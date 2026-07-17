@@ -11,6 +11,7 @@ use super::dto::{CityDto, ProvinceDto};
 const USER_AGENT: &str = "weather.app/0.1";
 const PROVINCES_PATH: &str = "rest/province/all";
 const WEATHER_PATH: &str = "rest/weather";
+const MAX_RESOURCE_BYTES: usize = 8 * 1024 * 1024;
 
 pub(super) struct JsonDocument {
     pub(super) endpoint: Url,
@@ -59,6 +60,24 @@ impl NmcTransport {
             .await?;
         Ok(JsonDocument { endpoint, body })
     }
+
+    pub(super) async fn resource(&self, source_url: &str) -> Result<(String, Vec<u8>)> {
+        let url = Url::parse(source_url).context("invalid NMC resource URL")?;
+        if url.scheme() != self.base_url.scheme()
+            || url.host_str() != self.base_url.host_str()
+            || url.port_or_known_default() != self.base_url.port_or_known_default()
+        {
+            anyhow::bail!("NMC resource URL is outside the configured provider origin");
+        }
+        let (content_type, bytes) = self.http.get_binary_url(&url, MAX_RESOURCE_BYTES).await?;
+        if !matches!(
+            content_type.as_str(),
+            "image/png" | "image/jpeg" | "image/jpg" | "image/webp" | "image/gif"
+        ) {
+            anyhow::bail!("unsupported NMC resource content type `{content_type}`");
+        }
+        Ok((content_type, bytes))
+    }
 }
 
 fn effective_network(
@@ -97,7 +116,45 @@ fn overlay_value(target: &mut Option<String>, value: Option<&str>) {
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
+
+    fn transport(base_url: String) -> NmcTransport {
+        NmcTransport::new(
+            &ProviderConfig {
+                name: "nmc".to_string(),
+                base_url,
+                request_timeout_seconds: 3,
+                network: ProviderNetworkConfig {
+                    http_proxy: Some(String::new()),
+                    https_proxy: Some(String::new()),
+                    all_proxy: Some(String::new()),
+                    ..Default::default()
+                },
+            },
+            &NetworkConfig::default(),
+        )
+        .unwrap()
+    }
+
+    async fn resource_server(content_type: &str, body: &[u8], content_length: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let content_type = content_type.to_string();
+        let body = body.to_vec();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2_048];
+            let _ = stream.read(&mut request).await.unwrap();
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+        });
+        format!("http://{address}/nmc/")
+    }
 
     #[test]
     fn provider_network_overrides_global_and_environment_by_field() {
@@ -134,5 +191,60 @@ mod tests {
         assert_eq!(effective.no_proxy, None);
         assert_eq!(effective.all_proxy, None);
         assert!(!effective.allow_insecure);
+    }
+
+    #[tokio::test]
+    async fn resource_rejects_urls_outside_the_configured_origin() {
+        let transport = transport("http://127.0.0.1:41001/nmc/".to_string());
+
+        let error = transport
+            .resource("http://127.0.0.1:41002/radar.png")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("outside the configured provider origin"));
+    }
+
+    #[tokio::test]
+    async fn resource_accepts_same_origin_images() {
+        let base_url = resource_server("image/png", b"png", 3).await;
+        let transport = transport(base_url.clone());
+
+        let (content_type, bytes) = transport
+            .resource(&format!("{base_url}radar.png"))
+            .await
+            .unwrap();
+
+        assert_eq!(content_type, "image/png");
+        assert_eq!(bytes, b"png");
+    }
+
+    #[tokio::test]
+    async fn resource_rejects_non_image_content_types() {
+        let base_url = resource_server("text/html; charset=utf-8", b"html", 4).await;
+        let transport = transport(base_url.clone());
+
+        let error = transport
+            .resource(&format!("{base_url}radar.html"))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unsupported NMC resource content type `text/html`"));
+    }
+
+    #[tokio::test]
+    async fn resource_rejects_declared_sizes_above_the_limit() {
+        let base_url = resource_server("image/png", b"", MAX_RESOURCE_BYTES + 1).await;
+        let transport = transport(base_url.clone());
+
+        let error = transport
+            .resource(&format!("{base_url}radar.png"))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("exceeds 8388608 bytes"));
     }
 }

@@ -1,7 +1,8 @@
 # Weather App
 
-A layered Rust weather client and local weather service. The current frontend is
-`weather-tui`, backed by a local `weather-engine` managed by `weather-daemon`.
+A layered Rust weather client and local weather service. The project provides
+both `weather-tui` and a Tauri-based `weather-gui`, backed by a local
+`weather-engine` managed by `weather-daemon`.
 Weather data is fetched from the NMC provider, cached locally, and exposed to
 frontends through the shared `weather-schema` protocol.
 
@@ -46,6 +47,10 @@ weather-tui stations add "北京-北京市"
 # Show engine status or stop the active engine
 weather-tui engine status
 weather-tui engine stop
+
+# Control the daemon directly
+weather-daemon status
+weather-daemon stop
 ```
 
 Use `-c/--config <path>` to select a config file. By default, the app uses
@@ -89,6 +94,63 @@ Omitted provider network fields inherit `updater.network`; an explicitly empty
 provider value clears that global value. `allow_insecure = true` disables TLS
 certificate validation and should only be used for a trusted intercepting
 proxy. Changing global or provider network settings requires an engine restart.
+`engine.request_timeout_ms` remains the short budget for local/control RPCs.
+Weather and catalog RPCs derive a larger end-to-end budget from the active
+provider's `request_timeout_seconds`, so a cold catalog plus weather fetch is
+not cancelled by the control-plane timeout.
+New configurations use a 600-second weather TTL. The refresh scheduler treats
+the two-level parent of every enabled three-level station as implicitly
+tracked, refreshes that parent before the child, and stores both snapshots in
+the engine database without adding the parent to the user's station config.
+
+## GUI
+
+The cross-platform desktop renderer lives in `weather-renderer/gui`. It keeps
+feature parity with the interactive TUI for weather display, station search and
+management, refresh, engine status/events, config inspection, restart, and
+stop. It uses the same protobuf/ZMQ client layer and never accesses provider or
+database internals directly. GUI dependencies and scripts use Bun, with the
+expected version pinned in `weather-renderer/gui/package.json`.
+Weather alerts are a list. Three-level station responses keep their own alerts
+first, then append deduplicated alerts inherited from their two-level parent;
+two-level stations do not inherit from a synthetic one-level parent.
+The GUI requests the current station's DB-backed daily temperature series in
+date-cursor pages through `GET_TEMPERATURE_HISTORY`; the engine reduces stored
+snapshots to historical daily highs/lows and appends the latest forecast only
+to the first page without exposing database rows to the renderer. The chart
+opens on two historical days through seven forecast days, fills the available
+card width, and loads every remaining history page as the user scrolls toward
+the past. It also supports desktop hover, mobile long-press/drag, and keyboard
+point inspection. GUI and TUI multi-day views label yesterday, today, and
+tomorrow relatively, use weekdays for days +2 through +7, and use concrete
+calendar dates outside that window.
+Remote images are represented by opaque engine resource IDs rather than NMC
+URLs. `GET_RESOURCE` starts an upstream download asynchronously and returns a
+short `PENDING` response while it is in flight; once ready, clients pull the
+binary data in bounded offset-based chunks. This keeps provider download time
+outside the normal engine RPC timeout. The engine caches at most 32 MiB in
+memory for 15 minutes and never stores binary content in the database.
+GUI-only preferences live in `weather-gui.toml` beside the selected engine
+configuration (`~/.weather/config/weather-gui.toml` by default). The GUI debug
+setting is disabled by default; it can be enabled from “关于与设置” to allow
+selection, context menus, and F12 developer tools. Use `WEATHER_GUI_CONFIG` to
+override the GUI configuration path.
+The GUI also owns `weather-gui.db` in that directory for current-day display
+snapshots only. It is not an engine cache: reopening the GUI and switching
+stations always trigger a fresh engine update, and stale fallback is identified
+by a persistent top-of-window warning. `WEATHER_GUI_DB` overrides this database
+path.
+
+```sh
+cargo build -p weather-daemon
+cd weather-renderer/gui
+bun install
+bun run tauri dev
+```
+
+Run `bun run bundle` from that directory for a native package with the matching
+release daemon staged as an application resource. See
+`weather-renderer/gui/README.md` for target and platform prerequisites.
 
 ## Service Installation
 

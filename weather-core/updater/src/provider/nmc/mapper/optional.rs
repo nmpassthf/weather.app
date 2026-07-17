@@ -96,6 +96,7 @@ pub(super) fn map_radar(raw: Option<Value>, context: &mut MappingContext<'_>) ->
             "radar.page_url",
             context,
         ),
+        image_resource_id: None,
     };
     if radar.title.is_some() || radar.image_url.is_some() || radar.page_url.is_some() {
         Some(radar)

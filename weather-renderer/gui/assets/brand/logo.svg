@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-label="Weather">
+  <defs><linearGradient id="b" x1="18" y1="12" x2="78" y2="86" gradientUnits="userSpaceOnUse"><stop stop-color="#53B9FF"/><stop offset="1" stop-color="#176EC8"/></linearGradient></defs>
+  <rect x="7" y="7" width="82" height="82" rx="25" fill="url(#b)"/>
+  <circle cx="58" cy="35" r="15" fill="#FFE47A"/>
+  <path d="M26 66c0-9 7-16 16-16 3-9 12-14 21-11 7 2 12 8 13 15 7 1 12 6 12 13 0 8-7 14-15 14H41c-8 0-15-7-15-15Z" fill="#fff" fill-opacity=".96"/>
+</svg>

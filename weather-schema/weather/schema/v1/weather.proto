@@ -59,6 +59,8 @@ enum RpcKind {
   MIGRATE_DB_TIMEZONE = 17;
   GET_CONFIG = 18;
   UPDATE_CONFIG = 19;
+  GET_RESOURCE = 20;
+  GET_TEMPERATURE_HISTORY = 21;
   // Legacy alias for GET_WEATHER with refresh=true.
   TRIGGER_REFRESH = 30;
   RESTART_ENGINE = 40;
@@ -138,6 +140,58 @@ message GetWeatherRequest {
   bool refresh = 2;
   bool include_debug = 3;
   reserved 4 to 19;
+  reserved 20 to 39;
+}
+
+message GetTemperatureHistoryRequest {
+  string unified_uuid = 1;
+  // Historical DB days are paged from newest to oldest. Empty means the
+  // newest page; otherwise this is an exclusive YYYY-MM-DD cursor.
+  optional string before_date = 2;
+  uint32 page_size = 3;
+  reserved 20 to 39;
+}
+
+message DailyTemperaturePoint {
+  string date = 1;
+  optional double max_temperature = 2;
+  optional double min_temperature = 3;
+  bool forecast = 4;
+  reserved 20 to 39;
+}
+
+message GetTemperatureHistoryResponse {
+  repeated DailyTemperaturePoint points = 1;
+  optional string next_before_date = 2;
+  bool has_more_history = 3;
+  reserved 20 to 39;
+}
+
+message GetResourceRequest {
+  string resource_id = 1;
+  uint64 offset = 2;
+  uint32 max_bytes = 3;
+  // Resource fetching is always asynchronous. Clients poll until
+  // transfer_state becomes READY, then continue requesting byte ranges.
+  reserved 20 to 39;
+}
+
+enum ResourceTransferState {
+  RESOURCE_TRANSFER_STATE_UNSPECIFIED = 0;
+  RESOURCE_TRANSFER_STATE_READY = 1;
+  RESOURCE_TRANSFER_STATE_PENDING = 2;
+}
+
+message GetResourceResponse {
+  string resource_id = 1;
+  string content_type = 2;
+  bytes data = 3;
+  uint64 total_size = 4;
+  uint64 next_offset = 5;
+  bool complete = 6;
+  bool cache_hit = 7;
+  ResourceTransferState transfer_state = 8;
+  uint32 retry_after_ms = 9;
   reserved 20 to 39;
 }
 
@@ -379,7 +433,7 @@ message ObservedWeather {
   optional double wind_speed = 9;
   optional string sunrise = 10;
   optional string sunset = 11;
-  WeatherAlert alert = 12;
+  repeated WeatherAlert alerts = 12;
   optional double temperature_diff = 13;
   optional double air_pressure = 14;
   optional string comfort_index = 15;
@@ -399,6 +453,8 @@ message WeatherAlert {
   optional string signal_level = 8;
   optional string icon_url = 9;
   optional string icon_name = 10;
+  optional string icon_resource_id = 11;
+  bool inherited = 12;
 }
 
 message ForecastReport {
@@ -477,6 +533,7 @@ message RadarInfo {
   optional string title = 2;
   optional string image_url = 3;
   optional string page_url = 4;
+  optional string image_resource_id = 5;
 }
 message DebugPayload {
   string provider = 1;

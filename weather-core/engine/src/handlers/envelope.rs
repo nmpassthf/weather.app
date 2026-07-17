@@ -64,6 +64,8 @@ impl Engine {
             RpcKind::ResolveStationUuid => self.handle_resolve_station_uuid(&request).await,
             RpcKind::MigrateDbTimezone => self.handle_migrate_db_timezone(&request).await,
             RpcKind::GetWeather => self.handle_get_weather(&request).await,
+            RpcKind::GetResource => self.handle_get_resource(&request).await,
+            RpcKind::GetTemperatureHistory => self.handle_get_temperature_history(&request).await,
             RpcKind::FuzzyMatchStations => self.handle_fuzzy(&request).await,
             RpcKind::TriggerRefresh => self.handle_trigger_refresh(&request).await,
             RpcKind::RestartEngine => self.accepted(&request.request_id, Empty {}),

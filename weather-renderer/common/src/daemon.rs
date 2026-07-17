@@ -1,4 +1,7 @@
 use std::{
+    error::Error,
+    fmt, io,
+    path::Path,
     path::PathBuf,
     process::{Child, Command as StdCommand, ExitStatus, Stdio},
     time::Duration,
@@ -9,21 +12,48 @@ use serde::Deserialize;
 use tokio::{process::Command as TokioCommand, time::Instant};
 use weather_schema::{EngineLockMetadata, correlation_id};
 
-use crate::cli::Cli;
-
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-pub(crate) struct DaemonSupervisor {
+pub struct DaemonSupervisor {
     exe: PathBuf,
     config: Option<PathBuf>,
 }
 
-pub(crate) struct ForegroundDaemon {
+#[derive(Debug)]
+pub struct DaemonExecutableNotFound {
+    executable: PathBuf,
+}
+
+impl DaemonExecutableNotFound {
+    pub fn new(executable: impl Into<PathBuf>) -> Self {
+        Self {
+            executable: executable.into(),
+        }
+    }
+
+    pub fn executable(&self) -> &Path {
+        &self.executable
+    }
+}
+
+impl fmt::Display for DaemonExecutableNotFound {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "daemon executable `{}` was not found",
+            self.executable.display()
+        )
+    }
+}
+
+impl Error for DaemonExecutableNotFound {}
+
+pub struct ForegroundDaemon {
     child: Child,
     graceful_shutdown_requested: bool,
 }
 
-pub(crate) enum EngineOwnership {
+pub enum EngineOwnership {
     Direct,
     Adopted,
     Owned {
@@ -32,9 +62,9 @@ pub(crate) enum EngineOwnership {
     },
 }
 
-pub(crate) struct ReadyDaemon {
-    pub(crate) probe: DaemonProbe,
-    pub(crate) ownership: EngineOwnership,
+pub struct ReadyDaemon {
+    pub probe: DaemonProbe,
+    pub ownership: EngineOwnership,
 }
 
 struct SpawnedForeground {
@@ -56,10 +86,10 @@ enum ReadinessDecision {
 }
 
 impl DaemonSupervisor {
-    pub(crate) fn from_cli(cli: &Cli) -> Result<Self> {
+    pub fn new(daemon_exe: Option<PathBuf>, config: Option<PathBuf>) -> Result<Self> {
         Ok(Self {
-            exe: cli.daemon_exe.clone().unwrap_or(resolve_daemon_exe()?),
-            config: cli.config.clone(),
+            exe: daemon_exe.unwrap_or(resolve_daemon_exe()?),
+            config,
         })
     }
 
@@ -78,14 +108,14 @@ impl DaemonSupervisor {
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
-            .with_context(|| format!("failed to start foreground daemon {}", self.exe.display()))?;
+            .map_err(|error| daemon_command_error(&self.exe, "start foreground daemon", error))?;
         Ok(ForegroundDaemon {
             child,
             graceful_shutdown_requested: false,
         })
     }
 
-    pub(crate) async fn probe(&self) -> Result<DaemonProbe> {
+    pub async fn probe(&self) -> Result<DaemonProbe> {
         self.probe_with_deadline(None).await
     }
 
@@ -108,19 +138,17 @@ impl DaemonSupervisor {
                 .await
                 .with_context(|| {
                     format!("timed out waiting for daemon probe {}", self.exe.display())
-                })??,
-            None => command
-                .output()
-                .await
-                .with_context(|| format!("failed to run daemon probe {}", self.exe.display()))?,
-        };
+                })?,
+            None => command.output().await,
+        }
+        .map_err(|error| daemon_command_error(&self.exe, "run daemon probe", error))?;
         if !output.status.success() {
             bail!("daemon probe failed with status {}", output.status);
         }
         serde_json::from_slice(&output.stdout).context("failed to parse daemon probe status")
     }
 
-    pub(crate) async fn ensure_ready(&self, initial: DaemonProbe) -> Result<ReadyDaemon> {
+    pub async fn ensure_ready(&self, initial: DaemonProbe) -> Result<ReadyDaemon> {
         match initial.state {
             DaemonProbeState::Running => Ok(ReadyDaemon {
                 probe: initial,
@@ -203,20 +231,27 @@ impl DaemonSupervisor {
     }
 }
 
+fn daemon_command_error(executable: &Path, operation: &str, error: io::Error) -> anyhow::Error {
+    if error.kind() == io::ErrorKind::NotFound {
+        return anyhow::Error::new(DaemonExecutableNotFound::new(executable));
+    }
+    anyhow::Error::new(error).context(format!("failed to {operation} {}", executable.display()))
+}
+
 #[derive(Debug, Deserialize)]
-pub(crate) struct DaemonProbe {
-    pub(crate) state: DaemonProbeState,
-    pub(crate) rpc_endpoint: String,
-    pub(crate) pub_endpoint: String,
-    pub(crate) lock_age_ms: Option<u64>,
-    pub(crate) startup_timeout_ms: u64,
-    pub(crate) lock_metadata: Option<EngineLockMetadata>,
-    pub(crate) message: Option<String>,
+pub struct DaemonProbe {
+    pub state: DaemonProbeState,
+    pub rpc_endpoint: String,
+    pub pub_endpoint: String,
+    pub lock_age_ms: Option<u64>,
+    pub startup_timeout_ms: u64,
+    pub lock_metadata: Option<EngineLockMetadata>,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum DaemonProbeState {
+pub enum DaemonProbeState {
     NotRunning,
     Starting,
     Running,
@@ -262,7 +297,7 @@ fn readiness_deadline(wait: Duration) -> Result<Instant> {
         .context("configured engine startup timeout is too large")
 }
 
-pub(crate) fn probe_state_error(state: DaemonProbeState, message: Option<&str>) -> String {
+pub fn probe_state_error(state: DaemonProbeState, message: Option<&str>) -> String {
     let state = match state {
         DaemonProbeState::NotRunning => "not_running",
         DaemonProbeState::Starting => "starting",
@@ -287,7 +322,7 @@ impl ForegroundDaemon {
             .context("failed to inspect foreground daemon process")
     }
 
-    pub(crate) fn mark_graceful_shutdown_requested(&mut self) {
+    pub fn mark_graceful_shutdown_requested(&mut self) {
         self.graceful_shutdown_requested = true;
     }
 }
@@ -448,5 +483,37 @@ mod tests {
     #[test]
     fn direct_ownership_is_an_explicit_state() {
         assert!(matches!(EngineOwnership::Direct, EngineOwnership::Direct));
+    }
+
+    #[test]
+    fn missing_daemon_command_preserves_a_typed_error() {
+        let error = daemon_command_error(
+            Path::new("weather-daemon"),
+            "run daemon probe",
+            io::Error::from(io::ErrorKind::NotFound),
+        );
+        let missing = error
+            .downcast_ref::<DaemonExecutableNotFound>()
+            .expect("missing command should retain its type");
+
+        assert_eq!(missing.executable(), Path::new("weather-daemon"));
+        assert_eq!(
+            error.to_string(),
+            "daemon executable `weather-daemon` was not found"
+        );
+    }
+
+    #[test]
+    fn other_daemon_spawn_errors_keep_operation_context() {
+        let error = daemon_command_error(
+            Path::new("weather-daemon"),
+            "run daemon probe",
+            io::Error::from(io::ErrorKind::PermissionDenied),
+        );
+
+        assert_eq!(
+            error.to_string(),
+            "failed to run daemon probe weather-daemon"
+        );
     }
 }

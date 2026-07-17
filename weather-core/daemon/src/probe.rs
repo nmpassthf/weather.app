@@ -31,7 +31,7 @@ pub(crate) enum ProbeState {
 }
 
 impl ProbeState {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::NotRunning => "not_running",
             Self::Starting => "starting",
@@ -43,20 +43,20 @@ impl ProbeState {
 }
 
 #[derive(Debug, Serialize)]
-struct ProbeStatus {
-    state: ProbeState,
-    rpc_endpoint: String,
+pub(crate) struct ProbeStatus {
+    pub(crate) state: ProbeState,
+    pub(crate) rpc_endpoint: String,
     pub_endpoint: String,
     config_path: String,
     lock_path: String,
     lock_held: bool,
     lock_age_ms: Option<u64>,
     startup_timeout_ms: u64,
-    lock_metadata: Option<EngineLockMetadata>,
+    pub(crate) lock_metadata: Option<EngineLockMetadata>,
     rpc_endpoint_reachable: bool,
     pub_endpoint_reachable: bool,
     engine_status: Option<EngineStatusView>,
-    message: Option<String>,
+    pub(crate) message: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -125,7 +125,7 @@ pub(crate) async fn probe(config: Option<PathBuf>, verbose: bool) -> Result<()> 
     Ok(())
 }
 
-async fn probe_status(config: Option<PathBuf>) -> Result<ProbeStatus> {
+pub(crate) async fn probe_status(config: Option<PathBuf>) -> Result<ProbeStatus> {
     let strict_config = config.is_some();
     let config_path = absolute_config_path(match config {
         Some(path) => path,
