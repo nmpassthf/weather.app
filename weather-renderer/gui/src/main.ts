@@ -1,6 +1,11 @@
 import { assets, usableWeatherDescription, weatherAsset } from "./assets";
 import { invokeBinaryCommand, invokeCommand as invoke, listenEvent as listen } from "./bridge";
 import { calendarDateIso, multiDayDateLabel, multiDayDateTimeLabel } from "./date";
+import {
+  recentTemperatureHistoryRows,
+  savitzkyGolayTemperaturePlotSamples,
+  temperatureHistoryTickIndices,
+} from "./history";
 import type {
   AppConfig,
   BootstrapPayload,
@@ -831,7 +836,7 @@ function aqiLevel(aqi?: number | null): string {
 function renderHistory(weather: WeatherSnapshot | null, placeholder = false): void {
   historyInteractionCleanup?.();
   historyInteractionCleanup = null;
-  const rows = (weather?.passedchart ?? []).filter((row) => typeof row.temperature === "number").slice(-18);
+  const rows = recentTemperatureHistoryRows(weather?.passedchart ?? []);
   const target = element<HTMLDivElement>("history-chart");
   target.replaceChildren();
   element("history-time").textContent = rows.length
@@ -852,19 +857,72 @@ function renderHistory(weather: WeatherSnapshot | null, placeholder = false): vo
   const min = Math.min(...temperatures);
   const max = Math.max(...temperatures);
   const span = Math.max(max - min, 1);
+  const plotLeft = 28;
+  const plotRight = 319;
+  const plotTop = 12;
+  const plotBottom = 82;
   const chartPoints = temperatures.map((temperature, index) => {
-    const x = (index / (temperatures.length - 1)) * 320;
-    const y = 88 - ((temperature - min) / span) * 68;
+    const x = plotLeft + (index / (temperatures.length - 1)) * (plotRight - plotLeft);
+    const y = max === min
+      ? (plotTop + plotBottom) / 2
+      : plotBottom - ((temperature - min) / span) * (plotBottom - plotTop);
     return { x, y };
   });
-  const points = chartPoints.map(({ x, y }) => `${x.toFixed(1)},${y.toFixed(1)}`);
+  const plotPoints = savitzkyGolayTemperaturePlotSamples(temperatures).map((sample) => {
+    const x = plotLeft + (sample.position / (temperatures.length - 1)) * (plotRight - plotLeft);
+    const y = max === min
+      ? (plotTop + plotBottom) / 2
+      : plotBottom - ((sample.temperature - min) / span) * (plotBottom - plotTop);
+    return { x, y };
+  });
+  const points = plotPoints.map(({ x, y }) => `${x.toFixed(1)},${y.toFixed(1)}`);
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  svg.setAttribute("viewBox", "0 0 320 108");
+  svg.setAttribute("viewBox", "0 0 320 112");
+  svg.setAttribute("preserveAspectRatio", "none");
   svg.setAttribute("role", "img");
-  svg.setAttribute("aria-label", "过去温度趋势，悬停或长按查看各时段气温");
+  svg.setAttribute("aria-label", `过去温度趋势，最低 ${min.toFixed(1)}°，最高 ${max.toFixed(1)}°，悬停或长按查看各时段气温`);
   svg.setAttribute("tabindex", "0");
+  const axes = document.createElementNS(svg.namespaceURI, "g");
+  axes.setAttribute("class", "chart-axes");
+  axes.setAttribute("aria-hidden", "true");
+  const axisLabels = document.createElement("div");
+  axisLabels.className = "chart-axis-labels";
+  axisLabels.setAttribute("aria-hidden", "true");
+  for (const [temperature, y] of [[max, plotTop], [min, plotBottom]] as const) {
+    const gridLine = document.createElementNS(svg.namespaceURI, "line");
+    gridLine.setAttribute("class", "chart-range-line");
+    gridLine.setAttribute("x1", String(plotLeft));
+    gridLine.setAttribute("x2", String(plotRight));
+    gridLine.setAttribute("y1", String(y));
+    gridLine.setAttribute("y2", String(y));
+    const label = document.createElement("span");
+    label.className = "chart-range-label";
+    label.style.left = `${((plotLeft - 4) / 320) * 100}%`;
+    label.style.top = `${(y / 112) * 100}%`;
+    label.textContent = `${temperature.toFixed(1)}°`;
+    axes.append(gridLine);
+    axisLabels.append(label);
+  }
+  for (const index of temperatureHistoryTickIndices(rows.length)) {
+    const chartPoint = chartPoints[index];
+    const row = rows[index];
+    if (!chartPoint || !row) continue;
+    const tick = document.createElementNS(svg.namespaceURI, "line");
+    tick.setAttribute("class", "chart-time-tick");
+    tick.setAttribute("x1", String(chartPoint.x));
+    tick.setAttribute("x2", String(chartPoint.x));
+    tick.setAttribute("y1", String(plotBottom));
+    tick.setAttribute("y2", String(plotBottom + 5));
+    const label = document.createElement("span");
+    label.className = "chart-time-label";
+    label.style.left = `${(chartPoint.x / 320) * 100}%`;
+    label.style.top = `${(102 / 112) * 100}%`;
+    label.textContent = clockTime(row.time);
+    axes.append(tick);
+    axisLabels.append(label);
+  }
   const area = document.createElementNS(svg.namespaceURI, "polygon");
-  area.setAttribute("points", `0,108 ${points.join(" ")} 320,108`);
+  area.setAttribute("points", `${plotLeft},${plotBottom} ${points.join(" ")} ${plotRight},${plotBottom}`);
   area.setAttribute("class", "chart-area");
   const line = document.createElementNS(svg.namespaceURI, "polyline");
   line.setAttribute("points", points.join(" "));
@@ -874,8 +932,8 @@ function renderHistory(weather: WeatherSnapshot | null, placeholder = false): vo
   inspector.setAttribute("aria-hidden", "true");
   const guide = document.createElementNS("http://www.w3.org/2000/svg", "line");
   guide.setAttribute("class", "chart-inspector-guide");
-  guide.setAttribute("y1", "8");
-  guide.setAttribute("y2", "101");
+  guide.setAttribute("y1", String(plotTop));
+  guide.setAttribute("y2", String(plotBottom));
   const halo = document.createElementNS("http://www.w3.org/2000/svg", "circle");
   halo.setAttribute("class", "chart-inspector-halo");
   halo.setAttribute("r", "7");
@@ -883,7 +941,7 @@ function renderHistory(weather: WeatherSnapshot | null, placeholder = false): vo
   point.setAttribute("class", "chart-inspector-point");
   point.setAttribute("r", "3.5");
   inspector.append(guide, halo, point);
-  svg.append(area, line, inspector);
+  svg.append(axes, area, line, inspector);
   const tooltip = document.createElement("div");
   tooltip.id = "history-chart-tooltip";
   tooltip.className = "chart-tooltip";
@@ -897,10 +955,8 @@ function renderHistory(weather: WeatherSnapshot | null, placeholder = false): vo
   const interactionHint = document.createElement("span");
   interactionHint.className = "chart-interaction-hint";
   interactionHint.textContent = "悬停 / 长按查看";
-  const range = document.createElement("span");
-  range.textContent = `${min.toFixed(1)}° — ${max.toFixed(1)}°`;
-  legend.append(interactionHint, range);
-  target.append(svg, tooltip, legend);
+  legend.append(interactionHint);
+  target.append(svg, axisLabels, tooltip, legend);
   historyInteractionCleanup = bindHistoryChartInteractions({
     target,
     svg,
@@ -944,7 +1000,7 @@ function bindHistoryChartInteractions(chart: HistoryChartInteraction): () => voi
     tooltipTime,
     tooltipTemperature,
   } = chart;
-  const baseLabel = "过去温度趋势，悬停或长按查看各时段气温";
+  const baseLabel = svg.getAttribute("aria-label") ?? "过去温度趋势，悬停或长按查看各时段气温";
   const LONG_PRESS_MS = 420;
   const LONG_PRESS_MOVE_TOLERANCE = 10;
   let activeIndex = rows.length - 1;

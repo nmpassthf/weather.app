@@ -259,10 +259,15 @@ body::before {
 .air-summary { margin: 0 0 17px; font-size: 12px; line-height: 1.6; }
 .pollutant-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; }
 .pollutant-grid span { padding: 8px; border-radius: 9px; background: var(--surface-muted); color: var(--muted); font-size: 10px; }
-.history-chart { position: relative; min-height: 119px; }
+.history-chart { position: relative; min-height: 139px; }
 .chart-placeholder { display: grid; place-items: center; height: 108px; color: var(--muted); }
-.history-chart svg { display: block; width: 100%; height: 108px; overflow: visible; border-radius: 9px; cursor: crosshair; outline: none; touch-action: pan-y; -webkit-touch-callout: none; }
+.history-chart svg { display: block; width: 100%; height: 112px; overflow: visible; border-radius: 9px; cursor: crosshair; outline: none; touch-action: pan-y; -webkit-touch-callout: none; }
 .history-chart svg:focus-visible { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent), transparent 62%); }
+.chart-axis-labels { position: absolute; inset: 0 0 auto; height: 112px; overflow: visible; pointer-events: none; }
+.chart-range-line { stroke: color-mix(in srgb, var(--muted), transparent 66%); stroke-width: 1; stroke-dasharray: 4 4; vector-effect: non-scaling-stroke; }
+.chart-range-label { position: absolute; color: var(--muted); font-size: 8px; font-variant-numeric: tabular-nums; line-height: 1; transform: translate(-100%, -50%); white-space: nowrap; }
+.chart-time-tick { stroke: color-mix(in srgb, var(--muted), transparent 46%); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.chart-time-label { position: absolute; color: var(--muted); font-size: 8px; font-variant-numeric: tabular-nums; line-height: 1; transform: translate(-50%, -50%); white-space: nowrap; }
 .chart-area { fill: color-mix(in srgb, var(--accent), transparent 86%); }
 .chart-line { fill: none; stroke: var(--accent); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
 .chart-inspector { opacity: 0; pointer-events: none; transition: opacity 100ms ease; }
@@ -273,7 +278,7 @@ body::before {
 .chart-tooltip { position: absolute; z-index: 4; display: flex; min-width: 92px; max-width: calc(100% - 8px); gap: 8px; align-items: center; justify-content: space-between; padding: 7px 9px; border: 1px solid var(--line-strong); border-radius: 9px; background: color-mix(in srgb, var(--surface-solid), transparent 3%); box-shadow: var(--small-shadow); color: var(--text); font-size: 10px; font-variant-numeric: tabular-nums; pointer-events: none; transform: translateX(-50%); white-space: nowrap; }
 .chart-tooltip time { min-width: 0; overflow: hidden; color: var(--muted); text-overflow: ellipsis; }
 .chart-tooltip strong { color: var(--accent); font-size: 11px; }
-.chart-legend { display: flex; justify-content: space-between; gap: 12px; margin-top: -3px; color: var(--muted); font-size: 10px; }
+.chart-legend { display: flex; justify-content: flex-start; gap: 12px; margin-top: 9px; padding-left: 28px; color: var(--muted); font-size: 10px; }
 .chart-interaction-hint { opacity: 0.78; }
 .history-chart[data-inspecting="true"] .chart-line { filter: drop-shadow(0 0 3px color-mix(in srgb, var(--accent), transparent 52%)); }
 .extra-content { display: grid; grid-template-columns: 1.3fr 1fr; gap: 18px; }

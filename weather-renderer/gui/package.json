@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420",
+    "test": "bun test",
     "build": "tsc --noEmit && vite build",
     "bundle": "bun scripts/stage-daemon.mjs && tauri build",
     "preview": "vite preview",
