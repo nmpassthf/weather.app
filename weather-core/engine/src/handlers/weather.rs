@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
-use weather_db::ProviderStation;
+use chrono::NaiveDate;
+use weather_db::{ProviderStation, StoredSnapshot};
 use weather_schema::*;
 use weather_updater::WeatherFetch;
 
+use super::temperature_history::{parse_full_date, parse_relative_date, parse_temperature};
 use crate::{
     handlers::RefreshTerminal, runtime::Engine, station::merge_station, time::date_for_tz,
 };
@@ -102,27 +104,49 @@ impl Engine {
             completion.set_unified_uuid(uuid.clone());
         }
         let include_debug = req.include_debug;
-        if !req.refresh
-            && !include_debug
-            && let Some(stored) = self.db.get_latest_snapshot(uuid.clone()).await?
-        {
-            let config = self.config.get();
-            if cached_snapshot_is_fresh(
-                stored.fetched_at_unix_ms,
-                self.weather_now_unix_ms(),
-                config.updater.weather_ttl_seconds,
-                &config.db.timezone,
-            )? {
-                let mut snapshot = stored.snapshot;
-                snapshot.station = Some(merge_station(snapshot.station.take(), &station));
-                let _ = self
-                    .apply_cached_municipality_air(&mut snapshot, &station)
-                    .await;
-                let _ = self.apply_parent_alerts(&mut snapshot, &station).await;
-                return Ok(self.prepare_snapshot_resources(snapshot));
+        if !req.refresh && !include_debug {
+            match self.db.get_latest_snapshot(uuid.clone()).await? {
+                Some(stored) => {
+                    let config = self.config.get();
+                    if cached_snapshot_is_fresh(
+                        stored.fetched_at_unix_ms,
+                        self.weather_now_unix_ms(),
+                        config.updater.weather_ttl_seconds,
+                        &config.db.timezone,
+                    )? {
+                        log::debug!("weather cache hit station={uuid}");
+                        let mut snapshot = stored.snapshot;
+                        snapshot.station = Some(merge_station(snapshot.station.take(), &station));
+                        if let Err(error) = self
+                            .apply_cached_municipality_air(&mut snapshot, &station)
+                            .await
+                        {
+                            log::warn!(
+                                "cached municipality air fallback failed station={uuid}: {error:#}"
+                            );
+                        }
+                        if let Err(error) = self.apply_parent_alerts(&mut snapshot, &station).await
+                        {
+                            log::warn!(
+                                "cached parent alert fallback failed station={uuid}: {error:#}"
+                            );
+                        }
+                        return Ok(self.prepare_snapshot_resources(snapshot));
+                    }
+                    log::debug!("weather cache stale station={uuid}");
+                }
+                None => log::debug!("weather cache miss station={uuid}"),
             }
+        } else {
+            log::debug!(
+                "weather cache bypassed station={} refresh={} include_debug={}",
+                uuid,
+                req.refresh,
+                include_debug
+            );
         }
 
+        log::debug!("weather upstream fetch queued station={uuid}");
         let flight_key = (uuid.clone(), include_debug);
         let singleflight = self.weather_singleflight.clone();
         let result = singleflight
@@ -148,6 +172,12 @@ impl Engine {
         include_debug: bool,
     ) -> Result<WeatherSnapshot> {
         let uuid = station.unified_uuid.clone();
+        log::debug!(
+            "weather upstream fetch started station={} provider={} provider_station={}",
+            uuid,
+            self.provider.provider_name(),
+            station.provider_station_id
+        );
         match self
             .provider
             .weather(&station.provider_station_id, include_debug)
@@ -157,7 +187,11 @@ impl Engine {
                 mut snapshot,
                 mut warnings,
             }) => {
+                log::debug!("weather upstream fetch succeeded station={uuid}");
                 snapshot.station = Some(merge_station(snapshot.station.take(), &station));
+                if let Err(err) = self.apply_cached_daily_high(&mut snapshot, &station).await {
+                    warnings.push(format!("daily high fallback failed: {err:#}"));
+                }
                 let debug = snapshot.debug.take();
                 let snapshot_for_storage = snapshot.clone();
                 snapshot.debug = debug;
@@ -193,6 +227,7 @@ impl Engine {
                 Ok(snapshot)
             }
             Err(err) => {
+                log::warn!("weather upstream fetch failed station={uuid}: {err:#}");
                 let fetch_error = format!("{err:#}");
                 let log_error = self
                     .db
@@ -218,6 +253,10 @@ impl Engine {
                 );
                 match self.db.get_latest_snapshot(uuid).await {
                     Ok(Some(mut stored)) => {
+                        log::warn!(
+                            "using stale weather cache after upstream failure station={}",
+                            station.unified_uuid
+                        );
                         stored.snapshot.station =
                             Some(merge_station(stored.snapshot.station.take(), &station));
                         stored.snapshot.stale = true;
@@ -324,6 +363,23 @@ impl Engine {
         Ok(true)
     }
 
+    async fn apply_cached_daily_high(
+        &self,
+        snapshot: &mut WeatherSnapshot,
+        station: &ProviderStation,
+    ) -> Result<bool> {
+        let config = self.config.get();
+        let today = date_for_tz(self.weather_now_unix_ms(), &config.db.timezone)?;
+        let Some(stored) = self
+            .db
+            .get_latest_snapshot(station.unified_uuid.clone())
+            .await?
+        else {
+            return Ok(false);
+        };
+        Ok(merge_cached_daily_high(snapshot, &stored, &today))
+    }
+
     /// 按 `unified_uuid` 反查 StationRef。
     ///
     /// 先查 DB stations 表；miss 则按 uuid 反推 name 不现实（uuid 是单向哈希），
@@ -377,6 +433,101 @@ impl Engine {
 
 fn warning_summary(warnings: &[String]) -> Option<String> {
     (!warnings.is_empty()).then(|| warnings.join("; "))
+}
+
+fn merge_cached_daily_high(
+    snapshot: &mut WeatherSnapshot,
+    stored: &StoredSnapshot,
+    today: &str,
+) -> bool {
+    if stored.date != today {
+        return false;
+    }
+    let Some(today) = parse_full_date(today) else {
+        return false;
+    };
+    let Some(high) = snapshot_daily_high(snapshot, today)
+        .or_else(|| snapshot_daily_high(&stored.snapshot, today))
+    else {
+        return false;
+    };
+
+    let mut changed = false;
+    if let Some(index) = current_forecast_index(snapshot, today)
+        && let Some(day) = snapshot
+            .predict
+            .as_mut()
+            .and_then(|forecast| forecast.days.get_mut(index))
+        && parse_temperature(day.day_temperature.as_deref())
+            .filter(|value| value.is_finite())
+            .is_none()
+    {
+        day.day_temperature = Some(temperature_text(high));
+        changed = true;
+    }
+    if let Some(index) = current_temperature_chart_index(snapshot, today) {
+        let chart = &mut snapshot.tempchart[index];
+        if chart
+            .max_temperature
+            .filter(|value| value.is_finite())
+            .is_none()
+        {
+            chart.max_temperature = Some(high);
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn snapshot_daily_high(snapshot: &WeatherSnapshot, today: NaiveDate) -> Option<f64> {
+    current_forecast_index(snapshot, today)
+        .and_then(|index| snapshot.predict.as_ref()?.days.get(index))
+        .and_then(|day| parse_temperature(day.day_temperature.as_deref()))
+        .filter(|value| value.is_finite())
+        .or_else(|| {
+            current_temperature_chart_index(snapshot, today)
+                .and_then(|index| snapshot.tempchart.get(index))
+                .and_then(|chart| chart.max_temperature)
+                .filter(|value| value.is_finite())
+        })
+}
+
+fn current_forecast_index(snapshot: &WeatherSnapshot, today: NaiveDate) -> Option<usize> {
+    snapshot
+        .predict
+        .as_ref()?
+        .days
+        .iter()
+        .position(|day| parse_relative_date(&day.date, today) == Some(today))
+}
+
+fn current_temperature_chart_index(snapshot: &WeatherSnapshot, today: NaiveDate) -> Option<usize> {
+    snapshot
+        .tempchart
+        .iter()
+        .position(|chart| {
+            chart
+                .date
+                .as_deref()
+                .and_then(|value| parse_relative_date(value, today))
+                == Some(today)
+        })
+        .or_else(|| {
+            (snapshot.tempchart.len() == 1
+                && snapshot.tempchart[0]
+                    .date
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty()))
+            .then_some(0)
+        })
+}
+
+fn temperature_text(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{value:.0}")
+    } else {
+        value.to_string()
+    }
 }
 
 fn first_enabled_station_name(config: &weather_configure::AppConfig) -> Option<&str> {
@@ -637,6 +788,48 @@ mod tests {
         }
     }
 
+    struct NightProvider;
+
+    impl WeatherProvider for NightProvider {
+        fn provider_name(&self) -> &str {
+            "night-test"
+        }
+
+        fn provinces(&self) -> ProviderFuture<'_, Vec<ProviderProvince>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn cities<'a>(
+            &'a self,
+            _provider_province_code: &'a str,
+        ) -> ProviderFuture<'a, Vec<ProviderCity>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn weather<'a>(
+            &'a self,
+            _provider_station_id: &'a str,
+            _include_debug: bool,
+        ) -> ProviderFuture<'a, WeatherFetch> {
+            Box::pin(async {
+                Ok(WeatherFetch {
+                    snapshot: WeatherSnapshot {
+                        predict: Some(ForecastReport {
+                            days: vec![ForecastDay {
+                                date: "06-24".to_string(),
+                                night_temperature: Some("24".to_string()),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    warnings: Vec::new(),
+                })
+            })
+        }
+    }
+
     fn warning_station() -> ProviderStation {
         let name = "北京-北京市-朝阳".to_string();
         ProviderStation {
@@ -729,6 +922,196 @@ mod tests {
 
         assert!(!cached_snapshot_is_fresh(fetched, now, 60, "Asia/Shanghai").unwrap());
         assert!(cached_snapshot_is_fresh(now - 1_000, now, 60, "Asia/Shanghai").unwrap());
+    }
+
+    #[test]
+    fn cached_daily_high_fills_only_missing_fields_for_today() {
+        let today = "2026-06-24";
+        let stored = StoredSnapshot {
+            date: today.to_string(),
+            snapshot: WeatherSnapshot {
+                tempchart: vec![TemperatureChart {
+                    date: Some("06-24".to_string()),
+                    max_temperature: Some(34.5),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            fetched_at_unix_ms: 1,
+        };
+        let mut snapshot = WeatherSnapshot {
+            predict: Some(ForecastReport {
+                days: vec![
+                    ForecastDay {
+                        date: "06-24".to_string(),
+                        ..Default::default()
+                    },
+                    ForecastDay {
+                        date: "06-25".to_string(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            tempchart: vec![
+                TemperatureChart {
+                    date: Some("2026-06-24".to_string()),
+                    ..Default::default()
+                },
+                TemperatureChart {
+                    date: Some("2026-06-25".to_string()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert!(merge_cached_daily_high(&mut snapshot, &stored, today));
+        let forecast = snapshot.predict.unwrap();
+        assert_eq!(forecast.days[0].day_temperature.as_deref(), Some("34.5"));
+        assert_eq!(forecast.days[1].day_temperature, None);
+        assert_eq!(snapshot.tempchart[0].max_temperature, Some(34.5));
+        assert_eq!(snapshot.tempchart[1].max_temperature, None);
+    }
+
+    #[test]
+    fn cached_daily_high_does_not_override_source_or_cross_dates() {
+        let cached_snapshot = WeatherSnapshot {
+            predict: Some(ForecastReport {
+                days: vec![ForecastDay {
+                    date: "06-23".to_string(),
+                    day_temperature: Some("33".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let previous_day = StoredSnapshot {
+            date: "2026-06-23".to_string(),
+            snapshot: cached_snapshot.clone(),
+            fetched_at_unix_ms: 1,
+        };
+        let mut snapshot = WeatherSnapshot {
+            predict: Some(ForecastReport {
+                days: vec![ForecastDay {
+                    date: "06-24".to_string(),
+                    day_temperature: Some("36".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(!merge_cached_daily_high(
+            &mut snapshot,
+            &previous_day,
+            "2026-06-24"
+        ));
+        assert_eq!(
+            snapshot.predict.as_ref().unwrap().days[0]
+                .day_temperature
+                .as_deref(),
+            Some("36")
+        );
+
+        let same_day = StoredSnapshot {
+            date: "2026-06-24".to_string(),
+            snapshot: WeatherSnapshot {
+                predict: Some(ForecastReport {
+                    days: vec![ForecastDay {
+                        date: "06-24".to_string(),
+                        day_temperature: Some("34".to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            fetched_at_unix_ms: 2,
+        };
+        assert!(!merge_cached_daily_high(
+            &mut snapshot,
+            &same_day,
+            "2026-06-24"
+        ));
+        assert_eq!(
+            snapshot.predict.unwrap().days[0].day_temperature.as_deref(),
+            Some("36")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evening_fetch_restores_and_persists_same_day_database_high() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("weather.toml");
+        let db_path = directory.path().join("weather.db");
+        let mut config = AppConfig::default();
+        config.db.path = db_path.display().to_string();
+        config.updater.default_provider = "night-test".to_string();
+        config.updater.provider[0].name = "night-test".to_string();
+        write_config_atomic(&config_path, &config).unwrap();
+        let now = 1_782_252_000_000;
+        let runtime = EngineRuntime::start_with_provider_and_clock(
+            config_path,
+            Arc::new(NightProvider),
+            Arc::new(FixedWeatherClock(now)),
+        )
+        .await
+        .unwrap();
+        let engine = runtime.test_engine();
+        let station = warning_station();
+        let mut station = ProviderStation {
+            provider_name: "night-test".to_string(),
+            ..station
+        };
+        station.unified_uuid = unified_station_uuid(&station.name);
+        engine
+            .db
+            .put_history_snapshot(
+                WeatherSnapshot {
+                    station: Some(station.public_ref()),
+                    predict: Some(ForecastReport {
+                        days: vec![ForecastDay {
+                            date: "2026-06-24".to_string(),
+                            day_temperature: Some("35.5".to_string()),
+                            night_temperature: Some("24".to_string()),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                now,
+            )
+            .await
+            .unwrap();
+
+        let snapshot = engine
+            .fetch_weather_uncached(station.clone(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.predict.as_ref().unwrap().days[0]
+                .day_temperature
+                .as_deref(),
+            Some("35.5")
+        );
+        let stored = engine
+            .db
+            .get_latest_snapshot(station.unified_uuid)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.date, "2026-06-24");
+        assert_eq!(
+            stored.snapshot.predict.unwrap().days[0]
+                .day_temperature
+                .as_deref(),
+            Some("35.5")
+        );
+        engine.db.shutdown().await.unwrap();
     }
 
     #[test]

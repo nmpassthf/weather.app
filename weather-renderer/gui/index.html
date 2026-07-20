@@ -6,12 +6,71 @@
     <meta name="color-scheme" content="light dark" />
     <meta name="theme-color" content="#e9f3ff" />
     <title>Weather</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --boot-bg: #eef5fb;
+        --boot-accent: #1676d2;
+        --boot-ring: rgba(22, 118, 210, 0.2);
+        --boot-glow: rgba(88, 177, 255, 0.2);
+        font-family: Inter, "SF Pro Display", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          color-scheme: dark;
+          --boot-bg: #0f1c25;
+          --boot-accent: #68b5ff;
+          --boot-ring: rgba(104, 181, 255, 0.2);
+          --boot-glow: rgba(88, 177, 255, 0.14);
+        }
+      }
+      html, body { margin: 0; min-width: 320px; min-height: 100%; background: var(--boot-bg); }
+      .boot {
+        position: fixed;
+        inset: 0;
+        z-index: 100;
+        display: grid;
+        overflow: hidden;
+        place-content: center;
+        justify-items: center;
+        gap: 18px;
+        background:
+          radial-gradient(circle at 74% 5%, var(--boot-glow), transparent 34%),
+          radial-gradient(circle at 16% 90%, rgba(91, 209, 185, 0.1), transparent 30%),
+          var(--boot-bg);
+        text-align: center;
+      }
+      .boot::before {
+        content: "";
+        position: absolute;
+        width: min(56vw, 520px);
+        aspect-ratio: 1;
+        border-radius: 50%;
+        background: radial-gradient(circle, var(--boot-glow), transparent 68%);
+        animation: boot-breathe 1.8s ease-in-out infinite alternate;
+      }
+      .boot-spinner {
+        position: relative;
+        z-index: 1;
+        width: 46px;
+        height: 46px;
+        border: 3px solid var(--boot-ring);
+        border-top-color: var(--boot-accent);
+        border-radius: 50%;
+        box-shadow: 0 0 0 12px var(--boot-ring);
+        animation: spin 0.8s linear infinite;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      @keyframes boot-breathe { from { opacity: 0.55; transform: scale(0.88); } to { opacity: 1; transform: scale(1.08); } }
+      @media (prefers-reduced-motion: reduce) {
+        .boot::before, .boot-spinner { animation: none; }
+      }
+    </style>
   </head>
   <body>
-    <div id="boot" class="boot" role="status" aria-live="polite">
-      <img id="boot-logo" alt="" />
-      <div class="boot-spinner"></div>
-      <p id="boot-message">正在连接本地天气引擎…</p>
+    <div id="boot" class="boot" role="status" aria-label="天气应用正在加载" aria-live="polite">
+      <div id="boot-spinner" class="boot-spinner" aria-hidden="true"></div>
+      <p id="boot-message" hidden></p>
       <button id="boot-retry" class="button primary" hidden>重新连接</button>
     </div>
 

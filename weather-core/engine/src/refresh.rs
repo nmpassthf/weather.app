@@ -102,7 +102,7 @@ pub(crate) async fn run_refresh_loop(
                         Ok((id, ())) => id,
                         Err(err) => {
                             let id = err.id();
-                            eprintln!("weather-engine warn: refresh task failed: {err}");
+                            log::warn!("refresh task failed: {err}");
                             id
                         }
                     };
@@ -277,16 +277,24 @@ fn stagger(index: usize) -> Duration {
 }
 
 async fn refresh_one(engine: &Engine, name: &str) {
-    let Ok(station) = engine.station_by_name(name).await else {
-        return;
+    log::debug!("scheduled weather refresh resolving station={name}");
+    let station = match engine.station_by_name(name).await {
+        Ok(station) => station,
+        Err(error) => {
+            log::warn!("scheduled weather refresh could not resolve station={name}: {error:#}");
+            return;
+        }
     };
     let req = GetWeatherRequest {
         unified_uuid: station.unified_uuid,
         refresh: true,
         include_debug: false,
     };
-    if let Ok(snapshot) = engine.get_weather_internal(req).await {
-        engine.publish_snapshot(&snapshot);
+    match engine.get_weather_internal(req).await {
+        Ok(snapshot) => engine.publish_snapshot(&snapshot),
+        Err(error) => {
+            log::warn!("scheduled weather refresh failed station={name}: {error:#}");
+        }
     }
 }
 

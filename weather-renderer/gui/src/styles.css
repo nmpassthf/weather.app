@@ -85,16 +85,21 @@ body::before {
   inset: 0;
   z-index: 100;
   display: grid;
+  overflow: hidden;
   place-content: center;
   justify-items: center;
   gap: 18px;
-  background: var(--bg);
+  background:
+    radial-gradient(circle at 74% 5%, rgba(88, 177, 255, 0.2), transparent 34%),
+    radial-gradient(circle at 16% 90%, rgba(91, 209, 185, 0.1), transparent 30%),
+    var(--bg);
   text-align: center;
 }
-.boot img { width: 92px; height: 92px; }
-.boot p { max-width: 520px; color: var(--muted); }
-.boot-spinner { width: 24px; height: 24px; border: 2px solid var(--line-strong); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
+.boot::before { content: ""; position: absolute; width: min(56vw, 520px); aspect-ratio: 1; border-radius: 50%; background: radial-gradient(circle, rgba(88, 177, 255, 0.2), transparent 68%); animation: boot-breathe 1.8s ease-in-out infinite alternate; }
+.boot p { position: relative; z-index: 1; max-width: min(520px, calc(100vw - 48px)); margin: 0; color: var(--muted); }
+.boot-spinner { position: relative; z-index: 1; width: 46px; height: 46px; border: 3px solid color-mix(in srgb, var(--accent), transparent 80%); border-top-color: var(--accent); border-radius: 50%; box-shadow: 0 0 0 12px color-mix(in srgb, var(--accent), transparent 88%); animation: spin 0.8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
+@keyframes boot-breathe { from { opacity: 0.55; transform: scale(0.88); } to { opacity: 1; transform: scale(1.08); } }
 
 .app-shell { position: relative; height: 100vh; }
 .topbar {

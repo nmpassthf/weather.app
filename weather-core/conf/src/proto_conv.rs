@@ -48,6 +48,11 @@ impl From<schema::EngineConfig> for EngineConfig {
             request_timeout_ms: value.request_timeout_ms,
             startup_timeout_ms: value.startup_timeout_ms,
             lock_path: value.lock_path,
+            log_level: if value.log_level.is_empty() {
+                crate::default_log_level()
+            } else {
+                value.log_level
+            },
         }
     }
 }
@@ -58,6 +63,7 @@ impl From<EngineConfig> for schema::EngineConfig {
             request_timeout_ms: value.request_timeout_ms,
             startup_timeout_ms: value.startup_timeout_ms,
             lock_path: value.lock_path,
+            log_level: value.log_level,
         }
     }
 }
@@ -230,6 +236,7 @@ mod tests {
                 request_timeout_ms: 3000,
                 startup_timeout_ms: 8000,
                 lock_path: "engine.lock".to_string(),
+                log_level: "debug".to_string(),
             },
             ipc: IpcConfig {
                 rpc_endpoint: "tcp://127.0.0.1:44445".to_string(),
@@ -284,6 +291,16 @@ mod tests {
         let schema: schema::AppConfig = original.clone().into();
         let back: AppConfig = schema.into();
         assert_eq!(original, back);
+    }
+
+    #[test]
+    fn empty_wire_log_level_uses_info() {
+        let mut wire: schema::AppConfig = sample_config().into();
+        wire.engine.as_mut().unwrap().log_level.clear();
+
+        let actual: AppConfig = wire.into();
+
+        assert_eq!(actual.engine.log_level, "info");
     }
 
     #[test]

@@ -14,6 +14,9 @@ pub(crate) enum Command {
     Run {
         #[arg(long, short = 'c')]
         config: Option<PathBuf>,
+        /// Override engine.log_level for this daemon process.
+        #[arg(long, value_enum)]
+        log_level: Option<DaemonLogLevel>,
         #[arg(long)]
         foreground: bool,
         #[arg(long, requires = "foreground", hide = true)]
@@ -40,6 +43,29 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: ServiceCommand,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum DaemonLogLevel {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl DaemonLogLevel {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -135,6 +161,21 @@ mod tests {
         };
         assert!(foreground);
         assert_eq!(owner_token.as_deref(), Some("owner-token"));
+    }
+
+    #[test]
+    fn parses_run_log_level_override() {
+        let cli = Cli::parse_from(["weather-daemon", "run", "--log-level", "debug"]);
+
+        let Command::Run { log_level, .. } = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(log_level, Some(DaemonLogLevel::Debug));
+    }
+
+    #[test]
+    fn rejects_unknown_run_log_level() {
+        assert!(Cli::try_parse_from(["weather-daemon", "run", "--log-level", "verbose"]).is_err());
     }
 
     #[test]

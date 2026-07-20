@@ -247,7 +247,7 @@ fn daily_point(date: NaiveDate, range: TemperatureRange, forecast: bool) -> Dail
     }
 }
 
-fn parse_temperature(value: Option<&str>) -> Option<f64> {
+pub(super) fn parse_temperature(value: Option<&str>) -> Option<f64> {
     value?
         .trim()
         .trim_end_matches(['°', '℃'])
@@ -256,14 +256,14 @@ fn parse_temperature(value: Option<&str>) -> Option<f64> {
         .ok()
 }
 
-fn parse_full_date(value: &str) -> Option<NaiveDate> {
+pub(super) fn parse_full_date(value: &str) -> Option<NaiveDate> {
     let date = value.split_whitespace().next()?;
     ["%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d"]
         .into_iter()
         .find_map(|format| NaiveDate::parse_from_str(date, format).ok())
 }
 
-fn parse_relative_date(value: &str, base: NaiveDate) -> Option<NaiveDate> {
+pub(super) fn parse_relative_date(value: &str, base: NaiveDate) -> Option<NaiveDate> {
     if let Some(date) = parse_full_date(value) {
         return Some(date);
     }

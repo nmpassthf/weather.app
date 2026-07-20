@@ -21,6 +21,8 @@ pub struct EngineConfig {
     pub request_timeout_ms: u64,
     pub startup_timeout_ms: u64,
     pub lock_path: String,
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -129,6 +131,7 @@ impl Default for EngineConfig {
             request_timeout_ms: default_request_timeout_ms(),
             startup_timeout_ms: default_startup_timeout_ms(),
             lock_path: default_engine_lock_path(),
+            log_level: default_log_level(),
         }
     }
 }

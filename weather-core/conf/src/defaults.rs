@@ -42,6 +42,9 @@ pub(crate) fn default_startup_timeout_ms() -> u64 {
 pub(crate) fn default_engine_lock_path() -> String {
     "engine.lock".to_string()
 }
+pub fn default_log_level() -> String {
+    "info".to_string()
+}
 pub(crate) fn default_rpc_endpoint() -> String {
     DEFAULT_ZMQ_RPC_ENDPOINT.to_string()
 }
@@ -117,6 +120,8 @@ mod tests {
     fn empty_provider_network_is_omitted_from_default_toml() {
         let content = default_config_toml();
 
+        assert!(content.contains("[engine]"), "{content}");
+        assert!(content.contains("log_level = \"info\""), "{content}");
         assert!(content.contains("[updater.network]"), "{content}");
         assert!(content.contains("allow_insecure = false"), "{content}");
         assert!(!content.contains("[updater.provider.network]"), "{content}");

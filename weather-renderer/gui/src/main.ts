@@ -24,6 +24,7 @@ const element = <T extends HTMLElement>(id: string): T => {
 
 const appElement = element<HTMLDivElement>("app");
 const boot = element<HTMLDivElement>("boot");
+const bootSpinner = element<HTMLDivElement>("boot-spinner");
 const bootMessage = element<HTMLParagraphElement>("boot-message");
 const bootRetry = element<HTMLButtonElement>("boot-retry");
 const stationList = element<HTMLElement>("station-list");
@@ -76,7 +77,6 @@ let historyInteractionCleanup: (() => void) | null = null;
 let dailyTemperatureInteractionCleanup: (() => void) | null = null;
 let dailyTemperatureRequestToken = 0;
 
-element<HTMLImageElement>("boot-logo").src = assets.logo;
 element<HTMLImageElement>("brand-logo").src = assets.logo;
 element<HTMLImageElement>("empty-image").src = assets.emptyStations;
 element<HTMLImageElement>("preview-image").src = assets.emptyStations;
@@ -157,6 +157,51 @@ function imageViewerOpen(): boolean {
 
 function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(Math.max(value, minimum), maximum);
+}
+
+function svgUserPointToClient(
+  svg: SVGSVGElement,
+  x: number,
+  y: number,
+): { x: number; y: number } | null {
+  const matrix = svg.getScreenCTM();
+  if (!matrix) return null;
+  const point = svg.createSVGPoint();
+  point.x = x;
+  point.y = y;
+  const clientPoint = point.matrixTransform(matrix);
+  return { x: clientPoint.x, y: clientPoint.y };
+}
+
+function svgClientPointToUser(
+  svg: SVGSVGElement,
+  x: number,
+  y: number,
+): { x: number; y: number } | null {
+  const matrix = svg.getScreenCTM();
+  if (!matrix) return null;
+  const point = svg.createSVGPoint();
+  point.x = x;
+  point.y = y;
+  try {
+    const userPoint = point.matrixTransform(matrix.inverse());
+    return { x: userPoint.x, y: userPoint.y };
+  } catch {
+    return null;
+  }
+}
+
+function nearestPlotPointIndex(points: ReadonlyArray<{ x: number }>, x: number): number {
+  let nearestIndex = 0;
+  let nearestDistance = Number.POSITIVE_INFINITY;
+  points.forEach((point, index) => {
+    const distance = Math.abs(point.x - x);
+    if (distance < nearestDistance) {
+      nearestDistance = distance;
+      nearestIndex = index;
+    }
+  });
+  return nearestIndex;
 }
 
 function clampImageViewerPan(): void {
@@ -342,8 +387,11 @@ function openGuiDevtools(): void {
 }
 
 async function initialize(): Promise<void> {
+  boot.setAttribute("aria-label", "天气应用正在加载");
+  bootSpinner.hidden = false;
   bootRetry.hidden = true;
-  bootMessage.textContent = "正在连接本地天气引擎…";
+  bootMessage.hidden = true;
+  bootMessage.textContent = "";
   setConnection("connecting");
   try {
     const payload = await invoke<BootstrapPayload>("bootstrap");
@@ -370,7 +418,10 @@ async function initialize(): Promise<void> {
   } catch (error) {
     const message = errorMessage(error);
     bootMessage.textContent = message.startsWith("未找到命令 `") ? message : `连接失败：${message}`;
+    bootMessage.hidden = false;
+    bootSpinner.hidden = true;
     bootRetry.hidden = false;
+    boot.setAttribute("aria-label", bootMessage.textContent);
     setConnection("failed");
   }
 }
@@ -918,6 +969,8 @@ function bindHistoryChartInteractions(chart: HistoryChartInteraction): () => voi
     const row = rows[index];
     const chartPoint = chartPoints[index];
     if (!row || !chartPoint || typeof row.temperature !== "number") return;
+    const clientPoint = svgUserPointToClient(svg, chartPoint.x, chartPoint.y);
+    if (!clientPoint) return;
     activeIndex = index;
     const time = row.time?.trim()
       ? multiDayDateTimeLabel(row.time)
@@ -938,12 +991,11 @@ function bindHistoryChartInteractions(chart: HistoryChartInteraction): () => voi
     target.dataset.inspecting = "true";
     svg.setAttribute("aria-label", `过去温度趋势，${time} 气温 ${temperature}`);
 
-    const svgBounds = svg.getBoundingClientRect();
     const targetBounds = target.getBoundingClientRect();
-    const rawLeft = svgBounds.left - targetBounds.left + (chartPoint.x / 320) * svgBounds.width;
+    const rawLeft = clientPoint.x - targetBounds.left;
     const tooltipHalfWidth = Math.min(tooltip.offsetWidth / 2, Math.max(0, target.clientWidth / 2 - 4));
     tooltip.style.left = `${clamp(rawLeft, tooltipHalfWidth + 4, target.clientWidth - tooltipHalfWidth - 4)}px`;
-    const pointTop = svgBounds.top - targetBounds.top + (chartPoint.y / 108) * svgBounds.height;
+    const pointTop = clientPoint.y - targetBounds.top;
     const above = pointTop - tooltip.offsetHeight - 10;
     const placeBelow = above < 2;
     tooltip.dataset.position = placeBelow ? "below" : "above";
@@ -952,8 +1004,9 @@ function bindHistoryChartInteractions(chart: HistoryChartInteraction): () => voi
   const showClientX = (clientX: number): void => {
     const bounds = svg.getBoundingClientRect();
     if (bounds.width <= 0) return;
-    const ratio = clamp((clientX - bounds.left) / bounds.width, 0, 1);
-    showIndex(Math.round(ratio * (rows.length - 1)));
+    const userPoint = svgClientPointToUser(svg, clientX, bounds.top + bounds.height / 2);
+    if (!userPoint) return;
+    showIndex(nearestPlotPointIndex(chartPoints, userPoint.x));
   };
   const finishTouch = (event: PointerEvent): void => {
     if (event.pointerId !== touchPointerId) return;

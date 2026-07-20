@@ -320,6 +320,15 @@ pub fn validate(config: &AppConfig) -> Result<()> {
             SUPPORTED_CONFIG_VERSION
         );
     }
+    if !matches!(
+        config.engine.log_level.as_str(),
+        "off" | "error" | "warn" | "info" | "debug" | "trace"
+    ) {
+        bail!(
+            "engine.log_level `{}` is invalid; expected off / error / warn / info / debug / trace",
+            config.engine.log_level
+        );
+    }
     if !config.ipc.rpc_endpoint.starts_with("tcp://") {
         bail!("ipc.rpc_endpoint must be a tcp:// endpoint");
     }
@@ -593,6 +602,33 @@ mod tests {
             crate::NetworkConfig::default()
         );
         assert!(loaded.config.updater.provider[0].network.is_empty());
+    }
+
+    #[test]
+    fn current_config_without_log_level_uses_info() {
+        let mut value: Value = toml::from_str(&default_config_toml()).unwrap();
+        value
+            .get_mut("engine")
+            .and_then(Value::as_table_mut)
+            .unwrap()
+            .remove("log_level");
+
+        let loaded = load_from_str(&toml::to_string_pretty(&value).unwrap()).unwrap();
+
+        assert_eq!(loaded.config.engine.log_level, "info");
+    }
+
+    #[test]
+    fn validate_rejects_invalid_engine_log_level() {
+        let mut config = base_config();
+        config.engine.log_level = "verbose".to_string();
+
+        let err = validate(&config).unwrap_err().to_string();
+
+        assert!(
+            err.contains("engine.log_level `verbose` is invalid"),
+            "{err}"
+        );
     }
 
     #[test]

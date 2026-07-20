@@ -50,36 +50,73 @@ impl Engine {
                 resource.bytes.as_ref(),
                 max_bytes,
             ) {
-                Ok(response) => self.ok(
-                    &request.request_id,
-                    GetResourceResponse {
-                        cache_hit: true,
-                        ..response
-                    },
-                ),
+                Ok(response) => {
+                    log::debug!(
+                        "resource cache hit resource_id={} offset={} chunk_bytes={} total_bytes={} complete={}",
+                        req.resource_id,
+                        req.offset,
+                        response.data.len(),
+                        response.total_size,
+                        response.complete
+                    );
+                    self.ok(
+                        &request.request_id,
+                        GetResourceResponse {
+                            cache_hit: true,
+                            ..response
+                        },
+                    )
+                }
                 Err(message) => {
+                    log::warn!(
+                        "resource chunk request rejected resource_id={} offset={}: {}",
+                        req.resource_id,
+                        req.offset,
+                        message
+                    );
                     Self::rpc_error_response(&request.request_id, RpcErrorCode::BadRequest, message)
                 }
             },
             ResourceFetchPlan::Start { source_url } => {
+                log::debug!(
+                    "resource upstream fetch scheduled resource_id={}",
+                    req.resource_id
+                );
                 self.spawn_resource_fetch(req.resource_id.clone(), source_url);
                 self.accepted(
                     &request.request_id,
                     pending_resource_response(&req, ASYNC_RESOURCE_RETRY_AFTER_MS),
                 )
             }
-            ResourceFetchPlan::Pending => self.accepted(
-                &request.request_id,
-                pending_resource_response(&req, ASYNC_RESOURCE_RETRY_AFTER_MS),
-            ),
+            ResourceFetchPlan::Pending => {
+                log::trace!(
+                    "resource fetch still pending resource_id={}",
+                    req.resource_id
+                );
+                self.accepted(
+                    &request.request_id,
+                    pending_resource_response(&req, ASYNC_RESOURCE_RETRY_AFTER_MS),
+                )
+            }
             ResourceFetchPlan::Failed(message) => {
+                log::warn!(
+                    "resource fetch unavailable resource_id={}: {}",
+                    req.resource_id,
+                    message
+                );
                 Self::rpc_error_response(&request.request_id, RpcErrorCode::Resource, message)
             }
-            ResourceFetchPlan::Missing => Self::rpc_error_response(
-                &request.request_id,
-                RpcErrorCode::Resource,
-                format!("resource `{}` is not registered", req.resource_id),
-            ),
+            ResourceFetchPlan::Missing => {
+                log::warn!(
+                    "resource request is not registered resource_id={}",
+                    req.resource_id
+                );
+                Self::rpc_error_response(
+                    &request.request_id,
+                    RpcErrorCode::Resource,
+                    format!("resource `{}` is not registered", req.resource_id),
+                )
+            }
         }
     }
 
@@ -90,6 +127,7 @@ impl Engine {
         let cache_resources = resources.clone();
         let cache_resource_id = resource_id.clone();
         let task = tokio::spawn(async move {
+            log::debug!("resource upstream fetch started resource_id={resource_id}");
             let fetched = singleflight
                 .run(resource_id.clone(), || async move {
                     let resource = provider.resource(&source_url).await?;
@@ -99,7 +137,24 @@ impl Engine {
                     Ok(resource)
                 })
                 .await;
-            resources.finish_fetch(&resource_id, fetched.err().map(|error| error.to_string()));
+            match fetched {
+                Ok(resource) => {
+                    log::debug!(
+                        "resource upstream fetch completed resource_id={} content_type={} bytes={}",
+                        resource_id,
+                        resource.content_type,
+                        resource.bytes.len()
+                    );
+                    resources.finish_fetch(&resource_id, None);
+                }
+                Err(error) => {
+                    log::warn!(
+                        "resource upstream fetch failed resource_id={}: {error:#}",
+                        resource_id
+                    );
+                    resources.finish_fetch(&resource_id, Some(error.to_string()));
+                }
+            }
         });
         drop(task);
     }

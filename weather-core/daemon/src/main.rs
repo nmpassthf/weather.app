@@ -1,4 +1,5 @@
 mod cli;
+mod logging;
 mod path;
 mod probe;
 mod run;
@@ -22,9 +23,10 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Run {
             config,
+            log_level,
             foreground,
             owner_token,
-        } => run(config, foreground, owner_token).await,
+        } => run(config, log_level, foreground, owner_token).await,
         Command::Probe { config, verbose } => probe(config, verbose).await,
         Command::Service { command } => match command {
             ServiceCommand::Install {

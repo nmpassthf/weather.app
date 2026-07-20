@@ -5371,8 +5371,10 @@ name = "weather-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "fs2",
+ "log",
  "prost",
  "same-file",
  "serde",
@@ -5394,6 +5396,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "chrono-tz",
+ "log",
  "rusqlite",
  "tempfile",
  "tokio",
@@ -5408,6 +5411,8 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "fs2",
+ "futures",
+ "log",
  "prost",
  "rusqlite",
  "same-file",

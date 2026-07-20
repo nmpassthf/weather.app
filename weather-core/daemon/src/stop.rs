@@ -235,6 +235,7 @@ mod tests {
         let daemon = tokio::spawn(async move {
             crate::run::run(
                 Some(daemon_config),
+                None,
                 true,
                 Some("stop-test-owner".to_string()),
             )

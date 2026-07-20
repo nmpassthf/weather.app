@@ -66,6 +66,37 @@ weather-tui config show
 weather-tui engine restart
 ```
 
+### Engine logging
+
+New configurations default to engine log level `info`:
+
+```toml
+[engine]
+request_timeout_ms = 3000
+startup_timeout_ms = 8000
+lock_path = "engine.lock"
+log_level = "info"
+```
+
+Accepted levels are `off`, `error`, `warn`, `info`, `debug`, and `trace`.
+`info` includes daemon/engine lifecycle and RPC/PUB client connection and
+disconnection records. `debug` adds RPC kind, request ID, payload size, result,
+and elapsed time together with cache/provider operations; `trace` adds event
+publishing and fine-grained socket state. Client identities are represented by
+a short hash and their raw bytes are not logged.
+
+Override the configured level for one daemon process by passing the option
+after `run`:
+
+```sh
+weather-daemon run --log-level debug
+```
+
+The command-line option takes precedence over `[engine].log_level` for the
+lifetime of that process. Without an override, an engine restart reloads the
+configured level. The built-in logger accepts only project `weather_*` targets,
+so Tokio, ZMQ, HTTP client, and other framework logs are suppressed by default.
+
 Network defaults live under `updater.network`. Missing proxy fields inherit the
 matching process `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`
 variables; an explicitly empty string clears the inherited value.

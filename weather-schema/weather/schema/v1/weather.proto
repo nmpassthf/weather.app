@@ -314,6 +314,7 @@ message EngineConfig {
   uint64 request_timeout_ms = 1;
   uint64 startup_timeout_ms = 2;
   string lock_path = 3;
+  string log_level = 4;
   reserved 20 to 39;
 }
 message IpcConfig {

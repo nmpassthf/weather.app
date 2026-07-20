@@ -923,8 +923,8 @@ fn run_timezone_finalize(finalize: TimezoneFinalize) -> Result<()> {
 
 fn run_postcommit_failure(callback: PostCommitFailure, message: String) {
     if let Err(payload) = catch_unwind(AssertUnwindSafe(|| callback(message))) {
-        eprintln!(
-            "weather-db warn: timezone post-commit failure callback panicked: {}",
+        log::warn!(
+            "timezone post-commit failure callback panicked: {}",
             panic_message(payload)
         );
     }

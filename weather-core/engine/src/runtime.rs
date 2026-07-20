@@ -136,6 +136,10 @@ impl EngineRuntime {
         F: FnOnce(&weather_configure::UpdaterConfig) -> Result<Arc<dyn WeatherProvider>>,
     {
         let config_path = absolute_config_path(config_path)?;
+        log::debug!(
+            "initializing weather engine config={}",
+            config_path.display()
+        );
         // This first load is deliberately read-only: it is used only to find
         // the stable singleton lock, including for legacy in-memory configs.
         let preliminary_config = load_or_default(&config_path)?;
@@ -146,11 +150,22 @@ impl EngineRuntime {
         let engine_lock_path = resolve_relative(&base_dir, &preliminary_config.engine.lock_path)?;
         let launch = launch_metadata(&config_path, owner_token)?;
         let _engine_lock = LockGuard::engine(engine_lock_path.clone(), &launch)?;
+        log::debug!(
+            "acquired engine singleton lock path={} instance={}",
+            engine_lock_path.display(),
+            launch.instance_id
+        );
 
         // Only the singleton owner may create or migrate the persistent
         // config. Migration and station normalization share one atomic write.
         ensure_config_file(&config_path)?;
         let mut config = load_for_engine_startup(&config_path)?;
+        log::debug!(
+            "loaded engine config provider={} stations={} timezone={}",
+            config.updater.default_provider,
+            config.stations.len(),
+            config.db.timezone
+        );
         let components = ComponentManifest::for_config_path(&config_path);
         components.record(ComponentKind::Config, &config_path)?;
         components.record(ComponentKind::Lock, &engine_lock_path)?;
@@ -158,6 +173,10 @@ impl EngineRuntime {
         // or starting its worker. A constructor error must not leave an
         // asynchronously reaped worker temporarily holding the lock.
         let provider = factory(&config.updater)?;
+        log::debug!(
+            "initialized weather provider name={}",
+            provider.provider_name()
+        );
         // Bind the lock to the canonical DB path. Lexical and symlink aliases
         // converge; hard-link aliases are not supported by suffix-derived
         // sidecars.
@@ -174,7 +193,13 @@ impl EngineRuntime {
         components.record(ComponentKind::Lock, &db_paths.lock)?;
         let db_lock = LockGuard::exclusive(db_paths.lock.clone())?;
         recover_pending_timezone(&db_paths.data, &config_path, &mut config)?;
-        let db = DbActor::start_with_lease(db_paths.data, config.db.timezone.clone(), db_lock)?;
+        let db_path = db_paths.data;
+        let db = DbActor::start_with_lease(db_path.clone(), config.db.timezone.clone(), db_lock)?;
+        log::debug!(
+            "started weather database path={} timezone={}",
+            db_path.display(),
+            config.db.timezone
+        );
         let config_state = ConfigState::new(config);
         let (sink, _) = tokio::sync::broadcast::channel(256);
         Ok(Self {
@@ -257,13 +282,20 @@ fn recover_pending_timezone(
         return Ok(false);
     };
     if config.db.timezone == target {
+        log::debug!("database timezone recovery already reflected in config timezone={target}");
         return Ok(false);
     }
+    let previous = config.db.timezone.clone();
     let mut recovered = config.clone();
-    recovered.db.timezone = target;
+    recovered.db.timezone = target.clone();
     validate(&recovered)?;
     write_config_atomic(config_path, &recovered)?;
     *config = recovered;
+    log::info!(
+        "recovered pending database timezone config old_timezone={} new_timezone={}",
+        previous,
+        target
+    );
     Ok(true)
 }
 

@@ -25,6 +25,10 @@ impl Engine {
             );
         };
         if chrono_tz::Tz::from_str(&req.new_timezone).is_err() {
+            log::warn!(
+                "database timezone migration rejected invalid_timezone={}",
+                req.new_timezone
+            );
             return Self::rpc_error_response(
                 &request.request_id,
                 RpcErrorCode::BadRequest,
@@ -33,19 +37,30 @@ impl Engine {
         }
 
         match self.migrate_db_timezone(req.new_timezone).await {
-            Ok(migration) => self.ok(
-                &request.request_id,
-                MigrateDbTimezoneResponse {
-                    old_timezone: migration.old_timezone,
-                    new_timezone: migration.new_timezone,
-                    rows_rewritten: migration.rows_rewritten,
-                },
-            ),
-            Err(err) => Self::rpc_error_response(
-                &request.request_id,
-                RpcErrorCode::Database,
-                format!("{err:#}"),
-            ),
+            Ok(migration) => {
+                log::info!(
+                    "database timezone migration completed old_timezone={} new_timezone={} rows_rewritten={}",
+                    migration.old_timezone,
+                    migration.new_timezone,
+                    migration.rows_rewritten
+                );
+                self.ok(
+                    &request.request_id,
+                    MigrateDbTimezoneResponse {
+                        old_timezone: migration.old_timezone,
+                        new_timezone: migration.new_timezone,
+                        rows_rewritten: migration.rows_rewritten,
+                    },
+                )
+            }
+            Err(err) => {
+                log::error!("database timezone migration failed: {err:#}");
+                Self::rpc_error_response(
+                    &request.request_id,
+                    RpcErrorCode::Database,
+                    format!("{err:#}"),
+                )
+            }
         }
     }
 
@@ -56,8 +71,14 @@ impl Engine {
         let commit_guard = self.config_commit.clone().lock_owned().await;
         let current = self.config.get();
         let old_timezone = current.db.timezone.clone();
+        log::info!(
+            "database timezone migration started old_timezone={} new_timezone={}",
+            old_timezone,
+            new_timezone
+        );
 
         if old_timezone == new_timezone {
+            log::debug!("database timezone migration is an idempotent request");
             let rows_rewritten = self
                 .db
                 .migrate_timezone_bundle(
@@ -115,6 +136,9 @@ fn postcommit_failure(
 ) -> impl FnOnce(String) + Send + Sync + 'static {
     move |message| {
         let _commit_guard = commit_guard;
+        log::error!(
+            "database timezone migration post-commit failed; requesting engine restart: {message}"
+        );
         control.request_exit(EngineExit::Restart);
         config.record_error(message);
     }
