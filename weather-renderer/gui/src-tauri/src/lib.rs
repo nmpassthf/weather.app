@@ -1,3 +1,5 @@
+#![cfg(feature = "gui")]
+
 mod gui_cache;
 mod gui_config;
 
@@ -138,8 +140,7 @@ impl GuiState {
         let (rpc_endpoint, pub_endpoint, ownership) = match resolve_direct_endpoints()? {
             Some((rpc, publisher)) => (rpc, publisher, EngineOwnership::Direct),
             None => {
-                let daemon = DaemonSupervisor::new(resolve_daemon_exe(app), resolve_config_path())
-                    .map_err(display_error)?;
+                let daemon = resolve_daemon_supervisor().map_err(display_error)?;
                 let probe = daemon.probe().await.map_err(display_daemon_error)?;
                 let ready = daemon
                     .ensure_ready(probe)
@@ -179,22 +180,15 @@ impl GuiState {
     }
 }
 
-fn resolve_daemon_exe(app: &AppHandle) -> Option<PathBuf> {
+fn resolve_daemon_supervisor() -> anyhow::Result<DaemonSupervisor> {
     if let Some(path) = std::env::var_os("WEATHER_DAEMON_EXE") {
-        return Some(PathBuf::from(path));
+        return DaemonSupervisor::new(Some(PathBuf::from(path)), resolve_config_path());
     }
-    let name = if cfg!(windows) {
-        "weather-daemon.exe"
+    if cfg!(feature = "daemon") {
+        DaemonSupervisor::for_current_exe(resolve_config_path())
     } else {
-        "weather-daemon"
-    };
-    let resource_dir = app.path().resource_dir().ok()?;
-    [
-        resource_dir.join("bin").join(name),
-        resource_dir.join("resources").join("bin").join(name),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
+        DaemonSupervisor::new(None, resolve_config_path())
+    }
 }
 
 fn resolve_config_path() -> Option<PathBuf> {
@@ -238,7 +232,7 @@ fn display_error(error: impl std::fmt::Display) -> String {
 fn display_daemon_error(error: anyhow::Error) -> String {
     if let Some(missing) = error.downcast_ref::<DaemonExecutableNotFound>() {
         return format!(
-            "未找到命令 `{}`。请先运行 `cargo build -p weather-daemon`，或设置 WEATHER_DAEMON_EXE 指向可执行文件。",
+            "未找到 daemon 命令 `{}`。请使用包含 daemon feature 的 weather.app，或设置 WEATHER_DAEMON_EXE 指向外部 daemon。",
             missing.executable().display()
         );
     }
@@ -868,7 +862,7 @@ mod tests {
 
         assert_eq!(
             message,
-            "未找到命令 `weather-daemon`。请先运行 `cargo build -p weather-daemon`，或设置 WEATHER_DAEMON_EXE 指向可执行文件。"
+            "未找到 daemon 命令 `weather-daemon`。请使用包含 daemon feature 的 weather.app，或设置 WEATHER_DAEMON_EXE 指向外部 daemon。"
         );
     }
 

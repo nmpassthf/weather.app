@@ -8,12 +8,13 @@ mod terminal;
 mod tui;
 mod util;
 
-use weather_renderer_common::{client, daemon, pagination};
+use std::ffi::OsString;
 
 use anyhow::{Context, Result, bail};
+use weather_renderer_common::{client, daemon, pagination};
 
 use crate::{
-    cli::{Cli, OutputFormat, parse_cli},
+    cli::{Cli, OutputFormat, parse_cli_from},
     client::EngineClient,
     command::run_command,
     connection::{ConnectionPlan, Endpoints, connection_plan},
@@ -21,14 +22,18 @@ use crate::{
     tui::run_interactive,
 };
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = parse_cli();
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunOptions {
+    pub embedded_daemon: bool,
+}
+
+pub async fn run_from(args: impl IntoIterator<Item = OsString>, options: RunOptions) -> Result<()> {
+    let cli = parse_cli_from(args);
     let plan = connection_plan(&cli)?;
     let hmac_key = resolve_hmac_key(&cli)?;
     match plan {
         ConnectionPlan::Direct(endpoints) => run_direct(&cli, endpoints, hmac_key).await,
-        ConnectionPlan::Managed => run_managed(&cli, hmac_key).await,
+        ConnectionPlan::Managed => run_managed(&cli, hmac_key, options).await,
     }
 }
 
@@ -46,8 +51,12 @@ async fn run_direct(cli: &Cli, endpoints: Endpoints, hmac_key: Option<[u8; 32]>)
     run_session(&client, cli, EngineOwnership::Direct).await
 }
 
-async fn run_managed(cli: &Cli, hmac_key: Option<[u8; 32]>) -> Result<()> {
-    let daemon = DaemonSupervisor::new(cli.daemon_exe.clone(), cli.config.clone())?;
+async fn run_managed(cli: &Cli, hmac_key: Option<[u8; 32]>, options: RunOptions) -> Result<()> {
+    let daemon = match (&cli.daemon_exe, options.embedded_daemon) {
+        (Some(path), _) => DaemonSupervisor::new(Some(path.clone()), cli.config.clone())?,
+        (None, true) => DaemonSupervisor::for_current_exe(cli.config.clone())?,
+        (None, false) => DaemonSupervisor::new(None, cli.config.clone())?,
+    };
     let probe = daemon.probe().await?;
     if cli.stops_engine() {
         match probe.state {

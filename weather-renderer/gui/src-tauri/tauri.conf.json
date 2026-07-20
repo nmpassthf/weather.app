@@ -1,8 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Weather",
+  "mainBinaryName": "weather.app",
   "version": "0.1.0",
-  "identifier": "dev.weather.app",
+  "identifier": "dev.weather.desktop",
   "build": {
     "beforeDevCommand": "bun run dev",
     "devUrl": "http://localhost:1420",
@@ -34,7 +35,6 @@
     "category": "Weather",
     "shortDescription": "跨平台天气应用",
     "longDescription": "基于本地 weather-engine 的跨平台天气桌面应用。",
-    "resources": ["resources/bin/*"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

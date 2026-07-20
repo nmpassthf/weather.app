@@ -6,6 +6,8 @@ mod run;
 mod service;
 mod stop;
 
+use std::ffi::OsString;
+
 use anyhow::Result;
 use clap::Parser;
 
@@ -17,9 +19,8 @@ use crate::{
     stop::stop,
 };
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
+pub async fn run_from(args: impl IntoIterator<Item = OsString>) -> Result<()> {
+    let cli = Cli::parse_from(args);
     match cli.command {
         Command::Run {
             config,

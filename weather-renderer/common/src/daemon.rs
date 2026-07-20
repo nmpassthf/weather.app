@@ -1,5 +1,6 @@
 use std::{
     error::Error,
+    ffi::OsString,
     fmt, io,
     path::Path,
     path::PathBuf,
@@ -16,6 +17,7 @@ const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub struct DaemonSupervisor {
     exe: PathBuf,
+    prefix_args: Vec<OsString>,
     config: Option<PathBuf>,
 }
 
@@ -89,12 +91,33 @@ impl DaemonSupervisor {
     pub fn new(daemon_exe: Option<PathBuf>, config: Option<PathBuf>) -> Result<Self> {
         Ok(Self {
             exe: daemon_exe.unwrap_or(resolve_daemon_exe()?),
+            prefix_args: Vec::new(),
             config,
         })
     }
 
-    fn start_foreground(&self, owner_token: &str) -> Result<ForegroundDaemon> {
+    pub fn for_current_exe(config: Option<PathBuf>) -> Result<Self> {
+        Ok(Self {
+            exe: std::env::current_exe().context("failed to resolve current executable")?,
+            prefix_args: vec![OsString::from("daemon")],
+            config,
+        })
+    }
+
+    fn std_command(&self) -> StdCommand {
         let mut command = StdCommand::new(&self.exe);
+        command.args(&self.prefix_args);
+        command
+    }
+
+    fn tokio_command(&self) -> TokioCommand {
+        let mut command = TokioCommand::new(&self.exe);
+        command.args(&self.prefix_args);
+        command
+    }
+
+    fn start_foreground(&self, owner_token: &str) -> Result<ForegroundDaemon> {
+        let mut command = self.std_command();
         command
             .arg("run")
             .arg("--foreground")
@@ -124,7 +147,7 @@ impl DaemonSupervisor {
     }
 
     async fn probe_with_deadline(&self, deadline: Option<Instant>) -> Result<DaemonProbe> {
-        let mut command = TokioCommand::new(&self.exe);
+        let mut command = self.tokio_command();
         command.arg("probe").arg("--verbose");
         if let Some(config) = &self.config {
             command.arg("--config").arg(config);
@@ -483,6 +506,22 @@ mod tests {
     #[test]
     fn direct_ownership_is_an_explicit_state() {
         assert!(matches!(EngineOwnership::Direct, EngineOwnership::Direct));
+    }
+
+    #[test]
+    fn embedded_invocation_prefixes_daemon_subcommand() {
+        let supervisor = DaemonSupervisor {
+            exe: PathBuf::from("weather.app"),
+            prefix_args: vec![OsString::from("daemon")],
+            config: None,
+        };
+
+        let command = supervisor.std_command();
+        assert_eq!(command.get_program(), "weather.app");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![std::ffi::OsStr::new("daemon")]
+        );
     }
 
     #[test]

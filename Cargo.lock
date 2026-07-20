@@ -5349,6 +5349,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "weather-app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "prost",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tempfile",
+ "tokio",
+ "toml 0.8.2",
+ "weather-daemon",
+ "weather-renderer-common",
+ "weather-schema",
+ "weather-tui",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "weather-build-support"
 version = "0.1.0"
 
@@ -5427,25 +5449,6 @@ dependencies = [
  "weather-schema",
  "weather-updater",
  "zeromq",
-]
-
-[[package]]
-name = "weather-gui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "prost",
- "rusqlite",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tempfile",
- "tokio",
- "toml 0.8.2",
- "weather-renderer-common",
- "weather-schema",
 ]
 
 [[package]]

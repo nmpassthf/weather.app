@@ -1,8 +1,9 @@
 # Weather App
 
-A layered Rust weather client and local weather service. The project provides
-both `weather-tui` and a Tauri-based `weather-gui`, backed by a local
-`weather-engine` managed by `weather-daemon`.
+A layered Rust weather client and local weather service. The project publishes
+one BusyBox-style `weather.app` executable containing feature-gated daemon,
+TUI, and Tauri GUI modes. A local `weather-engine` runs through the
+`weather.app daemon` subcommand.
 Weather data is fetched from the NMC provider, cached locally, and exposed to
 frontends through the shared `weather-schema` protocol.
 
@@ -18,39 +19,39 @@ TUI screenshots:
 
 ## Usage
 
-Build the binaries first, then run the TUI:
+Build the application with TUI support, then run it from a terminal:
 
 ```sh
-cargo build --workspace --bins
-./target/debug/weather-tui
+cargo build -p weather-app --features tui
+./target/debug/weather-app
 ```
 
 Common commands:
 
 ```sh
 # One-shot weather output
-weather-tui once
+weather.app tui once
 
 # JSON output
-weather-tui --format json once
+weather.app tui --format json once
 
 # Force a fresh weather fetch
-weather-tui once --refresh
+weather.app tui once --refresh
 
 # Search for a station
-weather-tui stations search "北京"
+weather.app tui stations search "北京"
 
 # Add or update the configured station through engine APIs
-weather-tui stations list
-weather-tui stations add "北京-北京市"
+weather.app tui stations list
+weather.app tui stations add "北京-北京市"
 
 # Show engine status or stop the active engine
-weather-tui engine status
-weather-tui engine stop
+weather.app tui engine status
+weather.app tui engine stop
 
 # Control the daemon directly
-weather-daemon status
-weather-daemon stop
+weather.app daemon status
+weather.app daemon stop
 ```
 
 Use `-c/--config <path>` to select a config file. By default, the app uses
@@ -61,9 +62,9 @@ during normal operation.
 Useful config commands:
 
 ```sh
-weather-tui config defaults
-weather-tui config show
-weather-tui engine restart
+weather.app tui config defaults
+weather.app tui config show
+weather.app tui engine restart
 ```
 
 ### Engine logging
@@ -89,7 +90,7 @@ Override the configured level for one daemon process by passing the option
 after `run`:
 
 ```sh
-weather-daemon run --log-level debug
+weather.app daemon run --log-level debug
 ```
 
 The command-line option takes precedence over `[engine].log_level` for the
@@ -178,13 +179,12 @@ Use this mode while editing the frontend. Vite must remain running for the GUI
 to load its resources:
 
 ```sh
-cargo build -p weather-daemon
 cd weather-renderer/gui
 bun install
-bun run tauri dev
+bun run tauri dev --features desktop
 ```
 
-The resulting `target/debug/weather-gui` points to
+The resulting `target/debug/weather-app` points to
 `http://localhost:1420`. It is not standalone and shows a blank window when
 launched without the Vite process started by `tauri dev`.
 
@@ -196,27 +196,26 @@ frontend and embeds `dist` into the executable:
 ```sh
 cd weather-renderer/gui
 bun run standalone:debug
-../../target/debug/weather-gui
+../../target/debug/weather.app
 ```
 
-The executable can be started directly from another terminal. It still needs a
-discoverable `weather-daemon`, such as the adjacent
-`target/debug/weather-daemon` built by `cargo build -p weather-daemon`.
+The executable can be started directly from another terminal. Its daemon code
+is embedded and the GUI starts the same executable with the `daemon`
+subcommand when an engine is needed.
 
-Run `bun run bundle` from that directory for a native package with the matching
-release daemon staged as an application resource. See
+Run `bun run bundle` from that directory for a native single-binary package. See
 `weather-renderer/gui/README.md` for target and platform prerequisites.
 
 ## Service Installation
 
 Service management currently supports systemd on Linux only. The `windows`
 backend name is retained so unsupported SCM operations fail with a clear error;
-`weather-daemon` does not yet implement a Windows SCM service dispatcher.
+`weather.app daemon` does not yet implement a Windows SCM service dispatcher.
 
 Install the daemon as a user service:
 
 ```sh
-weather-daemon service install systemd
+weather.app daemon service install systemd
 ```
 
 This installs files under `~/.weather/` by default, including:
@@ -227,27 +226,27 @@ This installs files under `~/.weather/` by default, including:
 Install as a system service:
 
 ```sh
-sudo weather-daemon service install systemd --system
+sudo weather.app daemon service install systemd --system
 ```
 
 System mode uses `/opt/weather` by default. You can override paths:
 
 ```sh
-weather-daemon service install systemd --path /custom/weather --config /custom/weather/weather.toml
+weather.app daemon service install systemd --path /custom/weather --config /custom/weather/weather.toml
 ```
 
 Reinstall or remove the service:
 
 ```sh
-weather-daemon service reinstall systemd
-weather-daemon service remove systemd
-weather-daemon service remove systemd --all
+weather.app daemon service reinstall systemd
+weather.app daemon service remove systemd
+weather.app daemon service remove systemd --all
 ```
 
 Pass the same scope and path overrides when removing a custom installation:
 
 ```sh
-weather-daemon service remove systemd --system --path /custom/weather \
+weather.app daemon service remove systemd --system --path /custom/weather \
   --config /custom/weather/weather.toml --all
 ```
 
@@ -258,15 +257,22 @@ commands fail before writing installation files.
 
 ## Build
 
-Workspace debug build:
+Daemon-only debug build (the default feature set):
 
 ```sh
-cargo build --workspace --bins
+cargo build -p weather-app
 ```
 
-This ordinary Cargo command builds `weather-gui` for the Vite development URL;
-it does not embed frontend assets. Use the “GUI debug build with embedded
-assets” command above when the GUI must run directly without Vite.
+Add `--features tui`, `--features gui`, or `--features desktop` to select the
+compiled frontends. TUI and daemon are libraries and do not produce separate
+release executables.
+
+Commits pushed to `master` are bundled after the full CI workflow succeeds.
+The desktop bundle workflow publishes Linux (Ubuntu 22.04-compatible), Windows
+10, and macOS packages as the `weather-desktop-latest` GitHub Actions artifact.
+Each package contains the single `weather.app` application binary with daemon,
+TUI, and GUI support. Only the newest complete successful artifact set is
+retained; a failed platform build leaves the preceding successful set intact.
 
 Static release build:
 
@@ -298,24 +304,24 @@ cargo test --workspace
 Refresh weather data manually:
 
 ```sh
-weather-tui once --refresh
+weather.app tui once --refresh
 ```
 
 Update configured stations through the frontend commands:
 
 ```sh
-weather-tui stations search "<query>"
-weather-tui stations add "<station>"
-weather-tui stations remove "<selector>"
-weather-tui stations enable "<selector>"
-weather-tui stations disable "<selector>"
+weather.app tui stations search "<query>"
+weather.app tui stations add "<station>"
+weather.app tui stations remove "<selector>"
+weather.app tui stations enable "<selector>"
+weather.app tui stations disable "<selector>"
 ```
 
 Update installed binaries by rebuilding and reinstalling the service:
 
 ```sh
 make release-static
-target/release-artifacts/<target-triple>/weather-daemon service reinstall systemd
+target/release-artifacts/<target-triple>/weather.app daemon service reinstall systemd
 ```
 
 ## NMC Diagnostic Scripts

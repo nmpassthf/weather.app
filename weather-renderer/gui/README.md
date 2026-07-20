@@ -1,7 +1,8 @@
 # Weather GUI
 
-This renderer is a Tauri 2 desktop frontend for the same local
-`weather-daemon` / `weather-engine` API used by `weather-tui`. It does not read
+This renderer is the optional Tauri 2 `gui` feature of the single
+`weather.app` executable. It uses the same local daemon/engine API as the
+optional TUI feature. It does not read
 the database, write the engine TOML directly, or call the NMC provider; only
 its separate renderer-owned `weather-gui.toml` is persisted locally.
 
@@ -40,18 +41,17 @@ The package manager is pinned to Bun 1.3.14 in `package.json`.
 
 ### Dev build (Vite/HMR)
 
-Use this mode for frontend development. Build the daemon once, install the
-frontend dependencies, and let `tauri dev` keep Vite running:
+Use this mode for frontend development. Install the frontend dependencies and
+let `tauri dev` build the full desktop feature set while Vite is running:
 
 ```sh
-cargo build -p weather-daemon
 cd weather-renderer/gui
 bun install
-bun run tauri dev
+bun run tauri dev --features desktop
 ```
 
 This build loads resources from `http://localhost:1420` and supports HMR. Its
-`target/debug/weather-gui` executable is only a development launcher: starting
+`target/debug/weather-app` executable is only a development launcher: starting
 it after Vite has stopped results in a blank window.
 
 ### Debug build with embedded assets
@@ -63,18 +63,17 @@ and application-bundle generation:
 ```sh
 cd weather-renderer/gui
 bun run standalone:debug
-../../target/debug/weather-gui
+../../target/debug/weather.app
 ```
 
-The resulting `target/debug/weather-gui` is standalone with respect to frontend
-assets. It still needs `weather-daemon` beside the executable, in `PATH`, or at
-`WEATHER_DAEMON_EXE`. If a later `cargo build -p weather-gui` or `tauri dev`
-overwrites the binary, rerun `bun run standalone:debug` before launching it
-directly. A packaged release built by `bun run bundle` uses the same
-embedded-asset path.
+The resulting `target/debug/weather.app` embeds frontend and daemon code. If a
+later ordinary Cargo build or `tauri dev` overwrites the binary, rerun
+`bun run standalone:debug` before launching it directly. A packaged release
+built by `bun run bundle` uses the same embedded-asset path.
 
-The GUI finds `weather-daemon` beside the app, in `PATH`, or through
-`WEATHER_DAEMON_EXE`. `WEATHER_CONFIG` selects a non-default config path.
+By default the GUI starts its own executable with the `daemon` subcommand.
+`WEATHER_DAEMON_EXE` can still select a legacy external daemon, and
+`WEATHER_CONFIG` selects a non-default config path.
 When no daemon is running, the GUI starts an owner-token-bound foreground
 daemon and shuts down only that owned process when the main window or GUI
 process exits. A daemon that was already running before GUI startup is adopted
@@ -114,15 +113,14 @@ key.
 ```sh
 bun install --frozen-lockfile
 bun run build
-cargo check -p weather-gui
+cargo check -p weather-app --features desktop
 bun run bundle
 ```
 
-`bun run bundle` stages a release `weather-daemon` into the app resources and
-then runs the native Tauri packager. Set `WEATHER_CARGO_TARGET` when staging a
-specific Rust target triple. Native packaging still requires the platform's
-normal Tauri prerequisites (WebView2 on Windows and WebKitGTK development
-packages on Linux).
+`bun run bundle` compiles daemon, TUI, and GUI into one application executable,
+then runs the native Tauri packager. Native packaging still requires the
+platform's normal Tauri prerequisites (WebView2 on Windows and WebKitGTK
+development packages on Linux).
 
 All bundled image sources are managed under `assets/`; see `assets/README.md`
 before replacing placeholders. The WebView never requests NMC directly:

@@ -8,8 +8,8 @@
     "dev": "vite --host 127.0.0.1 --port 1420",
     "test": "bun test",
     "build": "tsc --noEmit && vite build",
-    "standalone:debug": "tauri build --debug --no-bundle",
-    "bundle": "bun scripts/stage-daemon.mjs && tauri build",
+    "standalone:debug": "tauri build --debug --no-bundle --features desktop",
+    "bundle": "tauri build --features desktop",
     "preview": "vite preview",
     "tauri": "tauri"
   },

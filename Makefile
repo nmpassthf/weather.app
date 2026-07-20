@@ -1,11 +1,13 @@
 STATIC_TARGET ?= $(shell rustc -vV | awk '/^host:/ { print $$2 }')
 STATIC_TARGET_ENV := $(shell printf '%s' '$(STATIC_TARGET)' | tr '[:lower:]-' '[:upper:]_')
 CARGO_ARGS ?=
+APP_FEATURES ?= daemon
 TARGET_RELEASE_STATIC_DIR := target/$(STATIC_TARGET)/release-lto-static
 RELEASE_ARTIFACT_DIR := target/release-artifacts/$(STATIC_TARGET)
-BINS := weather-tui weather-daemon
 BIN_SUFFIX := $(if $(findstring windows,$(STATIC_TARGET)),.exe,)
-ARTIFACTS := $(addsuffix $(BIN_SUFFIX),$(BINS))
+SOURCE_ARTIFACT := weather-app$(BIN_SUFFIX)
+PUBLISHED_ARTIFACT := weather.app$(BIN_SUFFIX)
+ARTIFACTS := $(PUBLISHED_ARTIFACT)
 SHA256SUM ?= sha256sum
 SHA256SUM_ARGS ?=
 READELF ?= readelf
@@ -14,11 +16,12 @@ READELF ?= readelf
 
 release-static:
 	env CARGO_TARGET_$(STATIC_TARGET_ENV)_RUSTFLAGS="$${CARGO_TARGET_$(STATIC_TARGET_ENV)_RUSTFLAGS:-} -C target-feature=+crt-static" \
-		cargo build --workspace --bins --profile release-lto-static --target "$(STATIC_TARGET)" $(CARGO_ARGS)
+		cargo build -p weather-app --no-default-features --features "$(APP_FEATURES)" \
+			--profile release-lto-static --target "$(STATIC_TARGET)" $(CARGO_ARGS)
 	set -eu; \
 	mkdir -p "$(RELEASE_ARTIFACT_DIR)"; \
 	for artifact in $(ARTIFACTS); do \
-		src="$(TARGET_RELEASE_STATIC_DIR)/$$artifact"; \
+		src="$(TARGET_RELEASE_STATIC_DIR)/$(SOURCE_ARTIFACT)"; \
 		dst="$(RELEASE_ARTIFACT_DIR)/$$artifact"; \
 		if [ ! -f "$$src" ]; then \
 			echo "missing build artifact: $$src" >&2; \

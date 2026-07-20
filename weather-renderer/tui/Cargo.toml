@@ -23,7 +23,3 @@ tokio = { workspace = true, features = ["test-util"] }
 
 [build-dependencies]
 weather-build-support = { path = "../../weather-build-support" }
-
-[[bin]]
-name = "weather-tui"
-path = "src/main.rs"

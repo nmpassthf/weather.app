@@ -1,30 +1,57 @@
 [package]
-name = "weather-gui"
+name = "weather-app"
 version.workspace = true
 edition.workspace = true
 build = "build.rs"
 
 [lib]
-name = "weather_gui_lib"
+name = "weather_app_lib"
 crate-type = ["lib", "cdylib", "staticlib"]
+
+[features]
+default = ["daemon"]
+daemon = ["dep:weather-daemon"]
+tui = ["dep:weather-tui"]
+gui = [
+  "dep:chrono",
+  "dep:prost",
+  "dep:rusqlite",
+  "dep:serde",
+  "dep:serde_json",
+  "dep:tauri",
+  "dep:tauri-build",
+  "dep:tempfile",
+  "dep:toml",
+  "dep:weather-renderer-common",
+  "dep:weather-schema",
+]
+desktop = ["daemon", "tui", "gui"]
 
 [dependencies]
 anyhow.workspace = true
-chrono.workspace = true
-prost.workspace = true
-rusqlite.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-tauri.workspace = true
-tempfile.workspace = true
+chrono = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tauri = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 tokio.workspace = true
-toml.workspace = true
-weather-renderer-common = { path = "../../common" }
-weather-schema = { path = "../../../weather-schema" }
+toml = { workspace = true, optional = true }
+weather-daemon = { path = "../../../weather-core/daemon", optional = true }
+weather-renderer-common = { path = "../../common", optional = true }
+weather-schema = { path = "../../../weather-schema", optional = true }
+weather-tui = { path = "../../tui", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+  "Win32_System_Console",
+  "Win32_UI_WindowsAndMessaging",
+] }
 
 [build-dependencies]
-tauri-build.workspace = true
+tauri-build = { workspace = true, optional = true }
 
 [[bin]]
-name = "weather-gui"
+name = "weather-app"
 path = "src/main.rs"

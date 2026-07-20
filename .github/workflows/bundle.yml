@@ -1,0 +1,234 @@
+name: Desktop bundles
+
+on:
+  workflow_run:
+    workflows: [CI]
+    branches: [master]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: weather-desktop-master-bundle
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    name: Bundle Linux x86_64
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out tested commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - name: Install Linux bundle dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libfuse2
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install Bun and frontend dependencies
+        working-directory: weather-renderer/gui
+        run: |
+          npm install --global bun@1.3.14
+          bun install --frozen-lockfile
+      - name: Build Linux bundles
+        working-directory: weather-renderer/gui
+        run: bun run tauri build --features desktop --bundles appimage,deb
+      - name: Verify Linux ABI and archive
+        run: |
+          test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.35"
+          mkdir -p dist/linux
+          cp target/release/bundle/appimage/*.AppImage dist/linux/
+          cp target/release/bundle/deb/*.deb dist/linux/
+          highest_glibc="$(
+            readelf --version-info target/release/weather.app \
+              | grep -o 'GLIBC_[0-9.]\+' \
+              | sort -Vu \
+              | tail -1
+          )"
+          test -n "$highest_glibc"
+          test "$(printf '%s\n' "$highest_glibc" GLIBC_2.35 | sort -V | tail -1)" = GLIBC_2.35
+          tar -C dist -czf weather-linux-x86_64.tar.gz linux
+      - name: Upload Linux candidate
+        id: upload
+        uses: actions/upload-artifact@v5
+        with:
+          name: candidate-linux-${{ github.run_id }}
+          path: weather-linux-x86_64.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  windows:
+    name: Bundle Windows 10 x86_64
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    runs-on: windows-2022
+    steps:
+      - name: Check out tested commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install Bun and frontend dependencies
+        working-directory: weather-renderer/gui
+        run: |
+          npm install --global bun@1.3.14
+          bun install --frozen-lockfile
+      - name: Build Windows bundle
+        working-directory: weather-renderer/gui
+        run: bun run tauri build --features desktop --bundles nsis
+      - name: Verify and archive Windows bundle
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem target/release/bundle/nsis/*.exe
+          if ($files.Count -ne 1) { throw "expected exactly one NSIS installer" }
+          Compress-Archive -Path $files.FullName -DestinationPath weather-windows-x86_64.zip
+      - name: Upload Windows candidate
+        uses: actions/upload-artifact@v5
+        with:
+          name: candidate-windows-${{ github.run_id }}
+          path: weather-windows-x86_64.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  macos:
+    name: Bundle macOS Universal
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    runs-on: macos-14
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - name: Check out tested commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - name: Install stable Rust targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - name: Install Bun and frontend dependencies
+        working-directory: weather-renderer/gui
+        run: |
+          npm install --global bun@1.3.14
+          bun install --frozen-lockfile
+      - name: Build macOS Universal bundle
+        working-directory: weather-renderer/gui
+        run: >-
+          bun run tauri build --target universal-apple-darwin
+          --features desktop --bundles app,dmg
+      - name: Verify and archive macOS bundle
+        run: |
+          app_path="$(find target/universal-apple-darwin/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$app_path"
+          test -f "$app_path/Contents/MacOS/weather.app"
+          test ! -e "$app_path/Contents/Resources/resources/bin/weather-daemon"
+          mkdir -p dist/macos
+          ditto -c -k --sequesterRsrc --keepParent "$app_path" dist/macos/Weather.app.zip
+          cp target/universal-apple-darwin/release/bundle/dmg/*.dmg dist/macos/
+          tar -C dist -czf weather-macos-universal.tar.gz macos
+      - name: Upload macOS candidate
+        uses: actions/upload-artifact@v5
+        with:
+          name: candidate-macos-${{ github.run_id }}
+          path: weather-macos-universal.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish latest successful bundle set
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-22.04
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Download platform candidates
+        uses: actions/download-artifact@v5
+        with:
+          pattern: candidate-*-${{ github.run_id }}
+          path: dist
+          merge-multiple: true
+      - name: Create checksums and manifest
+        env:
+          TESTED_COMMIT: ${{ github.event.workflow_run.head_sha }}
+          SOURCE_RUN: ${{ github.event.workflow_run.id }}
+        run: |
+          jq -n \
+            --arg commit "$TESTED_COMMIT" \
+            --arg source_run "$SOURCE_RUN" \
+            --arg bundle_run "$GITHUB_RUN_ID" \
+            '{commit: $commit, source_run: $source_run, bundle_run: $bundle_run}' \
+            > dist/manifest.json
+          cd dist
+          find . -type f ! -name SHA256SUMS -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > SHA256SUMS
+      - name: Upload latest bundle set
+        id: upload
+        uses: actions/upload-artifact@v5
+        with:
+          name: weather-desktop-latest
+          path: dist
+          if-no-files-found: error
+          retention-days: 30
+
+  finalize:
+    name: Retain only the latest complete bundle set
+    if: >-
+      always() &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    needs: [linux, windows, macos, publish]
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Remove candidates and superseded bundle sets
+        uses: actions/github-script@v8
+        env:
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          KEEP_ARTIFACT_ID: ${{ needs.publish.outputs.artifact-id }}
+        with:
+          script: |
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 }
+            );
+            const publishSucceeded = process.env.PUBLISH_RESULT === 'success';
+            const keepId = Number(process.env.KEEP_ARTIFACT_ID || 0);
+            for (const artifact of artifacts) {
+              const isCurrentCandidate =
+                artifact.name.startsWith('candidate-') &&
+                artifact.workflow_run?.id === context.runId;
+              const isSupersededLatest =
+                publishSucceeded &&
+                artifact.name === 'weather-desktop-latest' &&
+                artifact.id !== keepId;
+              if (isCurrentCandidate || isSupersededLatest) {
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id,
+                });
+              }
+            }
