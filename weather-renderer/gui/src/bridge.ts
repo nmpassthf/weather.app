@@ -231,7 +231,7 @@ export async function invokeCommand<T>(command: string, args: Record<string, unk
         demoGuiConfig = { ...demoGuiConfig, debug: args.debug === true };
         return demoGuiConfig;
       case "open_gui_devtools": return undefined;
-      case "restart_gui": return undefined;
+      case "exit_gui": return undefined;
       case "restart_engine": return "引擎已接受重启请求";
       case "stop_engine": return "引擎已接受停止请求";
       default: throw new Error(`demo command not implemented: ${command}`);

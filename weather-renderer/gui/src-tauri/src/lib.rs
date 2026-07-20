@@ -33,6 +33,7 @@ const RESOURCE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_RESOURCE_RETRY_MS: u32 = 75;
 const MIN_RESOURCE_RETRY_MS: u32 = 10;
 const MAX_RESOURCE_RETRY_MS: u32 = 1_000;
+const GUI_EXIT_ANIMATION_DELAY: Duration = Duration::from_millis(180);
 
 struct RendererSession {
     client: EngineClient,
@@ -729,9 +730,16 @@ async fn open_gui_devtools(app: AppHandle, state: State<'_, GuiState>) -> Result
     Ok(())
 }
 
+async fn prepare_gui_exit(state: &GuiState, minimum_delay: Duration) {
+    tokio::join!(state.shutdown_owned(), tokio::time::sleep(minimum_delay),);
+}
+
 #[tauri::command]
-fn restart_gui(app: AppHandle) {
-    app.request_restart();
+async fn exit_gui(app: AppHandle, state: State<'_, GuiState>) -> Result<(), String> {
+    let _ = app.emit("gui-close-requested", ());
+    prepare_gui_exit(&state, GUI_EXIT_ANIMATION_DELAY).await;
+    app.exit(0);
+    Ok(())
 }
 
 #[tauri::command]
@@ -801,7 +809,7 @@ pub fn run() {
             get_gui_config,
             set_gui_debug,
             open_gui_devtools,
-            restart_gui,
+            exit_gui,
             engine_status,
             restart_engine,
             stop_engine,
@@ -817,8 +825,13 @@ pub fn run() {
         } if label == "main" => {
             api.prevent_close();
             let app_handle = app_handle.clone();
+            let _ = app_handle.emit("gui-close-requested", ());
             tauri::async_runtime::spawn(async move {
-                app_handle.state::<GuiState>().shutdown_owned().await;
+                let state = app_handle.state::<GuiState>();
+                tokio::join!(
+                    state.shutdown_owned(),
+                    tokio::time::sleep(GUI_EXIT_ANIMATION_DELAY),
+                );
                 app_handle.exit(0);
             });
         }
@@ -833,6 +846,19 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn gui_exit_preparation_finishes_shutdown_before_returning() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = GuiState::new(
+            GuiConfigStore::open(temp.path().join("weather-gui.toml")),
+            GuiWeatherCache::new(temp.path().join("weather-gui.sqlite")),
+        );
+
+        prepare_gui_exit(&state, Duration::ZERO).await;
+
+        assert!(state.shutdown_started.load(Ordering::Acquire));
+    }
 
     #[test]
     fn missing_daemon_command_has_an_actionable_chinese_message() {

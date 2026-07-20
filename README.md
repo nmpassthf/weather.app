@@ -172,12 +172,36 @@ stations always trigger a fresh engine update, and stale fallback is identified
 by a persistent top-of-window warning. `WEATHER_GUI_DB` overrides this database
 path.
 
+### GUI dev build (Vite/HMR)
+
+Use this mode while editing the frontend. Vite must remain running for the GUI
+to load its resources:
+
 ```sh
 cargo build -p weather-daemon
 cd weather-renderer/gui
 bun install
 bun run tauri dev
 ```
+
+The resulting `target/debug/weather-gui` points to
+`http://localhost:1420`. It is not standalone and shows a blank window when
+launched without the Vite process started by `tauri dev`.
+
+### GUI debug build with embedded assets
+
+Use this mode to run a debug-profile GUI without Vite. The command builds the
+frontend and embeds `dist` into the executable:
+
+```sh
+cd weather-renderer/gui
+bun run standalone:debug
+../../target/debug/weather-gui
+```
+
+The executable can be started directly from another terminal. It still needs a
+discoverable `weather-daemon`, such as the adjacent
+`target/debug/weather-daemon` built by `cargo build -p weather-daemon`.
 
 Run `bun run bundle` from that directory for a native package with the matching
 release daemon staged as an application resource. See
@@ -234,11 +258,15 @@ commands fail before writing installation files.
 
 ## Build
 
-Debug build:
+Workspace debug build:
 
 ```sh
 cargo build --workspace --bins
 ```
+
+This ordinary Cargo command builds `weather-gui` for the Vite development URL;
+it does not embed frontend assets. Use the “GUI debug build with embedded
+assets” command above when the GUI must run directly without Vite.
 
 Static release build:
 

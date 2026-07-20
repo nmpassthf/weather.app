@@ -28,13 +28,20 @@ its separate renderer-owned `weather-gui.toml` is persisted locally.
 - current/default config inspection plus engine status, restart, and stop;
 - a GUI-owned current-day SQLite display cache for reopen and station switching;
 - persistent GUI-only settings with a guarded debug/inspector mode;
+- startup-to-exit motion for loading, refreshes, station/layout changes,
+  dialogs, the runtime drawer, charts, image viewing, notifications, themes,
+  and the native-window shutdown handshake;
 - local fallback assets, light/dark themes, keyboard focus, reduced-motion, and
   responsive layouts for Windows, macOS, and Linux desktop sizes.
 
-## Develop
+## Development and debug builds
 
-The package manager is pinned to Bun 1.3.14 in `package.json`. Build the daemon
-once, install frontend dependencies, then launch Tauri:
+The package manager is pinned to Bun 1.3.14 in `package.json`.
+
+### Dev build (Vite/HMR)
+
+Use this mode for frontend development. Build the daemon once, install the
+frontend dependencies, and let `tauri dev` keep Vite running:
 
 ```sh
 cargo build -p weather-daemon
@@ -42,6 +49,29 @@ cd weather-renderer/gui
 bun install
 bun run tauri dev
 ```
+
+This build loads resources from `http://localhost:1420` and supports HMR. Its
+`target/debug/weather-gui` executable is only a development launcher: starting
+it after Vite has stopped results in a blank window.
+
+### Debug build with embedded assets
+
+Use this mode when the debug-profile GUI must run directly without Vite. The
+script runs the frontend production build, embeds `dist`, and skips installer
+and application-bundle generation:
+
+```sh
+cd weather-renderer/gui
+bun run standalone:debug
+../../target/debug/weather-gui
+```
+
+The resulting `target/debug/weather-gui` is standalone with respect to frontend
+assets. It still needs `weather-daemon` beside the executable, in `PATH`, or at
+`WEATHER_DAEMON_EXE`. If a later `cargo build -p weather-gui` or `tauri dev`
+overwrites the binary, rerun `bun run standalone:debug` before launching it
+directly. A packaged release built by `bun run bundle` uses the same
+embedded-asset path.
 
 The GUI finds `weather-daemon` beside the app, in `PATH`, or through
 `WEATHER_DAEMON_EXE`. `WEATHER_CONFIG` selects a non-default config path.
@@ -54,8 +84,10 @@ resolved engine config file (`~/.weather/config/weather-gui.toml` by default).
 `WEATHER_GUI_CONFIG` overrides that path. The `debug` option defaults to
 `false`; while disabled, the WebView inspector, context menu, element
 selection, and developer shortcuts are unavailable. Enabling it under
-“关于与设置” persists the option and restarts the GUI so F12 and the native
-inspector can be used.
+“关于与设置” persists the option, explains that a manual restart is required,
+and closes the current GUI process. Start the GUI again to apply the inspector
+setting. Under `tauri dev`, closing the GUI also ends the Tauri CLI session, so
+rerun `bun run tauri dev` manually.
 The separate `weather-gui.db` file is stored in the same directory by default;
 `WEATHER_GUI_DB` overrides its path. It keeps at most one current-local-day
 display snapshot per configured station, removes older-day/unconfigured rows
@@ -96,6 +128,11 @@ All bundled image sources are managed under `assets/`; see `assets/README.md`
 before replacing placeholders. The WebView never requests NMC directly:
 remote resource URLs are converted to opaque IDs by `weather-engine`, fetched
 through an asynchronous engine transfer, and delivered to Tauri as raw bytes.
+The motion layer uses bundled application code plus browser compositor
+primitives (CSS transitions and the Web Animations API); it has no CDN or
+runtime frontend-asset dependency. Rust owns close timing and completes the
+daemon shutdown handshake while the old WebView is still visible. Per-frame
+transforms stay in the WebView to avoid frame-rate IPC traffic.
 The first request starts the provider download and returns `PENDING` without
 holding the normal RPC timeout; the Tauri bridge polls until `READY`, then
 assembles bounded 512 KiB offset-based chunks. Large resources use a bounded

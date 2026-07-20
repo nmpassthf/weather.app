@@ -1,4 +1,9 @@
-import { assets, usableWeatherDescription, weatherAsset } from "./assets";
+import {
+  assets,
+  usableWeatherDescription,
+  weatherAsset,
+  weatherAtmosphere,
+} from "./assets";
 import { invokeBinaryCommand, invokeCommand as invoke, listenEvent as listen } from "./bridge";
 import { calendarDateIso, multiDayDateLabel, multiDayDateTimeLabel } from "./date";
 import {
@@ -6,6 +11,28 @@ import {
   savitzkyGolayTemperaturePlotSamples,
   temperatureHistoryTickIndices,
 } from "./history";
+import { uiIcon, type UiIconName } from "./icons";
+import {
+  animateApplicationExit,
+  animateBootState,
+  animateChartPaths,
+  animateDialogIn,
+  animateDialogOut,
+  animateEntrance,
+  animateLayoutFrom,
+  animateOverlayIn,
+  animateOverlayOut,
+  animateStateChange,
+  captureLayout,
+  motionDuration,
+  motionEasing,
+  playMotion,
+  revealApplication,
+  shouldAnimateInteraction,
+  shouldReduceMotion,
+  waitForMotion,
+  type LayoutSnapshot,
+} from "./motion";
 import type {
   AppConfig,
   BootstrapPayload,
@@ -49,7 +76,7 @@ const imageViewerImage = element<HTMLImageElement>("image-viewer-image");
 let config: AppConfig = { stations: [], config_version: 0 };
 let engine: EngineStatus | null = null;
 let guiConfig: GuiConfig = { configVersion: 1, debug: false, configPath: "" };
-let guiRestartPending = false;
+let guiExitPending = false;
 let snapshot: WeatherSnapshot | null = null;
 let selectedStation = "";
 let searchResults: StationRef[] = [];
@@ -81,6 +108,10 @@ let imageViewerResourceId = "";
 let historyInteractionCleanup: (() => void) | null = null;
 let dailyTemperatureInteractionCleanup: (() => void) | null = null;
 let dailyTemperatureRequestToken = 0;
+let imageViewerClosing = false;
+let appExitStarted = false;
+let toastSequence = 0;
+let dataBannerToken = 0;
 
 element<HTMLImageElement>("brand-logo").src = assets.logo;
 element<HTMLImageElement>("empty-image").src = assets.emptyStations;
@@ -97,10 +128,12 @@ function normalizeSelection(): void {
   }
 }
 
-function setConnection(state: "connecting" | "connected" | "failed"): void {
+function setConnection(state: "connecting" | "connected" | "failed", animate = true): void {
   const pill = element<HTMLSpanElement>("connection-state");
+  const changed = pill.dataset.state !== state;
   pill.dataset.state = state;
   pill.lastChild!.textContent = state === "connected" ? "已连接" : state === "connecting" ? "连接中" : "连接失败";
+  if (animate && changed && !appElement.hidden) animateStateChange(pill);
 }
 
 function log(message: string, level = "info"): void {
@@ -110,10 +143,10 @@ function log(message: string, level = "info"): void {
     level,
   });
   activity.splice(40);
-  renderLog();
+  renderLog(true);
 }
 
-function renderLog(): void {
+function renderLog(animateNewest = false): void {
   const target = element<HTMLDivElement>("event-log");
   target.replaceChildren();
   if (activity.length === 0) {
@@ -123,7 +156,7 @@ function renderLog(): void {
     target.append(empty);
     return;
   }
-  for (const item of activity) {
+  activity.forEach((item, index) => {
     const row = document.createElement("div");
     row.className = `log-row ${item.level}`;
     const dot = document.createElement("i");
@@ -133,10 +166,13 @@ function renderLog(): void {
     time.textContent = item.time;
     row.append(dot, text, time);
     target.append(row);
-  }
+    if (animateNewest && index === 0 && runtimePanel.dataset.open === "true") {
+      animateEntrance(row, 0, 4);
+    }
+  });
 }
 
-function setRuntimePanel(open: boolean, restoreFocus = false): void {
+function setRuntimePanel(open: boolean, restoreFocus = false, animate = true): void {
   if (!open && runtimePanel.contains(document.activeElement)) {
     if (restoreFocus) {
       runtimeToggle.focus();
@@ -144,6 +180,8 @@ function setRuntimePanel(open: boolean, restoreFocus = false): void {
       document.activeElement.blur();
     }
   }
+  runtimePanel.dataset.motion = animate && !shouldReduceMotion() ? "animated" : "instant";
+  runtimeToggle.dataset.motion = runtimePanel.dataset.motion;
   runtimePanel.dataset.open = String(open);
   runtimePanel.setAttribute("aria-hidden", String(!open));
   runtimePanel.inert = !open;
@@ -153,6 +191,13 @@ function setRuntimePanel(open: boolean, restoreFocus = false): void {
     element<HTMLButtonElement>("runtime-close").focus();
   } else if (restoreFocus && document.activeElement !== runtimeToggle) {
     runtimeToggle.focus();
+  }
+  if (!animate || shouldReduceMotion()) {
+    void runtimePanel.offsetWidth;
+    window.requestAnimationFrame(() => {
+      delete runtimePanel.dataset.motion;
+      delete runtimeToggle.dataset.motion;
+    });
   }
 }
 
@@ -218,7 +263,8 @@ function clampImageViewerPan(): void {
   imageViewerPanY = clamp(imageViewerPanY, -maximumY, maximumY);
 }
 
-function updateImageViewerTransform(): void {
+function updateImageViewerTransform(animate = true): void {
+  imageViewerViewport.dataset.motion = animate && !shouldReduceMotion() ? "smooth" : "instant";
   clampImageViewerPan();
   imageViewerImage.style.transform = `translate(-50%, -50%) translate(${imageViewerPanX}px, ${imageViewerPanY}px) scale(${imageViewerScale})`;
   element<HTMLOutputElement>("image-viewer-scale").value = `${Math.round(imageViewerScale * 100)}%`;
@@ -228,22 +274,26 @@ function updateImageViewerTransform(): void {
     || imageViewerPanY !== 0
     || imageViewerImage.offsetWidth * imageViewerScale > imageViewerViewport.clientWidth
     || imageViewerImage.offsetHeight * imageViewerScale > imageViewerViewport.clientHeight);
+  if (!animate || shouldReduceMotion()) {
+    void imageViewerImage.offsetWidth;
+    window.requestAnimationFrame(() => delete imageViewerViewport.dataset.motion);
+  }
 }
 
-function setImageViewerScale(scale: number): void {
+function setImageViewerScale(scale: number, animate = true): void {
   imageViewerScale = clamp(
     Math.round(scale / IMAGE_VIEWER_SCALE_STEP) * IMAGE_VIEWER_SCALE_STEP,
     IMAGE_VIEWER_MIN_SCALE,
     IMAGE_VIEWER_MAX_SCALE,
   );
-  updateImageViewerTransform();
+  updateImageViewerTransform(animate);
 }
 
-function resetImageViewer(): void {
+function resetImageViewer(animate = true): void {
   imageViewerScale = 1;
   imageViewerPanX = 0;
   imageViewerPanY = 0;
-  updateImageViewerTransform();
+  updateImageViewerTransform(animate);
 }
 
 function constrainImageViewerPanel(): void {
@@ -262,9 +312,13 @@ function centerImageViewerPanel(): void {
   imageViewerPanel.style.top = `${Math.max(8, (window.innerHeight - imageViewerPanel.offsetHeight) / 2)}px`;
 }
 
-function closeImageViewer(restoreFocus = true): void {
-  if (!imageViewerOpen()) return;
+async function closeImageViewer(restoreFocus = true, animate = true): Promise<void> {
+  if (!imageViewerOpen() || imageViewerClosing) return;
+  imageViewerClosing = true;
   const trigger = imageViewerTrigger;
+  if (animate && !shouldReduceMotion()) {
+    await animateOverlayOut(imageViewer, imageViewerPanel);
+  }
   imageViewer.hidden = true;
   imageViewer.setAttribute("aria-hidden", "true");
   appElement.inert = false;
@@ -275,16 +329,23 @@ function closeImageViewer(restoreFocus = true): void {
   imageViewerTrigger = null;
   imageViewerResourceId = "";
   imageViewerViewport.dataset.pannable = "false";
+  imageViewerClosing = false;
   if (restoreFocus && trigger?.isConnected) trigger.focus();
 }
 
-function openImageViewer(source: string, title: string, trigger: HTMLElement, resourceId = ""): void {
-  if (imageViewerOpen()) closeImageViewer(false);
+function openImageViewer(
+  source: string,
+  title: string,
+  trigger: HTMLElement,
+  resourceId = "",
+  animate = true,
+): void {
+  if (imageViewerOpen()) void closeImageViewer(false, false);
   imageViewerTrigger = trigger;
   imageViewerResourceId = resourceId;
   element("image-viewer-title").textContent = title;
   imageViewerImage.alt = title;
-  imageViewerImage.onload = () => resetImageViewer();
+  imageViewerImage.onload = () => resetImageViewer(false);
   imageViewerImage.onerror = () => {
     closeImageViewer(false);
     toast("图片预览加载失败", "error");
@@ -294,8 +355,9 @@ function openImageViewer(source: string, title: string, trigger: HTMLElement, re
   appElement.inert = true;
   imageViewerImage.src = source;
   centerImageViewerPanel();
-  resetImageViewer();
+  resetImageViewer(false);
   imageViewerPanel.focus();
+  if (animate && !shouldReduceMotion()) animateOverlayIn(imageViewer, imageViewerPanel);
 }
 
 function enableImageViewer(trigger: HTMLElement, source: string, title: string, resourceId = ""): void {
@@ -304,35 +366,99 @@ function enableImageViewer(trigger: HTMLElement, source: string, title: string, 
   trigger.setAttribute("role", "button");
   trigger.setAttribute("aria-label", `放大查看${title}`);
   trigger.title = `放大查看${title}`;
-  const open = (): void => openImageViewer(source, title, trigger, resourceId);
+  const open = (event?: Event): void => openImageViewer(
+    source,
+    title,
+    trigger,
+    resourceId,
+    shouldAnimateInteraction(event),
+  );
   trigger.addEventListener("click", open);
   trigger.addEventListener("keydown", (event) => {
     if (event.key !== "Enter" && event.key !== " ") return;
     event.preventDefault();
-    open();
+    open(event);
   });
 }
 
-function toast(message: string, level = "info"): void {
+function toast(message: string, level = "info", animate = true): void {
+  const region = element<HTMLDivElement>("toast-region");
+  const useMotion = animate && !shouldReduceMotion();
+  const previous = useMotion ? captureLayout(region, ".toast") : null;
   const node = document.createElement("div");
   node.className = `toast ${level}`;
+  node.dataset.motionKey = String(++toastSequence);
   node.textContent = message;
-  element<HTMLDivElement>("toast-region").append(node);
-  window.setTimeout(() => node.remove(), 3600);
+  region.append(node);
+  if (useMotion) animateLayoutFrom(region, ".toast", previous);
+  window.setTimeout(() => {
+    void (async () => {
+      if (useMotion) {
+        await waitForMotion(playMotion(node, [
+          { opacity: 1, transform: "translateY(0) scale(1)" },
+          { opacity: 0, transform: "translateY(5px) scale(0.985)" },
+        ], {
+          duration: motionDuration.fast,
+          easing: motionEasing.out,
+        }));
+      }
+      if (!node.isConnected) return;
+      const beforeRemoval = useMotion ? captureLayout(region, ".toast") : null;
+      node.remove();
+      if (useMotion) animateLayoutFrom(region, ".toast", beforeRemoval);
+    })();
+  }, 3400);
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function showDataUpdateFailure(message: string): void {
+function showDataUpdateFailure(message: string, animate = true): void {
+  dataBannerToken += 1;
   const summary = message.replace(/\s+/g, " ").trim().slice(0, 240) || "未能取得最新天气数据";
   element("data-update-message").textContent = `天气数据更新失败：${summary}。当前显示的可能是今日缓存数据。`;
-  element<HTMLDivElement>("data-update-banner").hidden = false;
+  const banner = element<HTMLDivElement>("data-update-banner");
+  const wasHidden = banner.hidden;
+  banner.hidden = false;
+  if (!animate || shouldReduceMotion()) return;
+  if (wasHidden) {
+    playMotion(banner, [
+      { opacity: 0, transform: "translate(-50%, -8px) scale(0.985)" },
+      { opacity: 1, transform: "translate(-50%, 0) scale(1)" },
+    ], {
+      duration: motionDuration.standard,
+      easing: motionEasing.out,
+    });
+  } else {
+    playMotion(banner, [
+      { opacity: 0.72, transform: "translate(-50%, 2px)" },
+      { opacity: 1, transform: "translate(-50%, 0)" },
+    ], {
+      duration: motionDuration.fast,
+      easing: motionEasing.out,
+    });
+  }
 }
 
-function clearDataUpdateFailure(): void {
-  element<HTMLDivElement>("data-update-banner").hidden = true;
+function clearDataUpdateFailure(animate = true): void {
+  const banner = element<HTMLDivElement>("data-update-banner");
+  if (banner.hidden) return;
+  if (!animate || shouldReduceMotion()) {
+    dataBannerToken += 1;
+    banner.hidden = true;
+    return;
+  }
+  const token = ++dataBannerToken;
+  void waitForMotion(playMotion(banner, [
+    { opacity: 1, transform: "translate(-50%, 0) scale(1)" },
+    { opacity: 0, transform: "translate(-50%, -6px) scale(0.99)" },
+  ], {
+    duration: motionDuration.fast,
+    easing: motionEasing.out,
+  })).then(() => {
+    if (token === dataBannerToken) banner.hidden = true;
+  });
 }
 
 function applyGuiConfig(next: GuiConfig): void {
@@ -340,7 +466,7 @@ function applyGuiConfig(next: GuiConfig): void {
   document.documentElement.dataset.debug = String(next.debug);
   const checkbox = element<HTMLInputElement>("debug-mode");
   checkbox.checked = next.debug;
-  checkbox.disabled = guiRestartPending;
+  checkbox.disabled = guiExitPending;
   const path = element<HTMLParagraphElement>("gui-config-path");
   path.textContent = `GUI 配置：${next.configPath || "—"}`;
   path.title = next.configPath;
@@ -356,25 +482,25 @@ async function initializeGuiConfig(): Promise<void> {
   }
 }
 
-async function updateGuiDebug(debug: boolean): Promise<void> {
+async function updateGuiDebug(debug: boolean, animate = true): Promise<void> {
   const checkbox = element<HTMLInputElement>("debug-mode");
   checkbox.disabled = true;
   try {
     const updated = await invoke<GuiConfig>("set_gui_debug", { debug });
-    guiRestartPending = true;
+    guiExitPending = true;
     applyGuiConfig(updated);
-    toast(`GUI 调试已${debug ? "启用" : "关闭"}，正在重启…`, "success");
+    toast(`GUI 调试已${debug ? "启用" : "关闭"}，请手动重启 GUI`, "success", animate);
     window.setTimeout(() => {
-      void invoke<void>("restart_gui").catch((error) => {
-        guiRestartPending = false;
+      void invoke<void>("exit_gui").catch((error) => {
+        guiExitPending = false;
         applyGuiConfig(guiConfig);
-        toast(`GUI 自动重启失败：${errorMessage(error)}`, "error");
+        toast(`GUI 自动关闭失败：${errorMessage(error)}`, "error", animate);
       });
     }, 350);
   } catch (error) {
     checkbox.checked = guiConfig.debug;
     checkbox.disabled = false;
-    toast(`GUI 调试设置保存失败：${errorMessage(error)}`, "error");
+    toast(`GUI 调试设置保存失败：${errorMessage(error)}`, "error", animate);
   }
 }
 
@@ -398,6 +524,7 @@ async function initialize(): Promise<void> {
   bootMessage.hidden = true;
   bootMessage.textContent = "";
   setConnection("connecting");
+  animateBootState(bootSpinner);
   try {
     const payload = await invoke<BootstrapPayload>("bootstrap");
     config = payload.config;
@@ -414,8 +541,7 @@ async function initialize(): Promise<void> {
     if (snapshot?.station?.name) weatherCache.set(snapshot.station.name, snapshot);
     normalizeSelection();
     renderAll();
-    boot.hidden = true;
-    appElement.hidden = false;
+    revealApplication(boot, appElement);
     setConnection("connected");
     log("天气引擎已连接");
     void loadWeather(true);
@@ -428,6 +554,7 @@ async function initialize(): Promise<void> {
     bootRetry.hidden = false;
     boot.setAttribute("aria-label", bootMessage.textContent);
     setConnection("failed");
+    animateBootState(bootMessage, bootRetry);
   }
 }
 
@@ -476,7 +603,9 @@ function renderStations(): void {
     );
     button.setAttribute("aria-busy", String(station.name === selectedStation && weatherLoading));
     button.append(name, brief);
-    button.addEventListener("click", () => void selectStation(station.name));
+    button.addEventListener("click", (event) => {
+      void selectStation(station.name, shouldAnimateInteraction(event));
+    });
     stationList.append(button);
   }
   const isEmpty = stations.length === 0;
@@ -528,7 +657,7 @@ async function loadStationSummaries(): Promise<void> {
   ));
 }
 
-async function selectStation(name: string): Promise<void> {
+async function selectStation(name: string, animate = true): Promise<void> {
   if (name === selectedStation && snapshot) return;
   selectedStation = name;
   const cached = weatherCache.get(name);
@@ -539,10 +668,11 @@ async function selectStation(name: string): Promise<void> {
     renderWeather(null, true);
   }
   renderStations();
-  await loadWeather(true);
+  if (animate) animateStateChange(weatherContent);
+  await loadWeather(true, animate);
 }
 
-async function loadWeather(refresh: boolean): Promise<void> {
+async function loadWeather(refresh: boolean, animate = true): Promise<void> {
   if (!selectedStation) return;
   const stationName = selectedStation;
   const requestToken = ++weatherRequestToken;
@@ -563,18 +693,19 @@ async function loadWeather(refresh: boolean): Promise<void> {
     loadedStationSummaries.add(stationName);
     renderStations();
     renderWeather(weather);
+    if (animate) animateStateChange(weatherContent);
     if (weather.stale) {
-      showDataUpdateFailure("上游更新未成功，已回退到缓存");
+      showDataUpdateFailure("上游更新未成功，已回退到缓存", animate);
       log(`${stationName} 更新失败，继续显示缓存`, "warning");
     } else {
-      clearDataUpdateFailure();
+      clearDataUpdateFailure(animate);
       log(`${stationName} 天气${refresh ? "已刷新" : "已载入"}`);
     }
   } catch (error) {
     if (requestToken !== weatherRequestToken || selectedStation !== stationName) return;
     const message = errorMessage(error);
-    showDataUpdateFailure(message);
-    toast(`天气加载失败：${message}`, "error");
+    showDataUpdateFailure(message, animate);
+    toast(`天气加载失败：${message}`, "error", animate);
     log(`刷新失败：${message}`, "error");
   } finally {
     if (requestToken === weatherRequestToken) {
@@ -589,6 +720,7 @@ async function loadWeather(refresh: boolean): Promise<void> {
 function setWeatherLoading(loading: boolean): void {
   weatherLoading = loading;
   weatherContent.setAttribute("aria-busy", String(loading));
+  weatherContent.dataset.loading = String(loading);
 }
 
 const value = (input: unknown, suffix = "", digits = 0): string =>
@@ -633,6 +765,9 @@ function renderWeather(weather: WeatherSnapshot | null, placeholder = false): vo
   const station = weather?.station;
   const firstDay = weather?.predict?.days[0];
   const currentDescription = currentWeatherDescription(weather);
+  document.documentElement.dataset.weather = placeholder
+    ? "unknown"
+    : weatherAtmosphere(currentDescription);
   element("location").textContent = station?.name || selectedStation || "—";
   element("publish-time").textContent = placeholder
     ? "观测时间 —"
@@ -664,9 +799,9 @@ function renderWeather(weather: WeatherSnapshot | null, placeholder = false): vo
 function renderComfort(label: string | null | undefined, index: string | null | undefined): void {
   const comfort = element<HTMLDivElement>("comfort");
   const entries = [
-    { icon: assets.icons.comfort, label: "舒适度", value: label },
-    { icon: assets.icons.comfortIndex, label: "指数", value: index },
-  ];
+    { icon: "comfort", label: "舒适度", value: label },
+    { icon: "gauge", label: "指数", value: index },
+  ] as const;
   comfort.replaceChildren();
   for (const entry of entries) {
     const metric = entry.value?.trim();
@@ -674,10 +809,7 @@ function renderComfort(label: string | null | undefined, index: string | null | 
     const item = document.createElement("span");
     item.className = "comfort-item";
     item.title = `${entry.label}：${metric}`;
-    const icon = document.createElement("img");
-    icon.src = entry.icon;
-    icon.alt = "";
-    icon.setAttribute("aria-hidden", "true");
+    const icon = uiIcon(entry.icon, "comfort-icon");
     const name = document.createElement("span");
     name.textContent = entry.label;
     const value = document.createElement("strong");
@@ -774,6 +906,7 @@ function renderForecast(weather: WeatherSnapshot | null, placeholder = false): v
     const dateTime = calendarDateIso(day?.date);
     if (dateTime) date.dateTime = dateTime;
     const description = forecastWeatherDescription(day);
+    card.dataset.weather = weatherAtmosphere(description);
     const icon = document.createElement("img");
     icon.src = weatherAsset(description);
     icon.alt = placeholder ? "天气占位图标" : text(description);
@@ -957,6 +1090,7 @@ function renderHistory(weather: WeatherSnapshot | null, placeholder = false): vo
   interactionHint.textContent = "悬停 / 长按查看";
   legend.append(interactionHint);
   target.append(svg, axisLabels, tooltip, legend);
+  animateChartPaths([line as SVGGeometryElement], [area]);
   historyInteractionCleanup = bindHistoryChartInteractions({
     target,
     svg,
@@ -1357,6 +1491,9 @@ function renderDailyTemperatureChart(
   interactionHint.textContent = "左右滑动 · 悬停 / 长按查看";
   legend.append(seriesLegend, interactionHint);
   target.append(scroll, tooltip, legend);
+  if (options.initialInterval === undefined) {
+    animateChartPaths([maxLine as SVGGeometryElement, minLine as SVGGeometryElement]);
+  }
 
   const cleanupInteractions = bindDailyTemperatureChartInteractions({
     target,
@@ -1679,7 +1816,7 @@ function climateValue(input: number | null | undefined, suffix: string): string 
 }
 
 function renderExtra(weather: WeatherSnapshot | null, placeholder = false): void {
-  closeImageViewer(false);
+  void closeImageViewer(false, false);
   dailyTemperatureInteractionCleanup?.();
   dailyTemperatureInteractionCleanup = null;
   const temperatureRequestToken = ++dailyTemperatureRequestToken;
@@ -1741,6 +1878,10 @@ function renderExtra(weather: WeatherSnapshot | null, placeholder = false): void
   radar.className = "radar-block";
   const image = document.createElement("img");
   const title = document.createElement("span");
+  title.className = "radar-title";
+  const zoomHint = document.createElement("span");
+  zoomHint.className = "radar-zoom-hint";
+  zoomHint.append(uiIcon("magnify"), document.createTextNode("放大"));
   image.src = assets.radarPlaceholder;
   image.alt = placeholder ? "雷达图占位图" : weather?.radar?.title || "雷达图占位图";
   image.addEventListener("error", () => {
@@ -1752,7 +1893,7 @@ function renderExtra(weather: WeatherSnapshot | null, placeholder = false): void
     if (image.src !== assets.radarPlaceholder) image.src = assets.radarPlaceholder;
   }, { once: true });
   title.textContent = placeholder ? "—" : weather?.radar?.title || "暂无雷达图像";
-  radar.append(image, title);
+  radar.append(image, title, zoomHint);
   const dailyTemperature = document.createElement("section");
   dailyTemperature.className = "daily-temperature-block";
   const dailyHeader = document.createElement("header");
@@ -1928,7 +2069,7 @@ function emptyCopy(message: string): HTMLParagraphElement {
   return node;
 }
 
-function renderManageStations(): void {
+function renderManageStations(previousLayout: LayoutSnapshot | null = null): void {
   manageList.replaceChildren();
   if (!config.stations.length) {
     manageList.append(emptyCopy("尚未配置站点"));
@@ -1937,6 +2078,7 @@ function renderManageStations(): void {
   config.stations.forEach((station, index) => {
     const row = document.createElement("div");
     row.className = "manage-row";
+    row.dataset.motionKey = station.name;
     const order = document.createElement("span");
     order.className = "manage-order";
     order.textContent = String(index + 1).padStart(2, "0");
@@ -1949,18 +2091,34 @@ function renderManageStations(): void {
     const actions = document.createElement("div");
     actions.className = "manage-actions";
     actions.append(
-      manageAction(station.enabled ? "停用" : "启用", () => void toggleStation(index)),
-      manageAction(hiddenStations.has(station.name) ? "显示" : "隐藏", () => toggleHidden(station.name)),
-      manageAction("↑", () => void moveStation(index, -1), index === 0),
-      manageAction("↓", () => void moveStation(index, 1), index === config.stations.length - 1),
-      manageAction("删除", () => void removeStation(index), false, "danger"),
+      manageAction(station.enabled ? "停用" : "启用", (event) => {
+        void toggleStation(index, shouldAnimateInteraction(event));
+      }),
+      manageAction(hiddenStations.has(station.name) ? "显示" : "隐藏", (event) => {
+        toggleHidden(station.name, shouldAnimateInteraction(event));
+      }),
+      manageIconAction("chevron-up", "上移", (event) => {
+        void moveStation(index, -1, shouldAnimateInteraction(event));
+      }, index === 0),
+      manageIconAction("chevron-down", "下移", (event) => {
+        void moveStation(index, 1, shouldAnimateInteraction(event));
+      }, index === config.stations.length - 1),
+      manageAction("删除", (event) => {
+        void removeStation(index, shouldAnimateInteraction(event));
+      }, false, "danger"),
     );
     row.append(order, copy, actions);
     manageList.append(row);
   });
+  animateLayoutFrom(manageList, ".manage-row", previousLayout);
 }
 
-function manageAction(label: string, action: () => void, disabled = false, variant = ""): HTMLButtonElement {
+function manageAction(
+  label: string,
+  action: (event: MouseEvent) => void,
+  disabled = false,
+  variant = "",
+): HTMLButtonElement {
   const button = document.createElement("button");
   button.className = `text-button ${variant}`;
   button.textContent = label;
@@ -1969,62 +2127,118 @@ function manageAction(label: string, action: () => void, disabled = false, varia
   return button;
 }
 
-async function submitStations(stations: StationConfig[], success: string): Promise<void> {
+function manageIconAction(
+  icon: Extract<UiIconName, "chevron-up" | "chevron-down">,
+  label: string,
+  action: (event: MouseEvent) => void,
+  disabled = false,
+): HTMLButtonElement {
+  const button = manageAction(label, action, disabled);
+  button.classList.add("icon-only");
+  button.replaceChildren(uiIcon(icon));
+  button.setAttribute("aria-label", label);
+  button.title = label;
+  return button;
+}
+
+async function submitStations(
+  stations: StationConfig[],
+  success: string,
+  previousLayout: LayoutSnapshot | null = null,
+  animateWeather = true,
+): Promise<void> {
   try {
     config = await invoke<AppConfig>("update_stations", { stations });
     normalizeSelection();
     renderStations();
-    renderManageStations();
-    toast(success, "success");
+    renderManageStations(previousLayout);
+    toast(success, "success", animateWeather);
     log(success);
     void loadStationSummaries();
-    if (!snapshot || snapshot.station?.name !== selectedStation) await loadWeather(false);
+    if (!snapshot || snapshot.station?.name !== selectedStation) {
+      await loadWeather(false, animateWeather);
+    }
   } catch (error) {
     const message = errorMessage(error);
-    toast(`配置更新失败：${message}`, "error");
+    toast(`配置更新失败：${message}`, "error", animateWeather);
     log(`配置更新失败：${message}`, "error");
   }
 }
 
-async function toggleStation(index: number): Promise<void> {
+async function toggleStation(index: number, animate = true): Promise<void> {
   const stations = config.stations.map((station) => ({ ...station }));
   const target = stations[index];
   if (!target) return;
   target.enabled = !target.enabled;
-  await submitStations(stations, `${target.enabled ? "已启用" : "已停用"} ${target.name}`);
+  await submitStations(
+    stations,
+    `${target.enabled ? "已启用" : "已停用"} ${target.name}`,
+    null,
+    animate,
+  );
+  if (animate) {
+    const updated = [...manageList.querySelectorAll<HTMLElement>(".manage-row")]
+      .find((row) => row.dataset.motionKey === target.name);
+    if (updated) animateStateChange(updated);
+  }
 }
 
-function toggleHidden(name: string): void {
+function toggleHidden(name: string, animate = true): void {
   hiddenStations.has(name) ? hiddenStations.delete(name) : hiddenStations.add(name);
   normalizeSelection();
   renderStations();
   renderManageStations();
+  if (animate) animateStateChange(stationList);
   void loadStationSummaries();
-  if (selectedStation) void loadWeather(false);
+  if (selectedStation) void loadWeather(false, animate);
 }
 
-async function moveStation(index: number, delta: number): Promise<void> {
+async function moveStation(index: number, delta: number, animate = true): Promise<void> {
   const destination = index + delta;
   if (destination < 0 || destination >= config.stations.length) return;
   const stations = config.stations.map((station) => ({ ...station }));
   const [moved] = stations.splice(index, 1);
   if (!moved) return;
   stations.splice(destination, 0, moved);
-  await submitStations(stations, `已移动 ${moved.name}`);
+  const previousLayout = animate ? captureLayout(manageList, ".manage-row") : null;
+  await submitStations(stations, `已移动 ${moved.name}`, previousLayout, animate);
 }
 
-async function removeStation(index: number): Promise<void> {
+async function removeStation(index: number, animate = true): Promise<void> {
   const target = config.stations[index];
   if (!target || !window.confirm(`确定删除 ${target.name}？`)) return;
   const stations = config.stations.filter((_, stationIndex) => stationIndex !== index);
   hiddenStations.delete(target.name);
-  await submitStations(stations, `已删除 ${target.name}`);
+  const previousLayout = animate ? captureLayout(manageList, ".manage-row") : null;
+  await submitStations(stations, `已删除 ${target.name}`, previousLayout, animate);
 }
 
-function openSearch(): void {
-  if (manageDialog.open) manageDialog.close();
+function showDialog(dialog: HTMLDialogElement, animate = true): void {
+  if (dialog.open) return;
+  dialog.dataset.motionState = animate && !shouldReduceMotion() ? "opening" : "instant";
+  dialog.showModal();
+  if (animate) animateDialogIn(dialog);
+  if (animate && !shouldReduceMotion()) {
+    window.requestAnimationFrame(() => {
+      if (dialog.open) dialog.dataset.motionState = "open";
+    });
+  }
+}
+
+async function hideDialog(dialog: HTMLDialogElement, animate = true): Promise<void> {
+  if (!dialog.open) return;
+  if (animate && !shouldReduceMotion()) {
+    dialog.dataset.motionState = "closing";
+    await waitForMotion(animateDialogOut(dialog));
+  }
+  if (dialog.open) dialog.close();
+  delete dialog.dataset.motionState;
+}
+
+async function openSearch(animate = true): Promise<void> {
+  if (manageDialog.open) await hideDialog(manageDialog, animate);
   resetSearch(true);
-  searchDialog.showModal();
+  showDialog(searchDialog, animate);
   window.setTimeout(() => element<HTMLInputElement>("search-input").focus(), 50);
 }
 
@@ -2100,31 +2314,38 @@ function renderSearchResults(): void {
     const path = document.createElement("small");
     path.textContent = [station.province, station.city].filter(Boolean).join(" · ");
     copy.append(title, path);
-    const arrow = document.createElement("i");
-    arrow.textContent = "›";
+    const arrow = uiIcon("chevron-right", "search-result-arrow");
     button.append(copy, arrow);
-    button.addEventListener("click", () => void previewStation(station));
+    button.addEventListener("click", (event) => {
+      void previewStation(station, shouldAnimateInteraction(event));
+    });
     target.append(button);
   }
 }
 
-async function previewStation(station: StationRef): Promise<void> {
+async function previewStation(station: StationRef, animate = true): Promise<void> {
   selectedSearchResult = station;
   renderSearchResults();
-  renderPreview(station, null, true);
+  renderPreview(station, null, true, "", animate);
   try {
     const weather = await invoke<WeatherSnapshot>("get_weather", {
       stationName: station.name,
       unifiedUuid: station.unified_uuid || null,
       refresh: false,
     });
-    if (selectedSearchResult?.name === station.name) renderPreview(station, weather);
+    if (selectedSearchResult?.name === station.name) renderPreview(station, weather, false, "", animate);
   } catch (error) {
-    renderPreview(station, null, false, errorMessage(error));
+    renderPreview(station, null, false, errorMessage(error), animate);
   }
 }
 
-function renderPreview(station: StationRef | null, weather: WeatherSnapshot | null, loading = false, error = ""): void {
+function renderPreview(
+  station: StationRef | null,
+  weather: WeatherSnapshot | null,
+  loading = false,
+  error = "",
+  animate = false,
+): void {
   const panel = element<HTMLElement>("preview-panel");
   panel.replaceChildren();
   const image = document.createElement("img");
@@ -2143,19 +2364,27 @@ function renderPreview(station: StationRef | null, weather: WeatherSnapshot | nu
   const add = document.createElement("button");
   add.className = "button primary";
   add.textContent = config.stations.some((item) => item.name === station.name) ? "启用此站点" : "添加到我的城市";
-  add.addEventListener("click", () => void addStation(station));
+  add.addEventListener("click", (event) => {
+    void addStation(station, shouldAnimateInteraction(event));
+  });
   panel.append(title, detail, add);
+  if (animate) animateStateChange(panel);
 }
 
-async function addStation(station: StationRef): Promise<void> {
+async function addStation(station: StationRef, animate = true): Promise<void> {
   const stations = config.stations.map((item) => ({ ...item }));
   const existing = stations.find((item) => item.name === station.name);
   if (existing) existing.enabled = true;
   else stations.push({ name: station.name, enabled: true });
-  await submitStations(stations, `${existing ? "已启用" : "已添加"} ${station.name}`);
+  await submitStations(
+    stations,
+    `${existing ? "已启用" : "已添加"} ${station.name}`,
+    null,
+    animate,
+  );
   selectedStation = station.name;
-  searchDialog.close();
-  await loadWeather(false);
+  await hideDialog(searchDialog, animate);
+  await loadWeather(false, animate);
 }
 
 function renderEngine(): void {
@@ -2185,68 +2414,101 @@ function renderEngine(): void {
   }
 }
 
-async function refreshEngineStatus(): Promise<void> {
+async function refreshEngineStatus(animate = true): Promise<void> {
   try {
     engine = await invoke<EngineStatus>("engine_status");
     renderEngine();
-    toast("引擎状态已刷新", "success");
+    if (animate) animateStateChange(element("engine-details"));
+    toast("引擎状态已刷新", "success", animate);
   } catch (error) {
-    toast(`状态刷新失败：${errorMessage(error)}`, "error");
+    toast(`状态刷新失败：${errorMessage(error)}`, "error", animate);
   }
 }
 
-async function showConfig(defaults: boolean): Promise<void> {
+async function showConfig(defaults: boolean, animate = true): Promise<void> {
   const output = element<HTMLPreElement>("config-output");
+  const wasHidden = output.hidden;
   output.hidden = false;
   output.textContent = "正在读取…";
+  if (animate && wasHidden) animateEntrance(output, 0, 5);
   try {
     output.textContent = await invoke<string>("get_config_text", { defaults });
+    if (animate) animateStateChange(output);
   } catch (error) {
     output.textContent = `读取失败：${errorMessage(error)}`;
   }
 }
 
-async function engineAction(command: "restart_engine" | "stop_engine"): Promise<void> {
+async function engineAction(command: "restart_engine" | "stop_engine", animate = true): Promise<void> {
   const label = command === "restart_engine" ? "重启" : "停止";
   if (!window.confirm(`确定${label}天气引擎？`)) return;
   try {
     const message = await invoke<string>(command);
-    toast(message, "success");
+    toast(message, "success", animate);
     log(message);
-    if (command === "stop_engine") setConnection("failed");
+    if (command === "stop_engine") setConnection("failed", animate);
   } catch (error) {
-    toast(`${label}失败：${errorMessage(error)}`, "error");
+    toast(`${label}失败：${errorMessage(error)}`, "error", animate);
   }
 }
 
 function bindEvents(): void {
   bootRetry.addEventListener("click", () => void initialize());
-  element("refresh-button").addEventListener("click", () => void loadWeather(true));
-  element("search-button").addEventListener("click", openSearch);
-  element("sidebar-add").addEventListener("click", openSearch);
-  element("empty-add").addEventListener("click", openSearch);
-  element("manage-search").addEventListener("click", openSearch);
-  element("manage-button").addEventListener("click", () => manageDialog.showModal());
-  element("about-button").addEventListener("click", () => aboutDialog.showModal());
-  runtimeToggle.addEventListener("click", () => setRuntimePanel(true));
-  element("runtime-close").addEventListener("click", () => setRuntimePanel(false, true));
+  element("refresh-button").addEventListener("click", (event) => {
+    void loadWeather(true, shouldAnimateInteraction(event));
+  });
+  ["search-button", "sidebar-add", "empty-add", "manage-search"].forEach((id) => {
+    element(id).addEventListener("click", (event) => {
+      void openSearch(shouldAnimateInteraction(event));
+    });
+  });
+  element("manage-button").addEventListener("click", (event) => {
+    showDialog(manageDialog, shouldAnimateInteraction(event));
+  });
+  element("about-button").addEventListener("click", (event) => {
+    showDialog(aboutDialog, shouldAnimateInteraction(event));
+  });
+  runtimeToggle.addEventListener("click", (event) => {
+    setRuntimePanel(true, false, shouldAnimateInteraction(event));
+  });
+  element("runtime-close").addEventListener("click", (event) => {
+    setRuntimePanel(false, true, shouldAnimateInteraction(event));
+  });
   document.addEventListener("click", (event) => {
     if (runtimePanel.dataset.open !== "true") return;
     const path = event.composedPath();
     if (path.includes(runtimePanel) || path.includes(runtimeToggle)) return;
-    setRuntimePanel(false);
+    setRuntimePanel(false, false, true);
   });
-  element("clear-log").addEventListener("click", () => { activity.length = 0; renderLog(); });
-  element("status-refresh").addEventListener("click", () => void refreshEngineStatus());
-  element("show-config").addEventListener("click", () => void showConfig(false));
-  element("show-defaults").addEventListener("click", () => void showConfig(true));
-  element("restart-engine").addEventListener("click", () => void engineAction("restart_engine"));
-  element("stop-engine").addEventListener("click", () => void engineAction("stop_engine"));
-  element("data-update-retry").addEventListener("click", () => void loadWeather(true));
-  element<HTMLInputElement>("debug-mode").addEventListener("change", (event) => {
-    void updateGuiDebug((event.currentTarget as HTMLInputElement).checked);
+  element("clear-log").addEventListener("click", () => { activity.length = 0; renderLog(false); });
+  element("status-refresh").addEventListener("click", (event) => {
+    void refreshEngineStatus(shouldAnimateInteraction(event));
   });
-  element("theme-button").addEventListener("click", toggleTheme);
+  element("show-config").addEventListener("click", (event) => {
+    void showConfig(false, shouldAnimateInteraction(event));
+  });
+  element("show-defaults").addEventListener("click", (event) => {
+    void showConfig(true, shouldAnimateInteraction(event));
+  });
+  element("restart-engine").addEventListener("click", (event) => {
+    void engineAction("restart_engine", shouldAnimateInteraction(event));
+  });
+  element("stop-engine").addEventListener("click", (event) => {
+    void engineAction("stop_engine", shouldAnimateInteraction(event));
+  });
+  element("data-update-retry").addEventListener("click", (event) => {
+    void loadWeather(true, shouldAnimateInteraction(event));
+  });
+  const debugMode = element<HTMLInputElement>("debug-mode");
+  debugMode.addEventListener("click", (event) => {
+    debugMode.dataset.animate = String(shouldAnimateInteraction(event));
+  });
+  debugMode.addEventListener("change", () => {
+    void updateGuiDebug(debugMode.checked, debugMode.dataset.animate !== "false");
+  });
+  element("theme-button").addEventListener("click", (event) => {
+    toggleTheme(shouldAnimateInteraction(event));
+  });
   element<HTMLFormElement>("search-form").addEventListener("submit", (event) => {
     event.preventDefault();
     const query = element<HTMLInputElement>("search-input").value.trim();
@@ -2260,11 +2522,20 @@ function bindEvents(): void {
   });
   searchDialog.addEventListener("close", () => resetSearch(false));
   document.querySelectorAll<HTMLElement>("[data-close]").forEach((button) => {
-    button.addEventListener("click", () => element<HTMLDialogElement>(button.dataset.close!).close());
+    button.addEventListener("click", (event) => {
+      void hideDialog(
+        element<HTMLDialogElement>(button.dataset.close!),
+        shouldAnimateInteraction(event),
+      );
+    });
   });
   document.querySelectorAll<HTMLDialogElement>("dialog").forEach((dialog) => {
     dialog.addEventListener("click", (event) => {
-      if (event.target === dialog) dialog.close();
+      if (event.target === dialog) void hideDialog(dialog, true);
+    });
+    dialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      void hideDialog(dialog, false);
     });
   });
   bindImageViewerEvents();
@@ -2283,21 +2554,21 @@ function bindEvents(): void {
     if (imageViewerOpen()) {
       if (event.key === "Escape") {
         event.preventDefault();
-        closeImageViewer();
+        void closeImageViewer(true, false);
       } else if (event.key === "+" || event.key === "=") {
         event.preventDefault();
-        setImageViewerScale(imageViewerScale + IMAGE_VIEWER_SCALE_STEP);
+        setImageViewerScale(imageViewerScale + IMAGE_VIEWER_SCALE_STEP, false);
       } else if (event.key === "-" || event.key === "_") {
         event.preventDefault();
-        setImageViewerScale(imageViewerScale - IMAGE_VIEWER_SCALE_STEP);
+        setImageViewerScale(imageViewerScale - IMAGE_VIEWER_SCALE_STEP, false);
       } else if (event.key === "0") {
         event.preventDefault();
-        resetImageViewer();
+        resetImageViewer(false);
       }
       return;
     }
     if (event.key === "Escape" && runtimePanel.dataset.open === "true") {
-      setRuntimePanel(false, true);
+      setRuntimePanel(false, true, false);
     }
   });
 }
@@ -2307,12 +2578,20 @@ function bindImageViewerEvents(): void {
   let panelDrag: { pointerId: number; startX: number; startY: number; left: number; top: number } | null = null;
   let imageDrag: { pointerId: number; startX: number; startY: number; panX: number; panY: number } | null = null;
 
-  element("image-viewer-close").addEventListener("click", () => closeImageViewer());
-  element("image-viewer-zoom-in").addEventListener("click", () => setImageViewerScale(imageViewerScale + IMAGE_VIEWER_SCALE_STEP));
-  element("image-viewer-zoom-out").addEventListener("click", () => setImageViewerScale(imageViewerScale - IMAGE_VIEWER_SCALE_STEP));
-  element("image-viewer-reset").addEventListener("click", resetImageViewer);
+  element("image-viewer-close").addEventListener("click", (event) => {
+    void closeImageViewer(true, shouldAnimateInteraction(event));
+  });
+  element("image-viewer-zoom-in").addEventListener("click", (event) => {
+    setImageViewerScale(imageViewerScale + IMAGE_VIEWER_SCALE_STEP, shouldAnimateInteraction(event));
+  });
+  element("image-viewer-zoom-out").addEventListener("click", (event) => {
+    setImageViewerScale(imageViewerScale - IMAGE_VIEWER_SCALE_STEP, shouldAnimateInteraction(event));
+  });
+  element("image-viewer-reset").addEventListener("click", (event) => {
+    resetImageViewer(shouldAnimateInteraction(event));
+  });
   imageViewer.addEventListener("click", (event) => {
-    if (event.target === imageViewer) closeImageViewer();
+    if (event.target === imageViewer) void closeImageViewer(true, true);
   });
   imageViewerViewport.addEventListener("wheel", (event) => {
     event.preventDefault();
@@ -2379,17 +2658,33 @@ function bindImageViewerEvents(): void {
   imageViewerViewport.addEventListener("pointercancel", finishImageDrag);
   window.addEventListener("resize", () => {
     constrainImageViewerPanel();
-    updateImageViewerTransform();
+    updateImageViewerTransform(false);
   });
 }
 
-function toggleTheme(): void {
+function toggleTheme(animate = true): void {
   const current = document.documentElement.dataset.theme;
   const next = current === "dark" ? "light" : current === "light" ? "system" : "dark";
-  if (next === "system") delete document.documentElement.dataset.theme;
-  else document.documentElement.dataset.theme = next;
-  localStorage.setItem("weather-theme", next);
-  toast(`主题：${next === "system" ? "跟随系统" : next === "dark" ? "深色" : "浅色"}`);
+  const applyTheme = (): void => {
+    if (next === "system") delete document.documentElement.dataset.theme;
+    else document.documentElement.dataset.theme = next;
+    localStorage.setItem("weather-theme", next);
+  };
+  const viewTransitionDocument = document as Document & {
+    startViewTransition?: (update: () => void) => unknown;
+  };
+  if (animate && !shouldReduceMotion() && viewTransitionDocument.startViewTransition) {
+    viewTransitionDocument.startViewTransition(applyTheme);
+  } else {
+    applyTheme();
+    if (animate) {
+      playMotion(appElement, [{ opacity: 0.76 }, { opacity: 1 }], {
+        duration: motionDuration.standard,
+        easing: motionEasing.out,
+      });
+    }
+  }
+  toast(`主题：${next === "system" ? "跟随系统" : next === "dark" ? "深色" : "浅色"}`, "info", animate);
 }
 
 function restoreTheme(): void {
@@ -2398,6 +2693,11 @@ function restoreTheme(): void {
 }
 
 async function bindEngineEvents(): Promise<void> {
+  await listen<void>("gui-close-requested", () => {
+    if (appExitStarted) return;
+    appExitStarted = true;
+    animateApplicationExit(document.body);
+  });
   await listen<string>("connection-status", (event) => setConnection(event.payload as "connecting" | "connected" | "failed"));
   await listen<GuiEngineEvent>("engine-event", (message) => {
     const event = message.payload;

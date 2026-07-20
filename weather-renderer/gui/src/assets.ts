@@ -18,6 +18,15 @@ export const assets = {
   },
 } as const;
 
+export type WeatherAtmosphere =
+  | "clear"
+  | "cloudy"
+  | "rain"
+  | "storm"
+  | "snow"
+  | "fog"
+  | "unknown";
+
 export function usableWeatherDescription(
   ...candidates: Array<string | null | undefined>
 ): string | null {
@@ -28,13 +37,17 @@ export function usableWeatherDescription(
   return null;
 }
 
-export function weatherAsset(description?: string | null): string {
+export function weatherAtmosphere(description?: string | null): WeatherAtmosphere {
   const value = (description ?? "").toLowerCase();
-  if (/雷|storm|thunder/.test(value)) return assets.weather.storm;
-  if (/雪|snow|sleet|冰雹/.test(value)) return assets.weather.snow;
-  if (/雨|rain|shower|drizzle/.test(value)) return assets.weather.rain;
-  if (/雾|霾|fog|haze|mist|沙尘/.test(value)) return assets.weather.fog;
-  if (/云|阴|cloud|overcast/.test(value)) return assets.weather.cloudy;
-  if (/晴|clear|sunny/.test(value)) return assets.weather.clear;
-  return assets.weather.unknown;
+  if (/雷|storm|thunder/.test(value)) return "storm";
+  if (/雪|snow|sleet|冰雹/.test(value)) return "snow";
+  if (/雨|rain|shower|drizzle/.test(value)) return "rain";
+  if (/雾|霾|fog|haze|mist|沙尘/.test(value)) return "fog";
+  if (/云|阴|cloud|overcast/.test(value)) return "cloudy";
+  if (/晴|clear|sunny/.test(value)) return "clear";
+  return "unknown";
+}
+
+export function weatherAsset(description?: string | null): string {
+  return assets.weather[weatherAtmosphere(description)];
 }
