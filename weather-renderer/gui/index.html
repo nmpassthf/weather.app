@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="zh-CN" data-weather="unknown">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#edf1ef" />
+    <title>Weather</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --boot-bg: #edf1ef;
+        --boot-accent: #087f86;
+        --boot-ring: rgba(16, 43, 49, 0.16);
+        --boot-wash: rgba(8, 127, 134, 0.12);
+        --boot-isobar: rgba(31, 79, 82, 0.08);
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei", sans-serif;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          color-scheme: dark;
+          --boot-bg: #07171b;
+          --boot-accent: #72d1d0;
+          --boot-ring: rgba(206, 235, 234, 0.16);
+          --boot-wash: rgba(114, 209, 208, 0.1);
+          --boot-isobar: rgba(181, 223, 219, 0.065);
+        }
+      }
+      html, body { margin: 0; min-width: 320px; min-height: 100%; background: var(--boot-bg); }
+      .boot {
+        position: fixed;
+        inset: 0;
+        z-index: 100;
+        display: grid;
+        overflow: hidden;
+        place-content: center;
+        justify-items: center;
+        gap: 18px;
+        background:
+          repeating-radial-gradient(ellipse 68% 47% at 78% 18%, transparent 0 43px, var(--boot-isobar) 44px 45px, transparent 46px 76px),
+          radial-gradient(ellipse 58% 44% at 78% 18%, var(--boot-wash), transparent 72%),
+          var(--boot-bg);
+        text-align: center;
+      }
+      .boot::before {
+        content: "";
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        width: min(68vw, 620px);
+        aspect-ratio: 1;
+        border-radius: 50%;
+        background: repeating-radial-gradient(circle, transparent 0 36px, var(--boot-isobar) 37px 38px, transparent 39px 61px);
+        transform: translate(-50%, -50%);
+      }
+      .boot-spinner {
+        position: relative;
+        z-index: 1;
+        width: 48px;
+        height: 48px;
+        border: 1px solid var(--boot-ring);
+        border-top: 3px solid var(--boot-accent);
+        border-radius: 50%;
+        box-shadow: inset 0 0 0 9px color-mix(in srgb, var(--boot-bg), transparent 20%), 0 0 0 10px color-mix(in srgb, var(--boot-accent), transparent 91%);
+        animation: spin 0.85s linear infinite;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      @media (prefers-reduced-motion: reduce) {
+        .boot-spinner { animation: none; }
+      }
+    </style>
+  </head>
+  <body>
+    <svg class="icon-symbols" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
+      <symbol id="icon-theme" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="8.25" />
+        <path d="M12 3.75a8.25 8.25 0 0 0 0 16.5Z" fill="currentColor" stroke="none" opacity="0.28" />
+      </symbol>
+      <symbol id="icon-more" viewBox="0 0 24 24">
+        <circle cx="5.5" cy="12" r="1.35" fill="currentColor" stroke="none" />
+        <circle cx="12" cy="12" r="1.35" fill="currentColor" stroke="none" />
+        <circle cx="18.5" cy="12" r="1.35" fill="currentColor" stroke="none" />
+      </symbol>
+      <symbol id="icon-close" viewBox="0 0 24 24">
+        <path d="m6.75 6.75 10.5 10.5M17.25 6.75l-10.5 10.5" />
+      </symbol>
+      <symbol id="icon-plus" viewBox="0 0 24 24">
+        <path d="M12 5.25v13.5M5.25 12h13.5" />
+      </symbol>
+      <symbol id="icon-minus" viewBox="0 0 24 24">
+        <path d="M5.25 12h13.5" />
+      </symbol>
+      <symbol id="icon-refresh" viewBox="0 0 24 24">
+        <path d="M19.25 8.5V4.25M19.25 8.5H15" />
+        <path d="M19 8.25a7.75 7.75 0 1 0 .35 6.9" />
+      </symbol>
+      <symbol id="icon-activity" viewBox="0 0 24 24">
+        <path d="M3.75 12h3.1l2.05-4.6 3.25 9.2 2.15-5.35 1.55 2.55h4.4" />
+      </symbol>
+      <symbol id="icon-drag" viewBox="0 0 24 24">
+        <circle cx="9" cy="6.5" r="1.25" fill="currentColor" stroke="none" />
+        <circle cx="15" cy="6.5" r="1.25" fill="currentColor" stroke="none" />
+        <circle cx="9" cy="12" r="1.25" fill="currentColor" stroke="none" />
+        <circle cx="15" cy="12" r="1.25" fill="currentColor" stroke="none" />
+        <circle cx="9" cy="17.5" r="1.25" fill="currentColor" stroke="none" />
+        <circle cx="15" cy="17.5" r="1.25" fill="currentColor" stroke="none" />
+      </symbol>
+      <symbol id="icon-chevron-right" viewBox="0 0 24 24">
+        <path d="m9 5.75 6.25 6.25L9 18.25" />
+      </symbol>
+      <symbol id="icon-chevron-up" viewBox="0 0 24 24">
+        <path d="m5.75 15 6.25-6.25L18.25 15" />
+      </symbol>
+      <symbol id="icon-chevron-down" viewBox="0 0 24 24">
+        <path d="m5.75 9 6.25 6.25L18.25 9" />
+      </symbol>
+      <symbol id="icon-warning" viewBox="0 0 24 24">
+        <path d="M10.55 4.35 2.8 18.15a1.65 1.65 0 0 0 1.45 2.45h15.5a1.65 1.65 0 0 0 1.45-2.45L13.45 4.35a1.67 1.67 0 0 0-2.9 0Z" />
+        <path d="M12 9v5.1" />
+        <circle cx="12" cy="17.45" r="1" fill="currentColor" stroke="none" />
+      </symbol>
+      <symbol id="icon-magnify" viewBox="0 0 24 24">
+        <circle cx="10.5" cy="10.5" r="6.25" />
+        <path d="m15.15 15.15 4.6 4.6" />
+      </symbol>
+      <symbol id="icon-comfort" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="8.5" />
+        <path d="M8.5 10h.01M15.5 10h.01M8.5 14.2c1 1.15 2.17 1.72 3.5 1.72s2.5-.57 3.5-1.72" />
+      </symbol>
+      <symbol id="icon-gauge" viewBox="0 0 24 24">
+        <path d="M4.2 16.8a8.5 8.5 0 1 1 15.6 0M12 13.2l3.4-3.4" />
+        <circle cx="12" cy="13.2" r="1.25" />
+        <path d="M6.3 17.5h11.4" />
+      </symbol>
+    </svg>
+    <div id="boot" class="boot" role="status" aria-label="天气应用正在加载" aria-live="polite">
+      <div id="boot-spinner" class="boot-spinner" aria-hidden="true"></div>
+      <p id="boot-message" hidden></p>
+      <button id="boot-retry" class="button primary" hidden>重新连接</button>
+    </div>
+
+    <div id="app" class="app-shell" hidden>
+      <header class="topbar">
+        <div class="brand">
+          <img id="brand-logo" alt="Weather" />
+          <div><strong>Weather</strong><span id="engine-mode">本地天气服务</span></div>
+        </div>
+        <div class="top-actions">
+          <span id="connection-state" class="status-pill"><i></i>已连接</span>
+          <button id="theme-button" class="icon-button" aria-label="切换主题" title="切换主题"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#icon-theme"></use></svg></button>
+          <button id="search-button" class="button quiet">搜索城市</button>
+          <button id="manage-button" class="button quiet">管理站点</button>
+          <button id="about-button" class="icon-button" aria-label="关于与设置" title="关于与设置"><svg class="ui-icon ui-icon-more" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#icon-more"></use></svg></button>
+        </div>
+      </header>
+
+      <div id="data-update-banner" class="data-update-banner" role="alert" hidden>
+        <span id="data-update-message">天气数据更新失败，当前显示的可能是今日缓存数据。</span>
+        <button id="data-update-retry" class="button warning">重试更新</button>
+      </div>
+
+      <div class="workspace">
+        <aside class="station-sidebar" aria-label="已配置站点">
+          <div class="section-kicker">我的城市</div>
+          <nav id="station-list" class="station-list"></nav>
+          <button id="sidebar-add" class="add-station"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#icon-plus"></use></svg><span>添加城市</span></button>
+        </aside>
+
+        <main class="weather-main">
+          <section id="empty-state" class="empty-state" hidden>
+            <img id="empty-image" alt="暂无站点" />
+            <h1>添加第一个城市</h1>
+            <p>搜索城市或气象站，即可查看实时天气、未来预报与预警。</p>
+            <button id="empty-add" class="button primary">搜索城市</button>
+          </section>
+
+          <div id="weather-content">
+            <section class="hero-card">
+              <div class="hero-copy">
+                <div class="location-line">
+                  <span id="location">—</span>
+                  <span id="stale-badge" class="stale-badge" hidden>缓存数据</span>
+                </div>
+                <p id="publish-time" class="muted">等待天气数据</p>
+                <div class="temperature-line">
+                  <strong id="temperature">—</strong>
+                  <div><span id="weather-info">—</span><small id="high-low">最高 — · 最低 —</small></div>
+                </div>
+                <div id="comfort" class="comfort-chip" hidden></div>
+              </div>
+              <div class="hero-visual">
+                <div id="weather-icon-wrap" class="weather-icon-wrap" role="img" tabindex="0" aria-label="当前天气：加载中">
+                  <img id="weather-icon" alt="" aria-hidden="true" />
+                  <span id="weather-icon-tooltip" class="weather-icon-tooltip" role="tooltip">天气信息加载中</span>
+                </div>
+                <button id="refresh-button" class="refresh-button" aria-label="刷新天气"><svg class="ui-icon refresh-glyph" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#icon-refresh"></use></svg><span>刷新</span></button>
+              </div>
+              <div id="current-metrics" class="metric-grid"></div>
+            </section>
+
+            <section id="alert-card" class="alert-card" hidden>
+              <div class="alert-card-heading">
+                <div class="alert-symbol"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#icon-warning"></use></svg></div>
+                <div><div class="section-kicker">天气预警</div><h2>当前生效预警</h2></div>
+              </div>
+              <div id="alert-list" class="alert-list"></div>
+            </section>
+
+            <section class="content-section">
+              <div class="section-heading"><div><div class="section-kicker">逐日趋势</div><h2>未来天气</h2></div><span id="forecast-time" class="muted"></span></div>
+              <div id="forecast-list" class="forecast-list"></div>
+            </section>
+
+            <section class="details-grid">
+              <article class="detail-card">
+                <div class="section-heading compact"><div><div class="section-kicker">空气质量</div><h2>呼吸指数</h2></div><strong id="aqi" class="aqi-value">—</strong></div>
+                <div id="air-content" class="detail-content"></div>
+              </article>
+              <article class="detail-card">
+                <div class="section-heading compact"><div><div class="section-kicker">过去观测</div><h2>温度变化</h2></div><span id="history-time" class="muted"></span></div>
+                <div id="history-chart" class="history-chart"></div>
+              </article>
+              <article class="detail-card wide">
+                <div class="section-heading compact"><div><div class="section-kicker">更多信息</div><h2>气候与雷达</h2></div></div>
+                <div id="extra-content" class="extra-content"></div>
+              </article>
+            </section>
+
+          </div>
+        </main>
+      </div>
+
+      <button id="runtime-toggle" class="runtime-toggle" type="button" aria-controls="runtime-panel" aria-expanded="false">
+        <span class="runtime-toggle-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" focusable="false"><use href="#icon-activity"></use></svg></span>
+        <span>运行状态</span>
+      </button>
+      <aside id="runtime-panel" class="runtime-panel" data-open="false" aria-label="应用运行状态" aria-hidden="true" inert>
+        <div class="runtime-panel-header">
+          <div><div class="section-kicker">应用运行状态</div><h2>活动记录</h2></div>
+          <div class="runtime-panel-actions">
+            <button id="clear-log" class="text-button" type="button">清空</button>
+            <button id="runtime-close" class="icon-button" type="button" aria-label="收起运行状态" title="收起运行状态"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#icon-close"></use></svg></button>
+          </div>
+        </div>
+        <div id="event-log" class="event-log" aria-live="polite"></div>
+      </aside>
+    </div>
+
+    <dialog id="search-dialog" class="modal search-modal">
+      <form id="search-form" class="search-form">
+        <label for="search-input">搜索城市或气象站</label>
+        <div class="search-input-row"><input id="search-input" autocomplete="off" placeholder="例如：北京、朝阳" /><button class="button primary" type="submit">搜索</button></div>
+      </form>
+      <div class="modal-body split-body">
+        <div><div id="search-summary" class="muted">输入关键词开始搜索</div><div id="search-results" class="search-results"></div></div>
+        <aside id="preview-panel" class="preview-panel"><img id="preview-image" alt="搜索预览" /><p>选择结果可预览天气</p></aside>
+      </div>
+      <button class="dialog-close icon-button" data-close="search-dialog" aria-label="关闭"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#icon-close"></use></svg></button>
+    </dialog>
+
+    <dialog id="manage-dialog" class="modal manage-modal">
+      <div class="modal-header">
+        <div><div class="section-kicker">配置同步至引擎</div><h2>管理站点</h2></div>
+        <div class="modal-header-actions">
+          <button class="button quiet" id="manage-search">添加站点</button>
+          <button class="dialog-close icon-button" data-close="manage-dialog" aria-label="关闭"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#icon-close"></use></svg></button>
+        </div>
+      </div>
+      <div id="manage-list" class="manage-list"></div>
+      <p class="modal-note">隐藏仅影响当前 GUI 会话；启用、删除与排序会写入共享配置。</p>
+    </dialog>
+
+    <dialog id="about-dialog" class="modal about-modal">
+      <div class="modal-header"><div><div class="section-kicker">Weather GUI</div><h2>引擎与配置</h2></div></div>
+      <section class="gui-settings" aria-labelledby="gui-settings-title">
+        <label class="debug-setting" for="debug-mode">
+          <span><strong id="gui-settings-title">GUI 调试</strong><small>允许选择界面元素、使用右键菜单，并通过 F12 打开审查元素。</small></span>
+          <input id="debug-mode" type="checkbox" disabled />
+        </label>
+        <p id="gui-config-path" class="gui-config-path">GUI 配置：正在读取…</p>
+        <p class="gui-setting-note">切换后会保存设置并关闭 GUI；请手动重新启动。</p>
+      </section>
+      <div id="engine-details" class="engine-details"></div>
+      <div class="settings-actions">
+        <button id="status-refresh" class="button quiet">刷新状态</button>
+        <button id="show-config" class="button quiet">当前配置</button>
+        <button id="show-defaults" class="button quiet">默认配置</button>
+        <button id="restart-engine" class="button warning">重启引擎</button>
+        <button id="stop-engine" class="button danger">停止引擎</button>
+      </div>
+      <pre id="config-output" class="config-output" hidden></pre>
+      <button class="dialog-close icon-button" data-close="about-dialog" aria-label="关闭"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#icon-close"></use></svg></button>
+    </dialog>
+
+    <div id="image-viewer" class="image-viewer" aria-hidden="true" hidden>
+      <section
+        id="image-viewer-panel"
+        class="image-viewer-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="image-viewer-title"
+        aria-describedby="image-viewer-hint"
+        tabindex="-1"
+      >
+        <header id="image-viewer-drag-handle" class="image-viewer-header">
+          <div class="image-viewer-heading">
+            <span class="image-viewer-grip" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" focusable="false"><use href="#icon-drag"></use></svg></span>
+            <strong id="image-viewer-title">图片预览</strong>
+          </div>
+          <div class="image-viewer-actions" aria-label="图片缩放控制">
+            <button id="image-viewer-zoom-out" class="image-viewer-button" type="button" aria-label="缩小图片" title="缩小（-）"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#icon-minus"></use></svg></button>
+            <output id="image-viewer-scale" aria-live="polite">100%</output>
+            <button id="image-viewer-zoom-in" class="image-viewer-button" type="button" aria-label="放大图片" title="放大（+）"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#icon-plus"></use></svg></button>
+            <button id="image-viewer-reset" class="image-viewer-button image-viewer-fit" type="button" title="适应窗口（0）">适应</button>
+            <button id="image-viewer-close" class="image-viewer-button image-viewer-close" type="button" aria-label="关闭图片预览" title="关闭（Esc）"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#icon-close"></use></svg></button>
+          </div>
+        </header>
+        <div id="image-viewer-viewport" class="image-viewer-viewport" tabindex="0" aria-label="图片查看区域，可拖动平移">
+          <img id="image-viewer-image" alt="" draggable="false" />
+        </div>
+        <p id="image-viewer-hint" class="image-viewer-hint">滚轮缩放 · 拖动图片平移 · 拖动标题栏移动窗口</p>
+      </section>
+    </div>
+
+    <div id="toast-region" class="toast-region" aria-live="polite"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

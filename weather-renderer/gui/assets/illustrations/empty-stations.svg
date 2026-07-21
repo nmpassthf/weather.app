@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 300" role="img" aria-label="空站点占位图">
+  <defs><linearGradient id="g" x1="90" y1="30" x2="320" y2="270"><stop stop-color="#D9EFFF"/><stop offset="1" stop-color="#BDE4F3"/></linearGradient></defs>
+  <ellipse cx="210" cy="260" rx="150" ry="20" fill="#7BA4BA" fill-opacity=".15"/>
+  <circle cx="210" cy="138" r="104" fill="url(#g)"/>
+  <path d="M210 42c-58 0-105 46-105 104 0 73 105 133 105 133s105-60 105-133c0-58-47-104-105-104Z" fill="#fff" fill-opacity=".52" stroke="#5E9FC8" stroke-width="4"/>
+  <circle cx="210" cy="143" r="52" fill="#fff"/>
+  <circle cx="232" cy="127" r="24" fill="#FFD85E"/>
+  <path d="M166 167c0-16 13-29 29-29 6-18 24-27 42-22 14 4 23 16 25 31 13 1 23 12 23 26 0 15-12 26-27 26h-65c-15 0-27-12-27-27Z" fill="#EAF6FC" stroke="#B6D8E9" stroke-width="3"/>
+</svg>

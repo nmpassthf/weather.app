@@ -42,7 +42,8 @@ fn full_response_preserves_the_existing_structured_mapping_baseline() {
     assert_eq!(real.wind_degree, Some(45.0));
     assert_eq!(real.sunrise.as_deref(), Some("04:50"));
     assert_eq!(real.sunset.as_deref(), Some("19:47"));
-    let alert = real.alert.as_ref().expect("weather alert");
+    let alert = real.alerts.first().expect("weather alert");
+    assert!(!alert.inherited);
     assert_eq!(
         alert.url.as_deref(),
         Some("https://configured.example/publish/alarm/ABJ.html")
@@ -145,7 +146,7 @@ fn malformed_sections_and_entries_are_isolated_with_stable_warnings() {
     let real = snapshot.real.expect("valid current weather must survive");
     assert_eq!(real.temperature, Some(30.0));
     assert_eq!(real.wind_speed, Some(2.5));
-    assert!(real.alert.is_none());
+    assert!(real.alerts.is_empty());
     assert_eq!(snapshot.predict.unwrap().days.len(), 1);
     assert_eq!(snapshot.tempchart.len(), 1);
     assert_eq!(snapshot.climate.unwrap().month.len(), 1);
@@ -194,6 +195,58 @@ fn aliases_try_each_complete_conversion_and_filter_every_sentinel_shape() {
         Some("http://proxy.test/radar.png")
     );
     assert_eq!(radar.page_url.as_deref(), Some("http://cdn.example/radar"));
+}
+
+#[test]
+fn current_nmc_air_shape_maps_overall_fields_without_inventing_pollutants() {
+    let fixture = serde_json::json!({
+        "code": 0,
+        "msg": "success",
+        "data": {
+            "air": {
+                "forecasttime": "2026-07-21 12:00",
+                "aqi": 46,
+                "aq": 1,
+                "text": "优",
+                "aqiCode": "99006;99008"
+            }
+        }
+    });
+    let mapped = mapper::map_weather(
+        dto::decode_weather_response(fixture).unwrap(),
+        &Url::parse("https://www.nmc.cn/").unwrap(),
+    );
+
+    assert!(mapped.warnings.is_empty(), "{:?}", mapped.warnings);
+    let air = mapped.value.air.unwrap();
+    assert_eq!(air.publish_time.as_deref(), Some("2026-07-21 12:00"));
+    assert_eq!(air.aqi, Some(46.0));
+    assert_eq!(air.level.as_deref(), Some("一级"));
+    assert_eq!(air.category.as_deref(), Some("优"));
+    assert_eq!(air.pm2_5, None);
+    assert_eq!(air.pm10, None);
+    assert_eq!(air.no2, None);
+    assert_eq!(air.so2, None);
+    assert_eq!(air.co, None);
+    assert_eq!(air.o3, None);
+}
+
+#[test]
+fn textual_dash_placeholders_are_mapped_as_missing_values() {
+    let mut fixture: Value = serde_json::from_str(FULL).unwrap();
+    fixture["data"]["real"]["weather"]["info"] = Value::String("-".to_string());
+    fixture["data"]["real"]["weather"]["img"] = Value::String("—".to_string());
+    let data = dto::decode_weather_response(fixture).unwrap();
+
+    let mapped = mapper::map_weather(
+        data,
+        &Url::parse("https://configured.example/nmc/").unwrap(),
+    );
+
+    assert!(mapped.warnings.is_empty(), "{:?}", mapped.warnings);
+    let real = mapped.value.real.unwrap();
+    assert!(real.info.is_none());
+    assert!(real.weather_icon.is_none());
 }
 
 #[test]

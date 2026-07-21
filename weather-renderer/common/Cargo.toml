@@ -1,0 +1,17 @@
+[package]
+name = "weather-renderer-common"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+prost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+zeromq.workspace = true
+weather-schema = { path = "../../weather-schema" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

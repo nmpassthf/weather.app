@@ -6,7 +6,9 @@ mod events;
 mod failure;
 mod fuzzy;
 mod migrate_tz;
+mod resource;
 mod response;
+mod temperature_history;
 mod weather;
 
 pub(crate) use events::RefreshTerminal;

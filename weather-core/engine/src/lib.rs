@@ -4,6 +4,7 @@ mod lifecycle;
 mod limits;
 mod lock;
 mod refresh;
+mod resource_cache;
 mod runtime;
 mod server;
 mod singleflight;

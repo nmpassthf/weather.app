@@ -12,17 +12,19 @@ pub(super) fn map_air_quality(
     let air = AirQuality {
         publish_time: value::alias_string(
             &map,
-            &["publish_time", "publishTime", "pubtime", "pub_time"],
+            &[
+                "publish_time",
+                "publishTime",
+                "pubtime",
+                "pub_time",
+                "forecasttime",
+                "forecastTime",
+            ],
             "air.publish_time",
             context,
         ),
         aqi: value::alias_f64(&map, &["aqi", "AQI"], "air.aqi", context),
-        level: value::alias_string(
-            &map,
-            &["level", "aqi_level", "aqiLevel"],
-            "air.level",
-            context,
-        ),
+        level: map_air_level(&map, context),
         category: value::alias_string(
             &map,
             &["category", "quality", "text"],
@@ -58,6 +60,31 @@ pub(super) fn map_air_quality(
         warn_if_unusable("air", &map, before, context);
         None
     }
+}
+
+fn map_air_level(map: &Map<String, Value>, context: &mut MappingContext<'_>) -> Option<String> {
+    if let Some(level) = value::alias_string(
+        map,
+        &["level", "aqi_level", "aqiLevel"],
+        "air.level",
+        context,
+    ) {
+        return Some(level);
+    }
+    let grade = value::alias_u32(map, &["aq"], "air.level", context)?;
+    let level = match grade {
+        1 => "一级",
+        2 => "二级",
+        3 => "三级",
+        4 => "四级",
+        5 => "五级",
+        6 => "六级",
+        _ => {
+            context.warn("air.level: AQ grade outside 1-6; field ignored".to_string());
+            return None;
+        }
+    };
+    Some(level.to_string())
 }
 
 pub(super) fn map_climate(
@@ -96,6 +123,7 @@ pub(super) fn map_radar(raw: Option<Value>, context: &mut MappingContext<'_>) ->
             "radar.page_url",
             context,
         ),
+        image_resource_id: None,
     };
     if radar.title.is_some() || radar.image_url.is_some() || radar.page_url.is_some() {
         Some(radar)

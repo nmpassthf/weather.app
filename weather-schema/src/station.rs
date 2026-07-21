@@ -7,6 +7,16 @@ pub fn normalize_station_name(name: &str) -> String {
         .join("-")
 }
 
+/// Return the two-level parent of an exact three-level station path.
+///
+/// Two-level stations deliberately have no parent in the public weather model,
+/// so inheritance never continues to a synthetic one-level station.
+pub fn parent_station_name(name: &str) -> Option<String> {
+    let normalized = normalize_station_name(name);
+    let parts = normalized.split('-').collect::<Vec<_>>();
+    (parts.len() == 3).then(|| parts[..2].join("-"))
+}
+
 /// Remove one supported Chinese administrative suffix without trimming or
 /// otherwise changing the input.
 pub fn short_region_name(value: &str) -> &str {
@@ -67,5 +77,20 @@ mod tests {
             "广西壮族-广西壮族自治区-南宁"
         );
         assert_eq!(canonical_station_name("", ""), "-");
+    }
+
+    #[test]
+    fn only_three_level_stations_have_a_two_level_parent() {
+        assert_eq!(
+            parent_station_name("北京-北京市-朝阳").as_deref(),
+            Some("北京-北京市")
+        );
+        assert_eq!(
+            parent_station_name(" 海南 - 海南省 - 三亚 ").as_deref(),
+            Some("海南-海南省")
+        );
+        assert_eq!(parent_station_name("北京-北京市"), None);
+        assert_eq!(parent_station_name("北京市"), None);
+        assert_eq!(parent_station_name("北京-北京市-朝阳-望京"), None);
     }
 }

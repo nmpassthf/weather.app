@@ -16,7 +16,7 @@ pub(super) fn is_missing_value(value: &Value) -> bool {
         Value::Null => true,
         Value::String(value) => {
             let value = value.trim();
-            value.is_empty() || is_sentinel_number(value.parse::<f64>().ok())
+            is_sentinel_string(value)
         }
         Value::Number(value) => is_sentinel_number(value.as_f64()),
         Value::Object(map) => map.is_empty() || map.values().all(is_missing_value),
@@ -206,7 +206,7 @@ pub(super) fn alias_resource_url(
 
 pub(super) fn required_resource_url(base_url: &Url, reference: &str) -> Result<String> {
     let reference = reference.trim();
-    if reference.is_empty() || is_sentinel_number(reference.parse::<f64>().ok()) {
+    if is_sentinel_string(reference) {
         bail!("resource URL is empty or sentinel");
     }
     Ok(base_url
@@ -350,4 +350,10 @@ fn join_resource_url(
 
 fn is_sentinel_number(value: Option<f64>) -> bool {
     value.is_some_and(|value| value == 9999.0)
+}
+
+fn is_sentinel_string(value: &str) -> bool {
+    value.is_empty()
+        || matches!(value, "-" | "--" | "—")
+        || is_sentinel_number(value.parse::<f64>().ok())
 }

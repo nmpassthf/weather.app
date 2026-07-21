@@ -17,6 +17,7 @@ pub enum RpcErrorCode {
     RestartRequired,
     Config,
     Weather,
+    Resource,
 }
 
 impl RpcErrorCode {
@@ -36,6 +37,7 @@ impl RpcErrorCode {
             Self::RestartRequired => "RESTART_REQUIRED",
             Self::Config => "CONFIG",
             Self::Weather => "WEATHER",
+            Self::Resource => "RESOURCE",
         }
     }
 
@@ -55,6 +57,7 @@ impl RpcErrorCode {
             "RESTART_REQUIRED" => Self::RestartRequired,
             "CONFIG" => Self::Config,
             "WEATHER" => Self::Weather,
+            "RESOURCE" => Self::Resource,
             _ => return None,
         })
     }
@@ -127,6 +130,7 @@ mod tests {
             RpcErrorCode::RestartRequired,
             RpcErrorCode::Config,
             RpcErrorCode::Weather,
+            RpcErrorCode::Resource,
         ];
 
         for code in known {

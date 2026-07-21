@@ -174,7 +174,7 @@ fn search_candidates(
         catalog
             .provinces
             .iter()
-            .filter(|province| province.name.contains(query))
+            .filter(|province| province_matches_query(province, query))
             .cloned()
             .map(SearchCandidate::Province),
     );
@@ -186,9 +186,17 @@ fn search_candidates(
 }
 
 fn city_matches(city: &ProviderCity, query: &str) -> bool {
-    city.city.contains(query)
-        || city.province.contains(query)
-        || canonical_station_name(&city.province, &city.city).contains(query)
+    search_values_match(&city_search_values(city), query)
+}
+
+fn province_matches_query(province: &ProviderProvince, query: &str) -> bool {
+    search_values_match(
+        &[
+            province.name.clone(),
+            short_region_name(&province.name).to_string(),
+        ],
+        query,
+    )
 }
 
 fn candidate_cmp(left: &SearchCandidate, right: &SearchCandidate, query: &str) -> Ordering {
@@ -208,24 +216,67 @@ fn candidate_kind_rank(candidate: &SearchCandidate) -> u8 {
 
 fn candidate_match_rank(candidate: &SearchCandidate, query: &str) -> u8 {
     match candidate {
-        SearchCandidate::Station(station) => {
-            match_rank(&[&station.name, &station.province, &station.city], query)
-        }
-        SearchCandidate::City(city) => {
-            let canonical = canonical_station_name(&city.province, &city.city);
-            match_rank(&[&city.city, &city.province, &canonical], query)
-        }
-        SearchCandidate::Province(province) => match_rank(&[&province.name], query),
+        SearchCandidate::Station(station) => search_match_rank(
+            &location_search_values(&station.name, &station.province, &station.city),
+            query,
+        ),
+        SearchCandidate::City(city) => search_match_rank(&city_search_values(city), query),
+        SearchCandidate::Province(province) => search_match_rank(
+            &[
+                province.name.clone(),
+                short_region_name(&province.name).to_string(),
+            ],
+            query,
+        ),
     }
 }
 
-fn match_rank(values: &[&str], query: &str) -> u8 {
+fn city_search_values(city: &ProviderCity) -> Vec<String> {
+    location_search_values(
+        &canonical_station_name(&city.province, &city.city),
+        &city.province,
+        &city.city,
+    )
+}
+
+fn location_search_values(name: &str, province: &str, city: &str) -> Vec<String> {
+    let short_province = short_region_name(province);
+    vec![
+        name.to_string(),
+        province.to_string(),
+        short_province.to_string(),
+        city.to_string(),
+        format!("{province}{city}"),
+        format!("{short_province}{city}"),
+    ]
+}
+
+fn search_values_match(values: &[String], query: &str) -> bool {
+    if query.trim().is_empty() {
+        return true;
+    }
+    let tokens = search_tokens(query);
+    if tokens.is_empty() {
+        return false;
+    }
+    let values = values
+        .iter()
+        .map(|value| compact_search_text(value))
+        .collect::<Vec<_>>();
+    tokens
+        .iter()
+        .all(|token| values.iter().any(|value| value.contains(token)))
+}
+
+fn search_match_rank(values: &[String], query: &str) -> u8 {
+    let query = compact_search_text(query);
     values
         .iter()
+        .map(|value| compact_search_text(value))
         .map(|value| {
-            if *value == query {
+            if value == query {
                 0
-            } else if value.starts_with(query) {
+            } else if value.starts_with(&query) {
                 1
             } else {
                 2
@@ -233,6 +284,22 @@ fn match_rank(values: &[&str], query: &str) -> u8 {
         })
         .min()
         .unwrap_or(2)
+}
+
+fn search_tokens(query: &str) -> Vec<String> {
+    query
+        .split(|character: char| !character.is_alphanumeric())
+        .map(compact_search_text)
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn compact_search_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn candidate_stable_cmp(left: &SearchCandidate, right: &SearchCandidate) -> Ordering {
@@ -298,6 +365,32 @@ mod tests {
         }
     }
 
+    fn beijing_catalog() -> ProviderCatalog {
+        ProviderCatalog {
+            provinces: vec![ProviderProvince {
+                provider_code: "ABJ".to_string(),
+                name: "北京市".to_string(),
+                url: "/ABJ".to_string(),
+            }],
+            cities: vec![
+                ProviderCity {
+                    provider_code: "BJ".to_string(),
+                    provider_province_code: "ABJ".to_string(),
+                    province: "北京市".to_string(),
+                    city: "北京".to_string(),
+                    url: "/BJ".to_string(),
+                },
+                ProviderCity {
+                    provider_code: "CY".to_string(),
+                    provider_province_code: "ABJ".to_string(),
+                    province: "北京市".to_string(),
+                    city: "朝阳".to_string(),
+                    url: "/CY".to_string(),
+                },
+            ],
+        }
+    }
+
     #[test]
     fn candidates_deduplicate_public_identities_after_stable_sorting() {
         let catalog = ProviderCatalog {
@@ -331,5 +424,27 @@ mod tests {
             SearchCandidate::Province(province) => assert_eq!(province.provider_code, "A"),
             _ => panic!("third candidate was not a province"),
         }
+    }
+
+    #[test]
+    fn compact_and_delimited_region_city_queries_match_the_same_station() {
+        let catalog = beijing_catalog();
+
+        for query in ["北京朝阳", "北京 朝阳", "北京-朝阳", "北京，朝阳"] {
+            let candidates = search_candidates("provider", &catalog, query);
+            assert_eq!(candidates.len(), 2, "query {query}");
+            match &candidates[0] {
+                SearchCandidate::Station(station) => {
+                    assert_eq!(station.name, "北京-北京市-朝阳", "query {query}");
+                }
+                _ => panic!("first candidate was not a station for query {query}"),
+            }
+        }
+    }
+
+    #[test]
+    fn segmented_query_requires_every_token_to_match() {
+        let candidates = search_candidates("provider", &beijing_catalog(), "北京 海淀");
+        assert!(candidates.is_empty());
     }
 }

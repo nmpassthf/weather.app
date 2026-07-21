@@ -6,7 +6,7 @@ mod validation;
 
 pub use actor::{
     CatalogCache, DbActor, ProviderCity, ProviderCityScopeCache, ProviderProvince, ProviderStation,
-    StoredSnapshot,
+    StoredSnapshot, StoredSnapshotPage,
 };
 pub use paths::DatabasePaths;
 pub use validation::{validate_provider_city_catalog, validate_provider_province_catalog};

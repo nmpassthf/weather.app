@@ -147,8 +147,8 @@ impl Cli {
     }
 }
 
-pub(crate) fn parse_cli() -> Cli {
-    Cli::parse_from(normalize_args(std::env::args_os()))
+pub(crate) fn parse_cli_from(args: impl IntoIterator<Item = OsString>) -> Cli {
+    Cli::parse_from(normalize_args(args))
 }
 
 fn normalize_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {

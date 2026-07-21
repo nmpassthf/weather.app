@@ -1,6 +1,7 @@
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
+use futures::{StreamExt, channel::mpsc::Receiver};
 use prost::Message;
 use prost::bytes::Bytes;
 use tokio::{
@@ -9,7 +10,7 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 use weather_schema::*;
-use zeromq::{PubSocket, RouterSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
+use zeromq::{PubSocket, RouterSocket, Socket, SocketEvent, SocketRecv, SocketSend, ZmqMessage};
 
 use crate::{
     lifecycle::{Cancellation, wait_for_exit},
@@ -26,6 +27,8 @@ pub(crate) type EventSink = broadcast::Sender<(String, EventEnvelope)>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskKind {
     Router,
+    RpcMonitor,
+    PubMonitor,
     Signal,
     Refresh,
 }
@@ -34,7 +37,9 @@ type TaskOutput = (TaskKind, Result<()>);
 
 pub(crate) struct BoundEngineSockets {
     publisher: PubSocket,
+    publisher_monitor: Receiver<SocketEvent>,
     router: RouterSocket,
+    router_monitor: Receiver<SocketEvent>,
     pub(crate) rpc_endpoint: String,
     pub(crate) pub_endpoint: String,
 }
@@ -48,6 +53,9 @@ struct RpcReply {
 const RESPONSE_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 const MIN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+const UPSTREAM_RPC_OVERHEAD: Duration = Duration::from_secs(2);
+const WEATHER_UPSTREAM_STAGES: u32 = 6;
+const CATALOG_UPSTREAM_STAGES: u32 = 8;
 
 pub(crate) async fn run_engine_sockets(
     engine: Engine,
@@ -67,6 +75,7 @@ pub(crate) async fn run_engine_sockets(
     let sockets = match sockets {
         Ok(Ok(sockets)) => sockets,
         Ok(Err(err)) => {
+            log::error!("failed to bind engine sockets: {err:#}");
             if let Err(db_err) =
                 bounded_db_shutdown(&engine, cleanup_timeout(request_timeout)).await
             {
@@ -75,6 +84,7 @@ pub(crate) async fn run_engine_sockets(
             return Err(err);
         }
         Err(err) => {
+            log::error!("engine socket startup timed out after {startup_timeout:?}");
             if let Err(db_err) =
                 bounded_db_shutdown(&engine, cleanup_timeout(request_timeout)).await
             {
@@ -94,7 +104,9 @@ pub(crate) async fn run_bound_engine_sockets(
 ) -> Result<EngineExit> {
     let BoundEngineSockets {
         publisher,
+        publisher_monitor,
         router,
+        router_monitor,
         rpc_endpoint,
         pub_endpoint,
     } = sockets;
@@ -127,6 +139,16 @@ pub(crate) async fn run_bound_engine_sockets(
     );
     spawn_task(
         &mut work_tasks,
+        TaskKind::RpcMonitor,
+        run_socket_monitor("rpc", router_monitor, work_cancellation.clone()),
+    );
+    spawn_task(
+        &mut work_tasks,
+        TaskKind::PubMonitor,
+        run_socket_monitor("events", publisher_monitor, work_cancellation.clone()),
+    );
+    spawn_task(
+        &mut work_tasks,
         TaskKind::Signal,
         run_signal(work_cancellation.clone()),
     );
@@ -143,6 +165,12 @@ pub(crate) async fn run_bound_engine_sockets(
         Some("engine tasks starting".to_string()),
     );
     engine.publish_status(&mode, &rpc_endpoint, &pub_endpoint);
+    log::info!(
+        "weather engine ready mode={} rpc_endpoint={} pub_endpoint={}",
+        mode,
+        rpc_endpoint,
+        pub_endpoint
+    );
 
     let mut exit_rx = engine.control.subscribe();
     let (requested_exit, mut critical_failure, mut publisher_finished) = tokio::select! {
@@ -225,8 +253,15 @@ pub(crate) async fn run_bound_engine_sockets(
     }
 
     match critical_failure {
-        Some(error) => Err(error),
-        None => Ok(requested_exit.unwrap_or(EngineExit::Shutdown)),
+        Some(error) => {
+            log::error!("weather engine terminated after critical failure: {error:#}");
+            Err(error)
+        }
+        None => {
+            let exit = requested_exit.unwrap_or(EngineExit::Shutdown);
+            log::info!("weather engine socket tasks stopped exit={exit:?}");
+            Ok(exit)
+        }
     }
 }
 
@@ -331,8 +366,8 @@ pub(crate) async fn bind_engine_sockets(
     rpc_endpoint: &str,
     pub_endpoint: &str,
 ) -> Result<BoundEngineSockets> {
-    let (publisher, pub_endpoint) = bind_publisher(pub_endpoint).await?;
-    let (router, rpc_endpoint) = match bind_router(rpc_endpoint).await {
+    let (publisher, publisher_monitor, pub_endpoint) = bind_publisher(pub_endpoint).await?;
+    let (router, router_monitor, rpc_endpoint) = match bind_router(rpc_endpoint).await {
         Ok(router) => router,
         Err(error) => {
             return match close_socket(publisher, "PUB").await {
@@ -345,28 +380,92 @@ pub(crate) async fn bind_engine_sockets(
     };
     Ok(BoundEngineSockets {
         publisher,
+        publisher_monitor,
         router,
+        router_monitor,
         rpc_endpoint,
         pub_endpoint,
     })
 }
 
-async fn bind_publisher(endpoint: &str) -> Result<(PubSocket, String)> {
+async fn bind_publisher(endpoint: &str) -> Result<(PubSocket, Receiver<SocketEvent>, String)> {
     let mut socket = PubSocket::new();
+    let monitor = socket.monitor();
     let endpoint = socket
         .bind(endpoint)
         .await
         .with_context(|| format!("failed to bind PUB endpoint {endpoint}"))?;
-    Ok((socket, endpoint.to_string()))
+    Ok((socket, monitor, endpoint.to_string()))
 }
 
-async fn bind_router(endpoint: &str) -> Result<(RouterSocket, String)> {
+async fn bind_router(endpoint: &str) -> Result<(RouterSocket, Receiver<SocketEvent>, String)> {
     let mut socket = RouterSocket::new();
+    let monitor = socket.monitor();
     let endpoint = socket
         .bind(endpoint)
         .await
         .with_context(|| format!("failed to bind RPC endpoint {endpoint}"))?;
-    Ok((socket, endpoint.to_string()))
+    Ok((socket, monitor, endpoint.to_string()))
+}
+
+async fn run_socket_monitor(
+    channel: &'static str,
+    mut monitor: Receiver<SocketEvent>,
+    cancellation: Cancellation,
+) -> Result<()> {
+    loop {
+        let event = tokio::select! {
+            _ = cancellation.cancelled() => return Ok(()),
+            event = monitor.next() => event,
+        };
+        let Some(event) = event else {
+            if cancellation.is_cancelled() {
+                return Ok(());
+            }
+            bail!("{channel} socket monitor closed unexpectedly");
+        };
+        match event {
+            SocketEvent::Accepted(endpoint, peer) => log::info!(
+                "client connected channel={} peer={} endpoint={}",
+                channel,
+                peer_label(peer.as_ref()),
+                endpoint
+            ),
+            SocketEvent::Disconnected(peer) => log::info!(
+                "client disconnected channel={} peer={}",
+                channel,
+                peer_label(peer.as_ref())
+            ),
+            SocketEvent::Listening(endpoint) => {
+                log::debug!("socket listening channel={} endpoint={}", channel, endpoint);
+            }
+            SocketEvent::AcceptFailed(error) => {
+                // Daemon readiness probes intentionally make a bounded raw TCP
+                // connection, which ZMQ reports as a failed greeting exchange.
+                log::debug!("client handshake failed channel={channel}: {error}");
+            }
+            SocketEvent::Closed => log::debug!("socket closed channel={channel}"),
+            SocketEvent::CloseFailed => log::warn!("socket close failed channel={channel}"),
+            SocketEvent::Connected(endpoint, peer) => log::debug!(
+                "socket connected channel={} peer={} endpoint={}",
+                channel,
+                peer_label(peer.as_ref()),
+                endpoint
+            ),
+            SocketEvent::ConnectDelayed | SocketEvent::ConnectRetried => {
+                log::trace!("socket connection delayed or retried channel={channel}");
+            }
+        }
+    }
+}
+
+fn peer_label(peer: &[u8]) -> String {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let hash = peer.iter().fold(OFFSET, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
+    });
+    format!("{hash:016x}")
 }
 
 async fn close_socket<S: Socket>(socket: S, label: &str) -> Result<()> {
@@ -420,7 +519,7 @@ async fn run_publisher_loop(
             event = rx.recv() => match event {
                 Ok(event) => event,
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    eprintln!("weather-engine warn: publisher lagged; skipped {skipped} events");
+                    log::warn!("publisher lagged; skipped {skipped} events");
                     continue;
                 }
                 Err(broadcast::error::RecvError::Closed) if cancellation.is_cancelled() => {
@@ -446,9 +545,7 @@ async fn drain_publisher(
         match rx.try_recv() {
             Ok((topic, event)) => send_publisher_event(socket, topic, event).await?,
             Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
-                eprintln!(
-                    "weather-engine warn: publisher lagged during shutdown; skipped {skipped} events"
-                );
+                log::warn!("publisher lagged during shutdown; skipped {skipped} events");
             }
             Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
                 return Ok(());
@@ -462,6 +559,12 @@ async fn send_publisher_event(
     topic: String,
     event: EventEnvelope,
 ) -> Result<()> {
+    log::trace!(
+        "publishing engine event topic={} kind={} payload_bytes={}",
+        topic,
+        event.kind,
+        event.payload.len()
+    );
     let mut frames = VecDeque::new();
     frames.push_back(Bytes::from(topic));
     frames.push_back(Bytes::from(event.encode_to_vec()));
@@ -507,7 +610,7 @@ async fn run_router(
                         }
                     }
                     Some(Err(err)) => {
-                        eprintln!("weather-engine warn: RPC request task panicked or was cancelled: {err}");
+                        log::error!("RPC request task panicked or was cancelled: {err}");
                     }
                     None => {}
                 }
@@ -519,9 +622,12 @@ async fn run_router(
                 };
                 let mut frames = message.into_vecdeque();
                 let Some(identity) = frames.pop_front() else {
+                    log::warn!("discarding RPC message without client identity");
                     continue;
                 };
+                let peer = peer_label(&identity);
                 let Some(payload) = frames.pop_front() else {
+                    log::warn!("rejecting RPC message peer={peer}: missing request frame");
                     if let Err(err) = send_back_error(
                         &mut socket, identity, "", RpcErrorCode::BadRequest, "missing rpc frame",
                         cancellation.clone(),
@@ -531,6 +637,11 @@ async fn run_router(
                     continue;
                 };
                 if !frames.is_empty() {
+                    log::warn!(
+                        "rejecting RPC message peer={} extra_frames={}",
+                        peer,
+                        frames.len()
+                    );
                     let request_id = decoded_request_id(&payload);
                     if let Err(err) = send_back_error(
                         &mut socket, identity, &request_id, RpcErrorCode::BadRequest,
@@ -541,6 +652,11 @@ async fn run_router(
                     continue;
                 }
                 if payload_exceeds_limit(payload.len()) {
+                    log::warn!(
+                        "rejecting oversized RPC request peer={} payload_bytes={}",
+                        peer,
+                        payload.len()
+                    );
                     let request_id = decoded_request_id(&payload);
                     if let Err(err) = send_back_error(
                         &mut socket,
@@ -560,6 +676,7 @@ async fn run_router(
                 let permit = match permits.clone().try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
+                        log::warn!("rejecting RPC request peer={peer}: concurrency limit reached");
                         let request_id = decoded_request_id(&payload);
                         if let Err(err) = send_back_error(
                             &mut socket, identity, &request_id, RpcErrorCode::Busy,
@@ -606,12 +723,25 @@ async fn process_request(
     pub_endpoint: String,
     request_timeout: Duration,
 ) -> RpcReply {
+    let started = Instant::now();
+    let peer = peer_label(&identity);
+    let payload_bytes = payload.len();
     let (response, exit) = match RpcRequest::decode(payload.as_ref()) {
         Ok(request) => {
             let kind = RpcKind::try_from(request.kind).unwrap_or(RpcKind::Unspecified);
             let request_id = request.request_id.clone();
+            let config = engine.config.get();
+            let effective_timeout = request_timeout_for(&config, kind, request_timeout);
+            log::debug!(
+                "RPC request started peer={} kind={} request_id={} payload_bytes={} timeout_ms={}",
+                peer,
+                kind.as_str_name(),
+                request_id,
+                payload_bytes,
+                effective_timeout.as_millis()
+            );
             let response = match tokio::time::timeout(
-                request_timeout,
+                effective_timeout,
                 engine.handle_rpc_request(request, &mode, &rpc_endpoint, &pub_endpoint),
             )
             .await
@@ -620,26 +750,96 @@ async fn process_request(
                 Err(_) => Engine::rpc_error_response(
                     &request_id,
                     RpcErrorCode::Timeout,
-                    format!("rpc request timed out after {request_timeout:?}"),
+                    format!("rpc request timed out after {effective_timeout:?}"),
                 ),
             };
             let exit = accepted_exit(kind, &response);
+            let status = ResponseStatus::try_from(response.status)
+                .map_or("UNKNOWN", |status| status.as_str_name());
+            if response.status == ResponseStatus::Error as i32 {
+                let code = response
+                    .error
+                    .as_ref()
+                    .map_or("unknown", |error| error.code.as_str());
+                log::warn!(
+                    "RPC request failed peer={} kind={} request_id={} status={} code={} elapsed_ms={}",
+                    peer,
+                    kind.as_str_name(),
+                    request_id,
+                    status,
+                    code,
+                    started.elapsed().as_millis()
+                );
+                if let Some(error) = response.error.as_ref() {
+                    log::debug!(
+                        "RPC error detail peer={} request_id={} message={}",
+                        peer,
+                        request_id,
+                        error.message
+                    );
+                }
+            } else {
+                log::debug!(
+                    "RPC request completed peer={} kind={} request_id={} status={} elapsed_ms={}",
+                    peer,
+                    kind.as_str_name(),
+                    request_id,
+                    status,
+                    started.elapsed().as_millis()
+                );
+            }
             (response, exit)
         }
-        Err(err) => (
-            Engine::rpc_error_response(
-                "",
-                RpcErrorCode::BadRequest,
-                format!("invalid rpc request: {err}"),
-            ),
-            None,
-        ),
+        Err(err) => {
+            log::warn!(
+                "invalid RPC request peer={} payload_bytes={} error={}",
+                peer,
+                payload_bytes,
+                err
+            );
+            (
+                Engine::rpc_error_response(
+                    "",
+                    RpcErrorCode::BadRequest,
+                    format!("invalid rpc request: {err}"),
+                ),
+                None,
+            )
+        }
     };
     RpcReply {
         identity,
         response,
         exit,
     }
+}
+
+fn request_timeout_for(
+    config: &weather_configure::AppConfig,
+    kind: RpcKind,
+    configured: Duration,
+) -> Duration {
+    let upstream_stages = match kind {
+        RpcKind::GetWeather | RpcKind::TriggerRefresh => WEATHER_UPSTREAM_STAGES,
+        RpcKind::ListProvinces => 1,
+        RpcKind::ListCities
+        | RpcKind::FuzzyMatchStations
+        | RpcKind::BatchListRegions
+        | RpcKind::ResolveStationUuid => CATALOG_UPSTREAM_STAGES,
+        _ => return configured,
+    };
+    let provider_timeout = config
+        .updater
+        .provider
+        .iter()
+        .find(|provider| provider.name == config.updater.default_provider)
+        .map(|provider| Duration::from_secs(provider.request_timeout_seconds.max(1)))
+        .unwrap_or(configured);
+    configured.max(
+        provider_timeout
+            .saturating_mul(upstream_stages)
+            .saturating_add(UPSTREAM_RPC_OVERHEAD),
+    )
 }
 
 fn payload_exceeds_limit(len: usize) -> bool {
@@ -697,7 +897,7 @@ async fn send_back_error(
 }
 
 fn log_response_send_error(err: &anyhow::Error) {
-    eprintln!("weather-engine warn: failed to send RPC response: {err:#}");
+    log::warn!("failed to send RPC response: {err:#}");
 }
 
 async fn run_signal(cancellation: Cancellation) -> Result<()> {
@@ -729,7 +929,71 @@ async fn wait_for_signal() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use tokio::sync::Semaphore;
+    use weather_configure::{AppConfig, write_config_atomic};
+    use weather_updater::{
+        ProviderCity, ProviderFuture, ProviderProvince, WeatherFetch, WeatherProvider,
+    };
+
     use super::*;
+    use crate::runtime::EngineRuntime;
+
+    struct SlowColdStartProvider {
+        weather_started: AtomicUsize,
+        weather_release: Arc<Semaphore>,
+    }
+
+    impl WeatherProvider for SlowColdStartProvider {
+        fn provider_name(&self) -> &str {
+            "cold-start-test"
+        }
+
+        fn provinces(&self) -> ProviderFuture<'_, Vec<ProviderProvince>> {
+            Box::pin(async {
+                Ok(vec![ProviderProvince {
+                    provider_code: "P1".to_string(),
+                    name: "北京市".to_string(),
+                    url: "/province".to_string(),
+                }])
+            })
+        }
+
+        fn cities<'a>(
+            &'a self,
+            provider_province_code: &'a str,
+        ) -> ProviderFuture<'a, Vec<ProviderCity>> {
+            Box::pin(async move {
+                Ok(vec![ProviderCity {
+                    provider_code: "A".to_string(),
+                    provider_province_code: provider_province_code.to_string(),
+                    province: "北京市".to_string(),
+                    city: "北京".to_string(),
+                    url: "/city".to_string(),
+                }])
+            })
+        }
+
+        fn weather<'a>(
+            &'a self,
+            _provider_station_id: &'a str,
+            _include_debug: bool,
+        ) -> ProviderFuture<'a, WeatherFetch> {
+            self.weather_started.fetch_add(1, Ordering::SeqCst);
+            let release = self.weather_release.clone();
+            Box::pin(async move {
+                release.acquire().await.unwrap().forget();
+                Ok(WeatherFetch {
+                    snapshot: WeatherSnapshot::default(),
+                    warnings: Vec::new(),
+                })
+            })
+        }
+    }
 
     #[test]
     fn only_accepted_shutdown_and_restart_responses_request_exit() {
@@ -768,6 +1032,20 @@ mod tests {
     }
 
     #[test]
+    fn peer_labels_are_stable_and_do_not_expose_identity() {
+        let identity = b"client-secret-identity";
+
+        let first = peer_label(identity);
+        let second = peer_label(identity);
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 16);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!first.contains("client"));
+        assert_ne!(first, peer_label(b"another-client"));
+    }
+
+    #[test]
     fn cleanup_timeout_is_clamped() {
         assert_eq!(
             cleanup_timeout(Duration::from_millis(1)),
@@ -783,6 +1061,96 @@ mod tests {
         );
     }
 
+    #[test]
+    fn network_backed_requests_outlive_the_short_control_rpc_timeout() {
+        let config = weather_configure::AppConfig::default();
+        let configured = Duration::from_secs(3);
+
+        assert_eq!(
+            request_timeout_for(&config, RpcKind::GetWeather, configured),
+            Duration::from_secs(122)
+        );
+        assert_eq!(
+            request_timeout_for(&config, RpcKind::ListProvinces, configured),
+            Duration::from_secs(22)
+        );
+        assert_eq!(
+            request_timeout_for(&config, RpcKind::FuzzyMatchStations, configured),
+            Duration::from_secs(162)
+        );
+        assert_eq!(
+            request_timeout_for(&config, RpcKind::Ping, configured),
+            configured
+        );
+        assert_eq!(
+            request_timeout_for(&config, RpcKind::GetResource, configured),
+            configured
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_weather_refresh_is_not_cancelled_by_the_control_rpc_timeout() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("weather.toml");
+        let mut config = AppConfig::default();
+        config.engine.request_timeout_ms = 1;
+        config.db.path = directory.path().join("weather.db").display().to_string();
+        config.updater.default_provider = "cold-start-test".to_string();
+        config.updater.provider[0].name = "cold-start-test".to_string();
+        config.updater.provider[0].request_timeout_seconds = 1;
+        write_config_atomic(&config_path, &config).unwrap();
+
+        let release = Arc::new(Semaphore::new(0));
+        let provider = Arc::new(SlowColdStartProvider {
+            weather_started: AtomicUsize::new(0),
+            weather_release: release.clone(),
+        });
+        let runtime = EngineRuntime::start_with_provider(config_path, provider.clone())
+            .await
+            .unwrap();
+        let engine = runtime.test_engine();
+        let request = RpcRequest {
+            schema_version: SCHEMA_VERSION.to_string(),
+            request_id: "cold-start-weather".to_string(),
+            kind: RpcKind::GetWeather as i32,
+            timestamp_unix_ms: 0,
+            hmac_sha256: Vec::new(),
+            payload: GetWeatherRequest {
+                unified_uuid: unified_station_uuid("北京-北京市"),
+                refresh: true,
+                include_debug: false,
+            }
+            .encode_to_vec(),
+        };
+        let task = tokio::spawn(process_request(
+            engine.clone(),
+            Bytes::from_static(b"cold-start-client"),
+            Bytes::from(request.encode_to_vec()),
+            "test".to_string(),
+            "tcp://127.0.0.1:1".to_string(),
+            "tcp://127.0.0.1:2".to_string(),
+            Duration::from_millis(1),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while provider.weather_started.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cold weather request did not reach the provider");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!task.is_finished(), "request used the 1ms control timeout");
+
+        release.add_permits(1);
+        let reply = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("cold weather request did not finish")
+            .unwrap();
+        assert_eq!(reply.response.status, ResponseStatus::Ok as i32);
+        engine.db.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn dynamic_endpoints_are_reported_and_can_be_rebound_after_close() {
         let sockets = bind_engine_sockets("tcp://127.0.0.1:0", "tcp://127.0.0.1:0")
@@ -793,6 +1161,7 @@ mod tests {
             router,
             rpc_endpoint,
             pub_endpoint,
+            ..
         } = sockets;
 
         assert_ne!(endpoint_port(&rpc_endpoint), 0);

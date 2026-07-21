@@ -1,0 +1,24 @@
+{
+  "name": "weather-gui",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "bun@1.3.14",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420",
+    "test": "bun test",
+    "build": "tsc --noEmit && vite build",
+    "standalone:debug": "tauri build --debug --no-bundle --features desktop",
+    "bundle": "tauri build --features desktop",
+    "preview": "vite preview",
+    "tauri": "bun scripts/tauri.mjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.8.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.0",
+    "typescript": "^5.9.0",
+    "vite": "^7.1.0"
+  }
+}

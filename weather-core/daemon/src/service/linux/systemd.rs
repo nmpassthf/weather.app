@@ -120,6 +120,21 @@ fn install_unit(
     };
     fs::create_dir_all(&unit_dir)?;
     let unit_path = unit_dir.join(format!("{}.service", service_name()));
+    let unit = render_unit(layout, bin_exe);
+    fs::write(&unit_path, unit)?;
+    println!("installed unit: {}", unit_path.display());
+    println!("config: {}", layout.config_path.display());
+    println!("base:   {}", layout.base.display());
+    let bin_dir = bin_exe
+        .parent()
+        .context("installed binary has no parent directory")?;
+    for line in install_next_step_lines(layout.system, bin_dir, output_mode) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn render_unit(layout: &ServiceLayout, bin_exe: &Path) -> String {
     let escaped_exe = shell_escape(&bin_exe.display().to_string());
     let escaped_config = shell_escape(&layout.config_path.display().to_string());
     let wanted_by = if layout.system {
@@ -132,14 +147,14 @@ fn install_unit(
     } else {
         ""
     };
-    let unit = format!(
+    format!(
         r#"[Unit]
 Description=Weather Engine Daemon
 After=network-online.target
 
 [Service]
 Type=simple
-ExecStart={exe} run --config {config}
+ExecStart={exe} daemon run --config {config}
 Restart=on-failure
 RestartSec=2s{user_section}
 
@@ -150,18 +165,7 @@ WantedBy={wanted_by}
         config = escaped_config,
         user_section = user_section,
         wanted_by = wanted_by,
-    );
-    fs::write(&unit_path, unit)?;
-    println!("installed unit: {}", unit_path.display());
-    println!("config: {}", layout.config_path.display());
-    println!("base:   {}", layout.base.display());
-    let bin_dir = bin_exe
-        .parent()
-        .context("installed binary has no parent directory")?;
-    for line in install_next_step_lines(layout.system, bin_dir, output_mode) {
-        println!("{line}");
-    }
-    Ok(())
+    )
 }
 
 fn install_next_step_lines(
@@ -408,6 +412,23 @@ fn shell_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_unit_uses_the_multicall_daemon_subcommand() {
+        let layout = ServiceLayout::resolve(
+            false,
+            Some(PathBuf::from("/tmp/weather")),
+            Some(PathBuf::from("/tmp/weather/config/weather.toml")),
+        )
+        .unwrap();
+
+        let unit = render_unit(&layout, Path::new("/tmp/weather/bin/weather.app"));
+
+        assert!(unit.contains("weather.app"));
+        assert!(unit.contains(" daemon run --config "));
+        assert!(unit.contains("weather.toml"));
+        assert_eq!(service_name(), "weather-daemon");
+    }
     use std::{
         path::Path,
         time::{SystemTime, UNIX_EPOCH},

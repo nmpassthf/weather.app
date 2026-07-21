@@ -32,6 +32,7 @@ mod tests {
                 request_timeout_ms: 3_000,
                 startup_timeout_ms: 8_000,
                 lock_path: "engine.lock".to_string(),
+                log_level: "info".to_string(),
             }),
             ipc: Some(IpcConfig {
                 transport: "tcp".to_string(),
@@ -149,6 +150,8 @@ mod tests {
             (RpcKind::MigrateDbTimezone, 17),
             (RpcKind::GetConfig, 18),
             (RpcKind::UpdateConfig, 19),
+            (RpcKind::GetResource, 20),
+            (RpcKind::GetTemperatureHistory, 21),
             (RpcKind::TriggerRefresh, 30),
             (RpcKind::RestartEngine, 40),
             (RpcKind::Shutdown, 41),
@@ -157,6 +160,20 @@ mod tests {
         for (kind, number) in expected {
             assert_eq!(kind as i32, number, "wire number changed for {kind:?}");
             assert_eq!(RpcKind::try_from(number), Ok(kind));
+        }
+    }
+
+    #[test]
+    fn resource_transfer_state_numbers_are_frozen() {
+        let expected = [
+            (ResourceTransferState::Unspecified, 0),
+            (ResourceTransferState::Ready, 1),
+            (ResourceTransferState::Pending, 2),
+        ];
+
+        for (state, number) in expected {
+            assert_eq!(state as i32, number, "wire number changed for {state:?}");
+            assert_eq!(ResourceTransferState::try_from(number), Ok(state));
         }
     }
 }

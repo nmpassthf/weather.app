@@ -102,7 +102,7 @@ pub(crate) async fn run_refresh_loop(
                         Ok((id, ())) => id,
                         Err(err) => {
                             let id = err.id();
-                            eprintln!("weather-engine warn: refresh task failed: {err}");
+                            log::warn!("refresh task failed: {err}");
                             id
                         }
                     };
@@ -122,13 +122,18 @@ pub(crate) async fn run_refresh_loop(
 
 fn enabled_stations(config: &AppConfig) -> Vec<String> {
     let mut seen = HashSet::new();
-    config
-        .stations
-        .iter()
-        .filter(|station| station.enabled)
-        .filter(|station| seen.insert(station.name.clone()))
-        .map(|station| station.name.clone())
-        .collect()
+    let mut stations = Vec::new();
+    for station in config.stations.iter().filter(|station| station.enabled) {
+        if let Some(parent) = weather_schema::parent_station_name(&station.name)
+            && seen.insert(parent.clone())
+        {
+            stations.push(parent);
+        }
+        if seen.insert(station.name.clone()) {
+            stations.push(station.name.clone());
+        }
+    }
+    stations
 }
 
 fn weather_ttl(config: &AppConfig) -> Duration {
@@ -272,13 +277,24 @@ fn stagger(index: usize) -> Duration {
 }
 
 async fn refresh_one(engine: &Engine, name: &str) {
+    log::debug!("scheduled weather refresh resolving station={name}");
+    let station = match engine.station_by_name(name).await {
+        Ok(station) => station,
+        Err(error) => {
+            log::warn!("scheduled weather refresh could not resolve station={name}: {error:#}");
+            return;
+        }
+    };
     let req = GetWeatherRequest {
-        unified_uuid: weather_schema::unified_station_uuid(name),
+        unified_uuid: station.unified_uuid,
         refresh: true,
         include_debug: false,
     };
-    if let Ok(snapshot) = engine.get_weather_internal(req).await {
-        engine.publish_snapshot(&snapshot);
+    match engine.get_weather_internal(req).await {
+        Ok(snapshot) => engine.publish_snapshot(&snapshot),
+        Err(error) => {
+            log::warn!("scheduled weather refresh failed station={name}: {error:#}");
+        }
     }
 }
 
@@ -313,6 +329,37 @@ mod tests {
         };
 
         assert_eq!(enabled_stations(&config), vec!["A", "C"]);
+    }
+
+    #[test]
+    fn tracked_districts_schedule_their_parent_before_the_child() {
+        let config = AppConfig {
+            stations: vec![
+                StationConfig {
+                    name: "北京-北京市-朝阳".to_string(),
+                    enabled: true,
+                },
+                StationConfig {
+                    name: "北京-北京市".to_string(),
+                    enabled: true,
+                },
+                StationConfig {
+                    name: "海南-海南省-三亚".to_string(),
+                    enabled: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            enabled_stations(&config),
+            [
+                "北京-北京市",
+                "北京-北京市-朝阳",
+                "海南-海南省",
+                "海南-海南省-三亚",
+            ]
+        );
     }
 
     #[test]

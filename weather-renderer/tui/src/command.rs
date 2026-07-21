@@ -409,6 +409,7 @@ mod tests {
                 request_timeout_ms: 111,
                 startup_timeout_ms: 222,
                 lock_path: "custom-engine.lock".to_string(),
+                log_level: "debug".to_string(),
             }),
             ipc: Some(IpcConfig {
                 transport: "tcp".to_string(),

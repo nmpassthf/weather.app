@@ -42,6 +42,9 @@ pub(crate) fn default_startup_timeout_ms() -> u64 {
 pub(crate) fn default_engine_lock_path() -> String {
     "engine.lock".to_string()
 }
+pub fn default_log_level() -> String {
+    "info".to_string()
+}
 pub(crate) fn default_rpc_endpoint() -> String {
     DEFAULT_ZMQ_RPC_ENDPOINT.to_string()
 }
@@ -62,7 +65,7 @@ pub(crate) fn default_db_timezone() -> String {
     "Asia/Shanghai".to_string()
 }
 pub(crate) fn default_weather_ttl_seconds() -> u64 {
-    900
+    600
 }
 pub(crate) fn default_province_ttl_seconds() -> u64 {
     86400
@@ -117,8 +120,15 @@ mod tests {
     fn empty_provider_network_is_omitted_from_default_toml() {
         let content = default_config_toml();
 
+        assert!(content.contains("[engine]"), "{content}");
+        assert!(content.contains("log_level = \"info\""), "{content}");
         assert!(content.contains("[updater.network]"), "{content}");
         assert!(content.contains("allow_insecure = false"), "{content}");
         assert!(!content.contains("[updater.provider.network]"), "{content}");
+    }
+
+    #[test]
+    fn default_weather_refresh_interval_is_ten_minutes() {
+        assert_eq!(AppConfig::default().updater.weather_ttl_seconds, 10 * 60);
     }
 }

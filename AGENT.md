@@ -2,10 +2,7 @@
 
 ## Repository Overview
 
-This is a Rust 2024 workspace organized around three top-level layers: protocol, core backend, and frontend renderers. The root `Cargo.toml` manages all crates. The current main binaries are:
-
-- `weather-tui`: the current user-facing CLI/TUI frontend implementation.
-- `weather-daemon`: the local engine daemon and foreground supervisor.
+This is a Rust 2024 workspace organized around three top-level layers: protocol, core backend, and frontend renderers. The root `Cargo.toml` manages all crates. The single public binary is `weather.app` (the internal Cargo target is `weather-app`). It dispatches daemon, TUI, and GUI modes by subcommand, launch environment, or BusyBox-style `argv[0]` aliases.
 
 `Makefile` is mainly for static release builds. `scripts/` contains NMC upstream inspection scripts. `todo/` and `docs/superpowers/` are historical design and planning material; current code structure takes priority.
 
@@ -41,17 +38,17 @@ Process and service management layer. Daemon provides `run`, `probe`, and `servi
 
 ### `weather-renderer`
 
-Public frontend family, not a synonym for TUI. `weather-renderer/tui` is only the current implementation; its crate and binary name is `weather-tui`. Future GUI, Web, or CUI variants should also live under the renderer family and work through schema/engine interfaces.
+Public frontend family, not a synonym for TUI. `weather-renderer/common` owns the engine client, pagination, and daemon supervision shared by renderers. `weather-renderer/tui` is a library used by the optional `tui` application feature. `weather-renderer/gui/src-tauri` owns the `weather-app` package and optional Tauri `gui` feature. Both work through schema/engine interfaces.
 
 ## Runtime Relationship
 
 The default runtime path is:
 
 ```text
-weather-renderer/* -> weather-daemon probe -> weather-engine(ZMQ RPC/PUB)
+weather.app GUI/TUI -> weather.app daemon probe -> weather-engine(ZMQ RPC/PUB)
 ```
 
-If `probe` finds an existing engine, renderer uses the returned endpoint. If no engine is running, the current TUI implementation may start `weather-daemon run --foreground` as a child process, then call engine over ZMQ. Daemon mode and foreground mode only change lifecycle ownership; they must not change engine business semantics.
+If `probe` finds an existing engine, renderer uses the returned endpoint. If no engine is running and the `daemon` feature is compiled, a renderer starts the same executable as `weather.app daemon run --foreground`, then calls engine over ZMQ. Daemon mode and foreground mode only change lifecycle ownership; they must not change engine business semantics.
 
 IPC uses ZMQ by default, with protobuf payloads from `weather-schema`. JSON output should also come from engine/schema structures, not directly from upstream NMC raw JSON.
 

@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use chrono_tz::Tz;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use weather_schema::{
@@ -15,7 +15,7 @@ use weather_schema::{
 use crate::{
     actor::{
         CatalogCache, ProviderCity, ProviderCityScopeCache, ProviderProvince, ProviderStation,
-        StoredSnapshot,
+        StoredSnapshot, StoredSnapshotPage,
     },
     migration,
     validation::{validate_provider_city_catalog, validate_provider_province_catalog},
@@ -29,6 +29,27 @@ const CATALOG_CITIES: &str = "cities";
 const PROVINCE_SCOPE: &str = "";
 const DB_TIMEZONE_KEY: &str = "db_timezone";
 const TIMEZONE_SYNC_PENDING_KEY: &str = "timezone_config_sync_pending";
+
+fn decode_stored_snapshot(
+    uuid: &str,
+    date: String,
+    schema_version: String,
+    bytes: Vec<u8>,
+    fetched_at_unix_ms: i64,
+) -> Result<StoredSnapshot> {
+    if schema_version != SCHEMA_VERSION {
+        bail!(
+            "snapshot cache row {uuid}/{date} uses unsupported schema `{schema_version}`; expected `{SCHEMA_VERSION}`"
+        );
+    }
+    let snapshot = decode_message(&bytes)
+        .with_context(|| format!("failed to decode snapshot cache row {uuid}/{date}"))?;
+    Ok(StoredSnapshot {
+        date,
+        snapshot,
+        fetched_at_unix_ms,
+    })
+}
 
 pub(crate) struct DbInstance {
     conn: Connection,
@@ -162,17 +183,57 @@ impl DbInstance {
         let Some((date, schema_version, bytes, fetched_at_unix_ms)) = row else {
             return Ok(None);
         };
-        if schema_version != SCHEMA_VERSION {
-            bail!(
-                "snapshot cache row {uuid}/{date} uses unsupported schema `{schema_version}`; expected `{SCHEMA_VERSION}`"
-            );
+        decode_stored_snapshot(uuid, date, schema_version, bytes, fetched_at_unix_ms).map(Some)
+    }
+
+    pub(crate) fn get_history_snapshot_page(
+        &self,
+        uuid: &str,
+        before_date: Option<&str>,
+        page_size: usize,
+    ) -> Result<StoredSnapshotPage> {
+        if page_size == 0 {
+            return Ok(StoredSnapshotPage {
+                snapshots: Vec::new(),
+                has_more: false,
+            });
         }
-        let snapshot = decode_message(&bytes)
-            .with_context(|| format!("failed to decode snapshot cache row {uuid}/{date}"))?;
-        Ok(Some(StoredSnapshot {
-            snapshot,
-            fetched_at_unix_ms,
-        }))
+        if let Some(before_date) = before_date {
+            NaiveDate::parse_from_str(before_date, "%Y-%m-%d")
+                .with_context(|| format!("invalid history cursor `{before_date}`"))?;
+        }
+        let fetch_limit = page_size.saturating_add(1);
+        let fetch_limit = i64::try_from(fetch_limit).context("history page size overflow")?;
+        let mut stmt = self.conn.prepare(
+            r#"SELECT date, snapshot_schema_version, snapshot_proto, fetched_at_unix_ms
+               FROM weather_snapshots_history
+               WHERE unified_uuid = ?1 AND (?2 IS NULL OR date < ?2)
+               ORDER BY date DESC
+               LIMIT ?3"#,
+        )?;
+        let mut rows = stmt
+            .query_map(params![uuid, before_date, fetch_limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let has_more = rows.len() > page_size;
+        rows.truncate(page_size);
+        rows.reverse();
+        let snapshots = rows
+            .into_iter()
+            .map(|(date, schema_version, bytes, fetched_at_unix_ms)| {
+                decode_stored_snapshot(uuid, date, schema_version, bytes, fetched_at_unix_ms)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(StoredSnapshotPage {
+            snapshots,
+            has_more,
+        })
     }
 
     pub(crate) fn replace_provider_provinces(
@@ -1108,6 +1169,51 @@ mod tests {
         wrong.station.as_mut().unwrap().unified_uuid = "not-canonical".to_string();
         assert!(db.put_history_snapshot(&wrong, fetched_at).is_err());
         assert!(db.put_history_snapshot(&wrong, i64::MAX).is_err());
+    }
+
+    #[test]
+    fn history_snapshot_pages_are_recent_first_but_returned_in_chronological_order() {
+        let mut db = temp_db_with_timezone("Asia/Shanghai");
+        let snapshot = sample_snapshot("北京-北京市-朝阳");
+        let uuid = snapshot.station.as_ref().unwrap().unified_uuid.clone();
+        let older = DateTime::parse_from_rfc3339("2026-06-20T16:30:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let first = DateTime::parse_from_rfc3339("2026-06-21T16:30:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let second = DateTime::parse_from_rfc3339("2026-06-23T03:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let newest = DateTime::parse_from_rfc3339("2026-06-23T16:30:00Z")
+            .unwrap()
+            .timestamp_millis();
+
+        db.put_history_snapshot(&snapshot, older).unwrap();
+        db.put_history_snapshot(&snapshot, second).unwrap();
+        db.put_history_snapshot(&snapshot, first).unwrap();
+
+        let first_page = db.get_history_snapshot_page(&uuid, None, 2).unwrap();
+        assert!(first_page.has_more);
+        assert_eq!(first_page.snapshots.len(), 2);
+        assert_eq!(first_page.snapshots[0].date, "2026-06-22");
+        assert_eq!(first_page.snapshots[1].date, "2026-06-23");
+
+        // A new day arriving between page requests must not shift the cursor
+        // and cause an older page to duplicate or skip an existing row.
+        db.put_history_snapshot(&snapshot, newest).unwrap();
+
+        let second_page = db
+            .get_history_snapshot_page(&uuid, Some("2026-06-22"), 2)
+            .unwrap();
+        assert!(!second_page.has_more);
+        assert_eq!(second_page.snapshots.len(), 1);
+        assert_eq!(second_page.snapshots[0].date, "2026-06-21");
+        assert_eq!(second_page.snapshots[0].fetched_at_unix_ms, older);
+        assert!(
+            db.get_history_snapshot_page(&uuid, Some("06-21-2026"), 2)
+                .is_err()
+        );
     }
 
     #[test]

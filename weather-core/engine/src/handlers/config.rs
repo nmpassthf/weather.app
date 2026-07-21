@@ -106,16 +106,27 @@ where
 {
     let _commit = commit_lock.lock().await;
     let current = state.get();
+    log::debug!("configuration update started path={}", path.display());
 
-    normalize_config_stations(&mut candidate);
-    validate(&candidate).map_err(|err| ConfigCommitError::Invalid(err.to_string()))?;
+    if normalize_config_stations(&mut candidate) {
+        log::debug!("configuration station names were normalized");
+    }
+    validate(&candidate).map_err(|err| {
+        log::warn!("configuration update rejected as invalid: {err:#}");
+        ConfigCommitError::Invalid(err.to_string())
+    })?;
 
     let restart_fields = restart_required_fields(&current, &candidate);
     if !restart_fields.is_empty() {
+        log::info!(
+            "configuration update requires engine restart fields={}",
+            restart_fields.join(",")
+        );
         return Err(ConfigCommitError::RestartRequired(restart_fields));
     }
 
     if candidate == current {
+        log::debug!("configuration update skipped because candidate is unchanged");
         return Ok(current);
     }
 
@@ -124,8 +135,18 @@ where
     let prepared =
         match tokio::task::spawn_blocking(move || prepare(prepare_path, prepare_candidate)).await {
             Ok(Ok(prepared)) => prepared,
-            Ok(Err(err)) => return Err(persistence_error(state, format!("{err:#}"))),
+            Ok(Err(err)) => {
+                log::error!(
+                    "configuration update prepare failed path={}: {err:#}",
+                    path.display()
+                );
+                return Err(persistence_error(state, format!("{err:#}")));
+            }
             Err(err) => {
+                log::error!(
+                    "configuration update prepare task failed path={}: {err}",
+                    path.display()
+                );
                 return Err(persistence_error(
                     state,
                     format!("config prepare task failed: {err}"),
@@ -136,9 +157,14 @@ where
     // There is deliberately no cancellation point between replacing the file
     // and publishing the matching authoritative live value.
     if let Err(err) = prepared.persist() {
+        log::error!(
+            "configuration update persistence failed path={}: {err:#}",
+            path.display()
+        );
         return Err(persistence_error(state, format!("{err:#}")));
     }
     state.apply(candidate.clone());
+    log::info!("configuration update committed path={}", path.display());
     Ok(candidate)
 }
 

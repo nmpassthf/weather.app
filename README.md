@@ -1,232 +1,150 @@
 # Weather App
 
-A layered Rust weather client and local weather service. The current frontend is
-`weather-tui`, backed by a local `weather-engine` managed by `weather-daemon`.
-Weather data is fetched from the NMC provider, cached locally, and exposed to
-frontends through the shared `weather-schema` protocol.
+Weather App is a cross-platform weather client written in Rust. It ships as
+one BusyBox-style `weather.app` executable with optional daemon, terminal, and
+desktop interfaces.
 
-TUI screenshots:
+Weather data comes from the NMC provider and is served through a local engine.
+The GUI and TUI share the same configuration, cache, and engine protocol.
 
-*Main screen*
+![TUI screenshot](https://raw.githubusercontent.com/nmpassthf/weather.app/refs/heads/master/docs/README/main.png)
 
-![main screenshot](https://raw.githubusercontent.com/nmpassthf/weather.app/refs/heads/master/docs/README/main.png)
+## Features
 
-*Search menu*
+- One executable for GUI, TUI, and daemon modes.
+- Desktop GUI for Linux, Windows 10, and macOS.
+- Interactive TUI and one-shot text or JSON output.
+- Station search, management, forecasts, alerts, and temperature history.
+- Local caching, background refresh, proxy support, and stale-data fallback.
+- systemd user or system service installation on Linux.
 
-![search screenshot](https://raw.githubusercontent.com/nmpassthf/weather.app/refs/heads/master/docs/README/search.png)
-
-## Usage
-
-Build the binaries first, then run the TUI:
-
-```sh
-cargo build --workspace --bins
-./target/debug/weather-tui
-```
-
-Common commands:
+The executable selects its interface from the launch environment:
 
 ```sh
-# One-shot weather output
-weather-tui once
-
-# JSON output
-weather-tui --format json once
-
-# Force a fresh weather fetch
-weather-tui once --refresh
-
-# Search for a station
-weather-tui stations search "北京"
-
-# Add or update the configured station through engine APIs
-weather-tui stations list
-weather-tui stations add "北京-北京市"
-
-# Show engine status or stop the active engine
-weather-tui engine status
-weather-tui engine stop
+weather.app                  # TUI in a terminal; GUI on desktop launch
+weather.app gui              # Explicit GUI
+weather.app tui              # Explicit TUI
+weather.app tui once         # One-shot weather output
+weather.app tui --format json once
+weather.app daemon status    # Control the local engine
 ```
 
-Use `-c/--config <path>` to select a config file. By default, the app uses
-`~/.weather/config/weather.toml`. Frontends should request and submit structured
-config changes through the engine; they should not edit the TOML file directly
-during normal operation.
+Renaming or symlinking the executable to `weather-daemon`, `weather-tui`, or
+`weather-gui` selects that mode directly.
 
-Useful config commands:
-
-```sh
-weather-tui config defaults
-weather-tui config show
-weather-tui engine restart
-```
-
-Network defaults live under `updater.network`. Missing proxy fields inherit the
-matching process `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`
-variables; an explicitly empty string clears the inherited value.
-HTTP(S), SOCKS4/4A, and SOCKS5/5H proxy URLs are supported.
-
-```toml
-[updater.network]
-http_proxy = "http://127.0.0.1:8123"
-https_proxy = "http://127.0.0.1:8123"
-no_proxy = "localhost,127.0.0.1"
-all_proxy = ""
-allow_insecure = false
-
-[[updater.provider]]
-name = "nmc"
-base_url = "https://www.nmc.cn"
-request_timeout_seconds = 20
-
-# Optional per-provider, field-by-field overrides.
-[updater.provider.network]
-https_proxy = "http://nmc-proxy.example:8123"
-no_proxy = "localhost,127.0.0.1,.internal.example"
-```
-
-Omitted provider network fields inherit `updater.network`; an explicitly empty
-provider value clears that global value. `allow_insecure = true` disables TLS
-certificate validation and should only be used for a trusted intercepting
-proxy. Changing global or provider network settings requires an engine restart.
-
-## Service Installation
-
-Service management currently supports systemd on Linux only. The `windows`
-backend name is retained so unsupported SCM operations fail with a clear error;
-`weather-daemon` does not yet implement a Windows SCM service dispatcher.
-
-Install the daemon as a user service:
-
-```sh
-weather-daemon service install systemd
-```
-
-This installs files under `~/.weather/` by default, including:
-
-- `~/.weather/bin/`
-- `~/.weather/config/weather.toml`
-
-Install as a system service:
-
-```sh
-sudo weather-daemon service install systemd --system
-```
-
-System mode uses `/opt/weather` by default. You can override paths:
-
-```sh
-weather-daemon service install systemd --path /custom/weather --config /custom/weather/weather.toml
-```
-
-Reinstall or remove the service:
-
-```sh
-weather-daemon service reinstall systemd
-weather-daemon service remove systemd
-weather-daemon service remove systemd --all
-```
-
-Pass the same scope and path overrides when removing a custom installation:
-
-```sh
-weather-daemon service remove systemd --system --path /custom/weather \
-  --config /custom/weather/weather.toml --all
-```
-
-Use `--no-modification-service` when you want the installer to write files and
-print next steps without starting or modifying the systemd service state. This
-flag does not enable the unsupported Windows SCM backend; Windows service
-commands fail before writing installation files.
+Configuration defaults to `~/.weather/config/weather.toml`. Use
+`-c/--config <path>` to select another file.
 
 ## Build
 
-Debug build:
+Requirements:
+
+- Stable Rust toolchain.
+- Bun 1.3.14 for GUI development and packaging.
+- Native Tauri dependencies for the target platform.
+
+Ubuntu 22.04 is the minimum supported Linux build target. See the
+[GUI development notes](weather-renderer/gui/README.md) for platform packages
+and bundle prerequisites.
+
+The application features are:
+
+| Feature | Contents |
+| --- | --- |
+| `daemon` | Local engine and daemon commands; enabled by default |
+| `tui` | Terminal interface |
+| `gui` | Tauri desktop interface |
+| `desktop` | `daemon`, `tui`, and `gui` |
+
+Build a daemon-only binary:
 
 ```sh
-cargo build --workspace --bins
+cargo build -p weather-app
 ```
 
-Static release build:
+Build the terminal application with its embedded daemon:
 
 ```sh
-make release-static
+cargo build -p weather-app --features tui
 ```
 
-Release artifacts are copied to:
+Build a standalone desktop debug executable with embedded frontend assets:
+
+```sh
+cd weather-renderer/gui
+bun install --frozen-lockfile
+bun run standalone:debug
+```
+
+Cargo uses the target name `weather-app`; Make and Tauri publish it as
+`weather.app` (or `weather.app.exe` on Windows).
+
+Build optimized single-binary variants with Make:
+
+```sh
+make             # Native daemon + TUI + GUI (default)
+make gui         # Native daemon + GUI
+make tui         # Native daemon + TUI
+make musl-tui    # Static x86_64 musl daemon + TUI
+```
+
+Artifacts and checksums are written to
+`target/release-artifacts/<target-triple>/<variant>/`. The musl build requires
+the `x86_64-unknown-linux-musl` Rust target and a compatible musl C compiler;
+override `MUSL_TARGET` and `MUSL_CC` for another toolchain.
+
+Build a native desktop bundle:
+
+```sh
+cd weather-renderer/gui
+bun install --frozen-lockfile
+bun run bundle
+```
+
+After CI succeeds on `master`, GitHub Actions produces Linux, Windows, and
+macOS bundles in the `weather-desktop-latest` artifact. Only the newest
+complete successful bundle set is retained.
+
+## Development
+
+The main workspace areas are:
 
 ```text
-target/release-artifacts/<target-triple>/
+weather-core/          engine, daemon, storage, provider, and configuration
+weather-renderer/tui/  terminal interface
+weather-renderer/gui/  Tauri and web frontend
+weather-schema/        shared engine protocol
 ```
 
-Cargo's original artifacts remain under
-`target/<target-triple>/release-lto-static/`. Packaging verifies that each copy
-matches its source, writes `SHA256SUMS`, and rejects dynamically linked Linux
-binaries.
+Run the GUI with Vite hot reload:
 
-Recommended checks after code changes:
+```sh
+cd weather-renderer/gui
+bun install --frozen-lockfile
+bun run tauri dev
+```
+
+`bun run tauri dev` automatically compiles the `desktop` feature set and
+launches GUI mode.
+
+Run the project checks before submitting changes:
 
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
+cargo test --workspace --all-features
+
+cd weather-renderer/gui
+bun test
+bun run build
 ```
 
-## Updates
-
-Refresh weather data manually:
+Install the daemon as a Linux user service when needed:
 
 ```sh
-weather-tui once --refresh
+weather.app daemon service install systemd
 ```
 
-Update configured stations through the frontend commands:
+## License
 
-```sh
-weather-tui stations search "<query>"
-weather-tui stations add "<station>"
-weather-tui stations remove "<selector>"
-weather-tui stations enable "<selector>"
-weather-tui stations disable "<selector>"
-```
-
-Update installed binaries by rebuilding and reinstalling the service:
-
-```sh
-make release-static
-target/release-artifacts/<target-triple>/weather-daemon service reinstall systemd
-```
-
-## NMC Diagnostic Scripts
-
-The executable scripts in `scripts/` make live NMC requests for upstream API
-inspection and troubleshooting. Their arguments and defaults are:
-
-| Script | Arguments | Defaults | Additional dependencies |
-| --- | --- | --- | --- |
-| `list_provinces.sh` | none | none | none |
-| `list_cities.sh` | `[province_code]` | `ABJ` | none |
-| `fetch_weather.sh` | `[station_id]` | `MjXfi` | none |
-| `inspect_nmc_capabilities.sh` | `[station_id] [province_code]` | `Wqsps ABJ` | Python 3, `sed`, `mktemp`, `rm` |
-| `explore_nmc_api.sh` | `[forecast_page_url] [station_id]` | `<base-url>/publish/forecast/ABJ/chaoyang.html MjXfi` | `sed`, `mktemp`, `rm` |
-
-All five scripts require a POSIX-compatible `sh` and `curl`. Run them directly,
-for example:
-
-```sh
-./scripts/list_provinces.sh
-./scripts/list_cities.sh ABJ
-./scripts/fetch_weather.sh MjXfi
-./scripts/inspect_nmc_capabilities.sh Wqsps ABJ
-./scripts/explore_nmc_api.sh \
-  https://www.nmc.cn/publish/forecast/ABJ/chaoyang.html MjXfi
-```
-
-`NMC_BASE_URL` selects the upstream origin and defaults to
-`https://www.nmc.cn`. Supply an origin without a trailing slash. It also
-controls the default forecast page used by `explore_nmc_api.sh`; an explicit
-first argument overrides that page URL.
-
-```sh
-NMC_BASE_URL=http://127.0.0.1:8080 ./scripts/fetch_weather.sh MjXfi
-```
+WTFPL.

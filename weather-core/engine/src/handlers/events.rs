@@ -91,13 +91,27 @@ impl Engine {
         message: Option<String>,
     ) {
         if let Some(line) = fetch_log_output_line(unified_uuid, endpoint, ok, message.as_deref()) {
-            println!("{line}");
+            if ok {
+                log::warn!("{line}");
+            } else {
+                log::error!("{line}");
+            }
+        } else {
+            log::debug!(
+                "upstream fetch completed endpoint={} station={}",
+                endpoint,
+                unified_uuid.unwrap_or("-")
+            );
         }
         let payload = fetch_log_event(unified_uuid, endpoint, ok, message).encode_to_vec();
         self.publish_event(TOPIC_ENGINE_LOG, EventKind::FetchLog, payload);
     }
 
     pub(crate) fn publish_refresh_started(&self, unified_uuid: Option<&str>) {
+        log::debug!(
+            "weather refresh started station={}",
+            unified_uuid.unwrap_or("-")
+        );
         self.publish_refresh(
             unified_uuid,
             RefreshPhase::Started,
@@ -114,6 +128,21 @@ impl Engine {
         unified_uuid: Option<&str>,
         outcome: RefreshTerminal,
     ) {
+        match &outcome {
+            RefreshTerminal::Success => log::info!(
+                "weather refresh completed station={} outcome=success",
+                unified_uuid.unwrap_or("-")
+            ),
+            RefreshTerminal::Stale => log::warn!(
+                "weather refresh completed station={} outcome=stale",
+                unified_uuid.unwrap_or("-")
+            ),
+            RefreshTerminal::Failure(message) => log::error!(
+                "weather refresh completed station={} outcome=failure message={}",
+                unified_uuid.unwrap_or("-"),
+                message
+            ),
+        }
         let (outcome, message) = outcome.into_diagnostics();
         self.publish_refresh(
             unified_uuid,
@@ -187,7 +216,6 @@ fn fetch_log_output_line(
     if ok && message.is_none() {
         return None;
     }
-    let level = if ok { "warn" } else { "error" };
     let station = unified_uuid
         .filter(|value| !value.is_empty())
         .map(|value| format!(" station={value}"))
@@ -197,7 +225,7 @@ fn fetch_log_output_line(
         .map(|value| format!(" message={value}"))
         .unwrap_or_default();
     Some(format!(
-        "weather-engine {level}: endpoint={endpoint}{station}{message}"
+        "upstream fetch endpoint={endpoint}{station}{message}"
     ))
 }
 
@@ -220,7 +248,7 @@ mod tests {
         )
         .expect("failure should produce output");
 
-        assert!(line.contains("weather-engine error"));
+        assert!(line.contains("upstream fetch"));
         assert!(line.contains("endpoint=rest/weather"));
         assert!(line.contains("station=uuid-1"));
         assert!(line.contains("failed to decode NMC weather response"));
@@ -231,7 +259,7 @@ mod tests {
         let line = fetch_log_output_line(None, "rest/weather", true, Some("using stale data"))
             .expect("message should produce output");
 
-        assert!(line.contains("weather-engine warn"));
+        assert!(line.contains("upstream fetch"));
         assert!(line.contains("endpoint=rest/weather"));
         assert!(line.contains("using stale data"));
     }

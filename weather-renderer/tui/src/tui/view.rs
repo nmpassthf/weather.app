@@ -73,7 +73,7 @@ fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &mut TuiApp, weather: Optio
         .split(area);
     draw_stations(frame, columns[0], app);
 
-    let has_alert = weather.and_then(|view| view.alert.as_ref()).is_some();
+    let has_alert = weather.is_some_and(|view| !view.alerts.is_empty());
     let right = right_panel_layout(columns[1], has_alert);
     draw_current(
         frame,
@@ -92,7 +92,9 @@ fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &mut TuiApp, weather: Optio
         draw_alert(
             frame,
             right[2],
-            weather.and_then(|view| view.alert.as_ref()),
+            weather
+                .map(|view| view.alerts.as_slice())
+                .unwrap_or_default(),
             app.focus,
             app.alert_scroll,
         );
@@ -290,14 +292,20 @@ fn draw_forecast(
 fn draw_alert(
     frame: &mut Frame<'_>,
     area: Rect,
-    alert: Option<&AlertView>,
+    alerts: &[AlertView],
     focus: PanelFocus,
     alert_scroll: usize,
 ) {
-    let lines = alert
-        .map(|alert| alert.lines.clone())
-        .unwrap_or_else(|| vec!["No active alert. Reserved for warning details.".to_string()])
-        .into_iter()
+    let lines = alerts
+        .iter()
+        .enumerate()
+        .flat_map(|(index, alert)| {
+            let mut lines = alert.lines.clone();
+            if index > 0 {
+                lines.insert(0, String::new());
+            }
+            lines
+        })
         .map(Line::from)
         .collect::<Vec<_>>();
     frame.render_widget(
@@ -821,13 +829,13 @@ mod tests {
     fn alert_lines_only_include_alert_details() {
         let weather = WeatherView::new(&WeatherSnapshot {
             real: Some(ObservedWeather {
-                alert: Some(WeatherAlert {
+                alerts: vec![WeatherAlert {
                     alert: Some("雷电黄色预警".to_string()),
                     signal_level: Some("黄色".to_string()),
                     issue_content: Some("雷阵雨天气".to_string()),
                     prevention: Some("注意防范".to_string()),
                     ..Default::default()
-                }),
+                }],
                 ..Default::default()
             }),
             radar: Some(RadarInfo {
@@ -844,7 +852,7 @@ mod tests {
             ..Default::default()
         });
 
-        let joined = weather.alert.unwrap().lines.join("\n");
+        let joined = weather.alerts[0].lines.join("\n");
         assert!(joined.contains("雷电黄色预警"));
         assert!(joined.contains("雷阵雨天气"));
         assert!(!joined.contains("Radar"));

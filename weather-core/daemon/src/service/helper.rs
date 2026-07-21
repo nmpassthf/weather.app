@@ -70,22 +70,11 @@ pub(in crate::service) fn install_service_files(
     fs::create_dir_all(config_dir).with_context(|| format!("mkdir {}", config_dir.display()))?;
     let manifest = ComponentManifest::open(&layout.manifest_path);
 
-    // 复制当前 daemon 二进制 + workspace 中其他同目录二进制(若存在)。
-    let exe = std::env::current_exe().context("failed to resolve current exe")?;
-    let bin_exe = copy_binary(&exe, &layout.bin_dir)?;
+    // 安装统一的 BusyBox 风格应用二进制；daemon 由子命令分派。
+    let exe = installation_source_exe()?;
+    let binary_name = application_binary_name();
+    let bin_exe = copy_binary_as(&exe, &layout.bin_dir, std::ffi::OsStr::new(&binary_name))?;
     manifest.record(ComponentKind::Bin, &bin_exe)?;
-    if let Some(parent) = exe.parent() {
-        for sibling in sibling_binary_names() {
-            let src = parent.join(&sibling);
-            if src
-                .try_exists()
-                .with_context(|| format!("inspect sibling binary {}", src.display()))?
-            {
-                let copied = copy_binary(&src, &layout.bin_dir)?;
-                manifest.record(ComponentKind::Bin, copied)?;
-            }
-        }
-    }
 
     // 默认 config: <base>/config/weather.toml,不存在则写默认模板。
     if !layout
@@ -125,10 +114,15 @@ fn resolve_base_path(system: bool, path_override: Option<PathBuf>) -> Result<Pat
     }
 }
 
+#[cfg(test)]
 fn copy_binary(src: &Path, bin_dir: &Path) -> Result<PathBuf> {
     let name = src
         .file_name()
         .with_context(|| format!("invalid exe path {}", src.display()))?;
+    copy_binary_as(src, bin_dir, name)
+}
+
+fn copy_binary_as(src: &Path, bin_dir: &Path, name: &std::ffi::OsStr) -> Result<PathBuf> {
     let dst = bin_dir.join(name);
     if paths_refer_to_same_file(src, &dst)? {
         println!("binary already installed: {}", dst.display());
@@ -178,14 +172,18 @@ fn paths_refer_to_same_file(src: &Path, dst: &Path) -> Result<bool> {
 }
 
 pub(in crate::service) fn service_name() -> &'static str {
-    option_env!("CARGO_BIN_NAME").unwrap_or(env!("CARGO_PKG_NAME"))
+    "weather-daemon"
 }
 
-fn workspace_binary_names() -> Vec<&'static str> {
-    env!("WEATHER_WORKSPACE_BIN_NAMES")
-        .split(';')
-        .filter(|name| !name.is_empty())
-        .collect()
+fn installation_source_exe() -> Result<PathBuf> {
+    #[cfg(target_os = "linux")]
+    if let Some(app_image) = std::env::var_os("APPIMAGE") {
+        let path = PathBuf::from(app_image);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    std::env::current_exe().context("failed to resolve current executable")
 }
 
 fn executable_name(bin_name: &str) -> String {
@@ -196,12 +194,8 @@ fn executable_name(bin_name: &str) -> String {
     }
 }
 
-fn sibling_binary_names() -> Vec<String> {
-    workspace_binary_names()
-        .into_iter()
-        .filter(|name| *name != service_name())
-        .map(executable_name)
-        .collect()
+fn application_binary_name() -> String {
+    executable_name("weather.app")
 }
 
 pub(in crate::service) fn cleanup_service_layout(
@@ -569,10 +563,12 @@ mod tests {
     }
 
     #[test]
-    fn workspace_binary_names_include_current_service_and_siblings() {
-        let bins = workspace_binary_names();
-
-        assert!(bins.iter().any(|name| *name == service_name()));
-        assert!(bins.len() >= 2);
+    fn application_binary_name_is_canonical() {
+        let expected = if cfg!(windows) {
+            "weather.app.exe"
+        } else {
+            "weather.app"
+        };
+        assert_eq!(application_binary_name(), expected);
     }
 }
