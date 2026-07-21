@@ -243,7 +243,7 @@ body::before {
 .hero-card::before { content: ""; position: absolute; z-index: -1; inset: -32% -7% 12% 53%; border: 1px solid var(--weather-line); border-radius: 50%; opacity: 0.5; transform: rotate(-8deg); }
 .hero-card::after { content: "OBS / LIVE"; position: absolute; z-index: 2; top: 21px; right: 24px; color: color-mix(in srgb, var(--weather-accent), var(--muted) 35%); font-size: 8px; font-weight: 780; letter-spacing: 0.16em; }
 .hero-copy { padding: clamp(24px, 4vw, 42px) 0 clamp(24px, 4vw, 42px) clamp(24px, 4vw, 42px); }
-#weather-content[data-loading="true"] .hero-card { opacity: 0.78; }
+#weather-content[data-loading-visual="true"] .hero-card { opacity: 0.78; }
 .location-line { gap: 10px; }
 .location-line > span:first-child { font-size: clamp(21px, 2.3vw, 31px); font-weight: 730; letter-spacing: -0.035em; line-height: 1.08; }
 .muted { color: var(--muted); }
@@ -278,7 +278,7 @@ body::before {
 }
 .weather-icon-wrap:focus-visible { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent), transparent 62%); }
 .refresh-button { position: absolute; right: 0; bottom: -5px; z-index: 2; display: flex; gap: 6px; align-items: center; padding: 8px 11px; border: 1px solid var(--line-strong); border-radius: 999px; background: var(--surface-raised); box-shadow: var(--small-shadow); color: var(--accent); font-size: 11px; font-weight: 700; line-height: 1; }
-.refresh-button.spinning { opacity: 0.7; }
+.refresh-button:disabled { cursor: wait; transform: none; }
 .refresh-glyph { width: 15px; height: 15px; transform-origin: center; }
 .refresh-button.spinning .refresh-glyph { animation: spin 0.72s linear infinite; }
 .metric-grid { position: relative; z-index: 1; grid-column: 1 / -1; display: grid; grid-template-columns: repeat(8, minmax(76px, 1fr)); margin: 0; padding: 18px clamp(24px, 4vw, 42px) 20px; border-top: 1px solid var(--line); background: color-mix(in srgb, var(--surface-muted), transparent 19%); }

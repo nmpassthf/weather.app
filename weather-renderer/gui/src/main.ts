@@ -668,18 +668,21 @@ async function selectStation(name: string, animate = true): Promise<void> {
     renderWeather(null, true);
   }
   renderStations();
-  if (animate) animateStateChange(weatherContent);
-  await loadWeather(true, animate);
+  await loadWeather(true, animate, false);
 }
 
-async function loadWeather(refresh: boolean, animate = true): Promise<void> {
+async function loadWeather(
+  refresh: boolean,
+  animate = true,
+  animateContent = animate,
+): Promise<void> {
   if (!selectedStation) return;
   const stationName = selectedStation;
   const requestToken = ++weatherRequestToken;
   const button = element<HTMLButtonElement>("refresh-button");
-  button.disabled = true;
-  button.classList.add("spinning");
-  setWeatherLoading(true);
+  button.disabled = animateContent;
+  button.classList.toggle("spinning", animateContent);
+  setWeatherLoading(true, animateContent);
   renderStations();
   try {
     const weather = await invoke<WeatherSnapshot>("get_weather", {
@@ -693,7 +696,7 @@ async function loadWeather(refresh: boolean, animate = true): Promise<void> {
     loadedStationSummaries.add(stationName);
     renderStations();
     renderWeather(weather);
-    if (animate) animateStateChange(weatherContent);
+    if (animateContent) animateStateChange(weatherContent);
     if (weather.stale) {
       showDataUpdateFailure("上游更新未成功，已回退到缓存", animate);
       log(`${stationName} 更新失败，继续显示缓存`, "warning");
@@ -711,16 +714,17 @@ async function loadWeather(refresh: boolean, animate = true): Promise<void> {
     if (requestToken === weatherRequestToken) {
       button.disabled = false;
       button.classList.remove("spinning");
-      setWeatherLoading(false);
+      setWeatherLoading(false, animateContent);
       renderStations();
     }
   }
 }
 
-function setWeatherLoading(loading: boolean): void {
+function setWeatherLoading(loading: boolean, showContentLoading = true): void {
   weatherLoading = loading;
   weatherContent.setAttribute("aria-busy", String(loading));
   weatherContent.dataset.loading = String(loading);
+  weatherContent.dataset.loadingVisual = String(loading && showContentLoading);
 }
 
 const value = (input: unknown, suffix = "", digits = 0): string =>
