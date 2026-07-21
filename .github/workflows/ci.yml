@@ -61,7 +61,7 @@ jobs:
           bun run build
 
   musl:
-    name: Linux musl (daemon only)
+    name: Linux musl (daemon + TUI)
     runs-on: ubuntu-22.04
     steps:
       - name: Check out repository
@@ -75,8 +75,10 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
       - name: Check musl target
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
         run: >-
-          cargo check -p weather-app --no-default-features --features daemon
+          cargo check -p weather-app --no-default-features --features daemon,tui
           --target x86_64-unknown-linux-musl
 
   windows-gnu:

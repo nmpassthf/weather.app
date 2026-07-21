@@ -11,7 +11,7 @@
     "standalone:debug": "tauri build --debug --no-bundle --features desktop",
     "bundle": "tauri build --features desktop",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "bun scripts/tauri.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0"

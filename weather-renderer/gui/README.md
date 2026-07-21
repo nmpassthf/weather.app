@@ -1,138 +1,83 @@
 # Weather GUI
 
-This renderer is the optional Tauri 2 `gui` feature of the single
-`weather.app` executable. It uses the same local daemon/engine API as the
-optional TUI feature. It does not read
-the database, write the engine TOML directly, or call the NMC provider; only
-its separate renderer-owned `weather-gui.toml` is persisted locally.
+The Weather GUI is the Tauri 2 desktop interface embedded in the single
+`weather.app` executable. It communicates with the same local engine as the
+TUI and does not access the provider or engine database directly.
 
 ## Features
 
-- current conditions, forecast, warning, air quality, history, climate, radar,
-  stale-data state, and engine event log;
-- ordered multi-alert display with current-station alerts followed by
-  deduplicated two-level parent alerts for three-level stations;
-- interactive temperature history with desktop hover, mobile long-press/drag,
-  and keyboard point inspection;
-- consistent multi-day labels across forecasts and charts: yesterday, today,
-  tomorrow, weekdays through day +7, then concrete calendar dates;
-- a horizontally scrollable daily high/low chart that combines every stored
-  engine-DB history date with the latest forecast, opens on a responsive
-  two-history-day through seven-forecast-day window, and supports bidirectional
-  scrolling plus the same hover, long-press/drag, and keyboard inspection;
-  older DB days are fetched in stable date-cursor pages when the user
-  reaches the loaded past boundary;
-- an in-window large-image viewer for radar resources with wheel/button zoom,
-  image panning, and a draggable viewer panel;
-- station search and weather preview;
-- station add, remove, enable/disable, ordering, and GUI-session-only hiding;
-- current/default config inspection plus engine status, restart, and stop;
-- a GUI-owned current-day SQLite display cache for reopen and station switching;
-- persistent GUI-only settings with a guarded debug/inspector mode;
-- startup-to-exit motion for loading, refreshes, station/layout changes,
-  dialogs, the runtime drawer, charts, image viewing, notifications, themes,
-  and the native-window shutdown handshake;
-- local fallback assets, light/dark themes, keyboard focus, reduced-motion, and
-  responsive layouts for Windows, macOS, and Linux desktop sizes.
+- Current conditions, forecasts, alerts, air quality, climate, and radar.
+- Station search, preview, ordering, and enable/disable management.
+- Scrollable temperature history with mouse, touch, and keyboard inspection.
+- Local display cache with stale-data fallback and background refresh.
+- Engine status, event log, restart, and stop controls.
+- Light/dark themes, responsive layout, reduced motion, and keyboard access.
 
-## Development and debug builds
+## Prerequisites
 
-The package manager is pinned to Bun 1.3.14 in `package.json`.
+Install stable Rust and Bun 1.3.14. Native packaging also requires the Tauri
+dependencies for the current platform.
 
-### Dev build (Vite/HMR)
+Ubuntu 22.04:
 
-Use this mode for frontend development. Install the frontend dependencies and
-let `tauri dev` build the full desktop feature set while Vite is running:
+```sh
+sudo apt-get update
+sudo apt-get install --yes \
+  build-essential pkg-config libglib2.0-dev libgtk-3-dev \
+  libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+  libayatana-appindicator3-dev librsvg2-dev patchelf libfuse2
+```
+
+Windows 10 uses the MSVC Rust toolchain, Windows SDK, and WebView2. macOS uses
+the Xcode command-line tools; release bundles target macOS 11 or newer.
+
+## Development
+
+Install dependencies and start Tauri with Vite hot reload:
 
 ```sh
 cd weather-renderer/gui
-bun install
-bun run tauri dev --features desktop
-```
-
-This build loads resources from `http://localhost:1420` and supports HMR. Its
-`target/debug/weather-app` executable is only a development launcher: starting
-it after Vite has stopped results in a blank window.
-
-### Debug build with embedded assets
-
-Use this mode when the debug-profile GUI must run directly without Vite. The
-script runs the frontend production build, embeds `dist`, and skips installer
-and application-bundle generation:
-
-```sh
-cd weather-renderer/gui
-bun run standalone:debug
-../../target/debug/weather.app
-```
-
-The resulting `target/debug/weather.app` embeds frontend and daemon code. If a
-later ordinary Cargo build or `tauri dev` overwrites the binary, rerun
-`bun run standalone:debug` before launching it directly. A packaged release
-built by `bun run bundle` uses the same embedded-asset path.
-
-By default the GUI starts its own executable with the `daemon` subcommand.
-`WEATHER_DAEMON_EXE` can still select a legacy external daemon, and
-`WEATHER_CONFIG` selects a non-default config path.
-When no daemon is running, the GUI starts an owner-token-bound foreground
-daemon and shuts down only that owned process when the main window or GUI
-process exits. A daemon that was already running before GUI startup is adopted
-for the session and is left running on exit, matching the TUI lifecycle.
-GUI-only settings are stored separately in `weather-gui.toml`, beside the
-resolved engine config file (`~/.weather/config/weather-gui.toml` by default).
-`WEATHER_GUI_CONFIG` overrides that path. The `debug` option defaults to
-`false`; while disabled, the WebView inspector, context menu, element
-selection, and developer shortcuts are unavailable. Enabling it under
-“关于与设置” persists the option, explains that a manual restart is required,
-and closes the current GUI process. Start the GUI again to apply the inspector
-setting. Under `tauri dev`, closing the GUI also ends the Tauri CLI session, so
-rerun `bun run tauri dev` manually.
-The separate `weather-gui.db` file is stored in the same directory by default;
-`WEATHER_GUI_DB` overrides its path. It keeps at most one current-local-day
-display snapshot per configured station, removes older-day/unconfigured rows
-on access, and excludes debug payloads and process-local image resource IDs.
-Cached snapshots are marked stale and are used only to avoid an empty screen
-while reopening the GUI or switching stations. Every GUI launch and station
-switch still forces an engine refresh. Cold-engine refreshes use the provider
-network timeout budget rather than the short control-RPC timeout. A failed
-refresh, including an engine
-response that falls back to stale data, leaves a persistent warning at the top
-until a fresh update succeeds.
-The engine also treats a configured three-level station's two-level parent as
-implicitly tracked. Parent refreshes run before child refreshes, are persisted
-to the engine DB, and use the configured weather TTL (600 seconds by default
-for new configurations), but implicit parents are not added to the GUI station
-list or user config.
-For a direct connection, set both `WEATHER_RPC_ENDPOINT` and
-`WEATHER_PUB_ENDPOINT`. HMAC-enabled engines can use `WEATHER_HMAC_KEY`, or
-`WEATHER_HMAC_ENV_KEY_NAME` to name the environment variable containing the
-key.
-
-## Verify and package
-
-```sh
 bun install --frozen-lockfile
+bun run tauri dev
+```
+
+The command automatically compiles the `desktop` feature set and explicitly
+starts GUI mode. The resulting development executable depends on the Vite
+server and should be launched through this command.
+
+Run frontend checks:
+
+```sh
+bun test
 bun run build
-cargo check -p weather-app --features desktop
+```
+
+Build a standalone debug executable with embedded frontend assets:
+
+```sh
+bun run standalone:debug
+../../target/debug/weather.app gui
+```
+
+GUI settings and the current-day display cache are stored beside the engine
+configuration under `~/.weather/config/`. `WEATHER_CONFIG`,
+`WEATHER_GUI_CONFIG`, and `WEATHER_GUI_DB` override their default paths.
+
+## Package
+
+Build the native bundle for the current platform:
+
+```sh
 bun run bundle
 ```
 
-`bun run bundle` compiles daemon, TUI, and GUI into one application executable,
-then runs the native Tauri packager. Native packaging still requires the
-platform's normal Tauri prerequisites (WebView2 on Windows and WebKitGTK
-development packages on Linux).
+Tauri writes installers and application bundles under
+`target/release/bundle/`. Each package contains one `weather.app` application
+binary with daemon, TUI, and GUI support; no daemon sidecar is required.
 
-All bundled image sources are managed under `assets/`; see `assets/README.md`
-before replacing placeholders. The WebView never requests NMC directly:
-remote resource URLs are converted to opaque IDs by `weather-engine`, fetched
-through an asynchronous engine transfer, and delivered to Tauri as raw bytes.
-The motion layer uses bundled application code plus browser compositor
-primitives (CSS transitions and the Web Animations API); it has no CDN or
-runtime frontend-asset dependency. Rust owns close timing and completes the
-daemon shutdown handshake while the old WebView is still visible. Per-frame
-transforms stay in the WebView to avoid frame-rate IPC traffic.
-The first request starts the provider download and returns `PENDING` without
-holding the normal RPC timeout; the Tauri bridge polls until `READY`, then
-assembles bounded 512 KiB offset-based chunks. Large resources use a bounded
-32 MiB in-memory engine cache with a 15-minute TTL; resource bytes are never
-written to SQLite or another database.
+The CI release targets are Ubuntu 22.04, Windows 10, and universal macOS.
+Platform builds produce AppImage/deb, NSIS, and app/dmg packages respectively.
+
+Bundled image sources live under `assets/`. Read
+[assets/README.md](assets/README.md) before replacing generated or placeholder
+assets.
