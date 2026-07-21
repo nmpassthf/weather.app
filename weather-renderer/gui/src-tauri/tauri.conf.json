@@ -2,7 +2,6 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Weather",
   "mainBinaryName": "weather.app",
-  "version": "0.1.0",
   "identifier": "dev.weather.desktop",
   "build": {
     "features": ["desktop"],

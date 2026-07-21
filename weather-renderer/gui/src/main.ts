@@ -66,6 +66,10 @@ const weatherContent = element<HTMLDivElement>("weather-content");
 const emptyState = element<HTMLElement>("empty-state");
 const searchDialog = element<HTMLDialogElement>("search-dialog");
 const manageDialog = element<HTMLDialogElement>("manage-dialog");
+const confirmDialog = element<HTMLDialogElement>("confirm-dialog");
+const confirmDialogTitle = element<HTMLHeadingElement>("confirm-dialog-title");
+const confirmDialogMessage = element<HTMLParagraphElement>("confirm-dialog-message");
+const confirmAccept = element<HTMLButtonElement>("confirm-accept");
 const aboutDialog = element<HTMLDialogElement>("about-dialog");
 const runtimePanel = element<HTMLElement>("runtime-panel");
 const runtimeToggle = element<HTMLButtonElement>("runtime-toggle");
@@ -114,6 +118,8 @@ let imageViewerClosing = false;
 let appExitStarted = false;
 let toastSequence = 0;
 let dataBannerToken = 0;
+let confirmationResolver: ((confirmed: boolean) => void) | null = null;
+let confirmationAccepted = false;
 
 element<HTMLImageElement>("brand-logo").src = assets.logo;
 element<HTMLImageElement>("empty-image").src = assets.emptyStations;
@@ -2199,7 +2205,14 @@ async function moveStation(index: number, delta: number, animate = true): Promis
 
 async function removeStation(index: number, animate = true): Promise<void> {
   const target = config.stations[index];
-  if (!target || !window.confirm(`确定删除 ${target.name}？`)) return;
+  if (!target) return;
+  const confirmed = await requestConfirmation(
+    "删除站点",
+    `确定删除「${target.name}」吗？此更改将写入共享配置。`,
+    "删除",
+    animate,
+  );
+  if (!confirmed) return;
   const stations = config.stations.filter((_, stationIndex) => stationIndex !== index);
   hiddenStations.delete(target.name);
   const previousLayout = animate ? captureLayout(manageList, ".manage-row") : null;
@@ -2216,6 +2229,30 @@ function showDialog(dialog: HTMLDialogElement, animate = true): void {
       if (dialog.open) dialog.dataset.motionState = "open";
     });
   }
+}
+
+function requestConfirmation(
+  title: string,
+  message: string,
+  acceptLabel: string,
+  animate = true,
+): Promise<boolean> {
+  if (confirmationResolver) return Promise.resolve(false);
+  confirmDialogTitle.textContent = title;
+  confirmDialogMessage.textContent = message;
+  confirmAccept.textContent = acceptLabel;
+  confirmationAccepted = false;
+  showDialog(confirmDialog, animate);
+  return new Promise((resolve) => {
+    confirmationResolver = resolve;
+  });
+}
+
+function finishConfirmation(): void {
+  const resolve = confirmationResolver;
+  confirmationResolver = null;
+  resolve?.(confirmationAccepted);
+  confirmationAccepted = false;
 }
 
 async function hideDialog(dialog: HTMLDialogElement, animate = true): Promise<void> {
@@ -2434,7 +2471,13 @@ async function showConfig(defaults: boolean, animate = true): Promise<void> {
 
 async function engineAction(command: "restart_engine" | "stop_engine", animate = true): Promise<void> {
   const label = command === "restart_engine" ? "重启" : "停止";
-  if (!window.confirm(`确定${label}天气引擎？`)) return;
+  const confirmed = await requestConfirmation(
+    `${label}天气引擎`,
+    `确定${label}天气引擎？`,
+    label,
+    animate,
+  );
+  if (!confirmed) return;
   try {
     const message = await invoke<string>(command);
     toast(message, "success", animate);
@@ -2489,6 +2532,14 @@ function bindEvents(): void {
   element("stop-engine").addEventListener("click", (event) => {
     void engineAction("stop_engine", shouldAnimateInteraction(event));
   });
+  element("confirm-cancel").addEventListener("click", (event) => {
+    void hideDialog(confirmDialog, shouldAnimateInteraction(event));
+  });
+  confirmAccept.addEventListener("click", (event) => {
+    confirmationAccepted = true;
+    void hideDialog(confirmDialog, shouldAnimateInteraction(event));
+  });
+  confirmDialog.addEventListener("close", finishConfirmation);
   element("data-update-retry").addEventListener("click", (event) => {
     void loadWeather(true, shouldAnimateInteraction(event));
   });

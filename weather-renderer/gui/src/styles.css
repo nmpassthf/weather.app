@@ -536,6 +536,12 @@ dialog[data-motion-state="instant"]::backdrop { animation: none; }
 .manage-actions { gap: 2px; }
 .modal-note { margin: 0; padding: 16px 26px 23px; color: var(--muted); font-size: 10px; }
 
+dialog.confirm-modal { width: min(420px, calc(100vw - 36px)); }
+.confirm-content { display: grid; gap: 18px; padding: 25px 26px 23px; }
+.confirm-content h2 { margin-top: 4px; }
+.confirm-content p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.65; }
+.confirm-actions { display: flex; gap: 8px; justify-content: flex-end; }
+
 .gui-settings { display: grid; gap: 8px; margin: 14px 26px 0; padding: 14px 16px; border: 1px solid var(--line); border-radius: 5px 14px 14px 14px; background: var(--surface-muted); }
 .debug-setting { display: flex; gap: 18px; align-items: center; justify-content: space-between; cursor: pointer; }
 .debug-setting > span { display: grid; gap: 4px; }

@@ -270,6 +270,22 @@
       <p class="modal-note">隐藏仅影响当前 GUI 会话；启用、删除与排序会写入共享配置。</p>
     </dialog>
 
+    <dialog
+      id="confirm-dialog"
+      class="modal confirm-modal"
+      aria-labelledby="confirm-dialog-title"
+      aria-describedby="confirm-dialog-message"
+    >
+      <div class="confirm-content">
+        <div><div class="section-kicker">请确认操作</div><h2 id="confirm-dialog-title">确认操作</h2></div>
+        <p id="confirm-dialog-message"></p>
+        <div class="confirm-actions">
+          <button id="confirm-cancel" class="button quiet" type="button">取消</button>
+          <button id="confirm-accept" class="button danger" type="button">确认</button>
+        </div>
+      </div>
+    </dialog>
+
     <dialog id="about-dialog" class="modal about-modal">
       <div class="modal-header"><div><div class="section-kicker">Weather GUI</div><h2>引擎与配置</h2></div></div>
       <section class="gui-settings" aria-labelledby="gui-settings-title">
