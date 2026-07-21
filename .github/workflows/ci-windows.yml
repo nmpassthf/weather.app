@@ -1,0 +1,23 @@
+name: CI Windows
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native Windows
+    runs-on: windows-2022
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Check workspace
+        run: cargo check -p weather-app --all-targets --features desktop
+      - name: Check Windows service dispatcher CLI
+        run: >-
+          cargo test -p weather-daemon --lib
+          cli::tests::parses_windows_service_mode_and_rejects_foreground

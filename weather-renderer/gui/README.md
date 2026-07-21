@@ -75,8 +75,14 @@ Tauri writes installers and application bundles under
 `target/release/bundle/`. Each package contains one `weather.app` application
 binary with daemon, TUI, and GUI support; no daemon sidecar is required.
 
-The CI release targets are Ubuntu 22.04, Windows 10, and universal macOS.
-Platform builds produce AppImage/deb, NSIS, and app/dmg packages respectively.
+The CI release targets are Ubuntu 22.04, Windows 10, macOS Universal, and macOS
+Apple Silicon. Platform builds produce AppImage/deb, Windows NSIS and portable
+tar variants, plus macOS app/dmg packages.
+
+The NSIS package installs per-machine and registers the embedded daemon as the
+auto-start `weather-daemon` Windows service. Its uninstall hook removes the
+service while preserving configuration data. The tar package is portable and
+does not modify SCM state.
 
 Bundled image sources live under `assets/`. Read
 [assets/README.md](assets/README.md) before replacing generated or placeholder

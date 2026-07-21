@@ -1,0 +1,62 @@
+name: Bundle macOS
+
+on:
+  workflow_call:
+    inputs:
+      tested_commit:
+        required: true
+        type: string
+      source_run:
+        required: true
+        type: number
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: Bundle macOS ${{ matrix.label }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Universal
+            rust_target: universal-apple-darwin
+            manifest_target: macos-universal
+            artifact_name: weather-macos-universal-latest
+            expected_archs: x86_64 arm64
+            expected_arch_count: 2
+          - label: Apple Silicon
+            rust_target: aarch64-apple-darwin
+            manifest_target: macos-aarch64
+            artifact_name: weather-macos-aarch64-latest
+            expected_archs: arm64
+            expected_arch_count: 1
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - name: Check out tested commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tested_commit }}
+      - name: Install stable Rust targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - name: Build and prepare macOS ${{ matrix.label }} artifact
+        env:
+          TESTED_COMMIT: ${{ inputs.tested_commit }}
+          SOURCE_RUN: ${{ inputs.source_run }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+          MANIFEST_TARGET: ${{ matrix.manifest_target }}
+          EXPECTED_ARCHS: ${{ matrix.expected_archs }}
+          EXPECTED_ARCH_COUNT: ${{ matrix.expected_arch_count }}
+        run: bash .github/scripts/bundle-macos.sh
+      - name: Upload latest macOS bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/macos
+          if-no-files-found: error
+          retention-days: 30

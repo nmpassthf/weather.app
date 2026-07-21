@@ -1,0 +1,38 @@
+name: Bundle Linux
+
+on:
+  workflow_call:
+    inputs:
+      tested_commit:
+        required: true
+        type: string
+      source_run:
+        required: true
+        type: number
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: Bundle Linux x86_64
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out tested commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tested_commit }}
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build and prepare Linux artifact
+        env:
+          TESTED_COMMIT: ${{ inputs.tested_commit }}
+          SOURCE_RUN: ${{ inputs.source_run }}
+        run: bash .github/scripts/bundle-linux.sh
+      - name: Upload latest Linux bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: weather-linux-x86_64-latest
+          path: dist/linux
+          if-no-files-found: error
+          retention-days: 30

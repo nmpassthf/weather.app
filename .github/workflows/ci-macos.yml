@@ -1,0 +1,19 @@
+name: CI macOS
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native macOS
+    runs-on: macos-14
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Check desktop application
+        run: cargo check -p weather-app --all-targets --features desktop

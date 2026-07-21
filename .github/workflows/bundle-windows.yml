@@ -1,0 +1,46 @@
+name: Bundle Windows
+
+on:
+  workflow_call:
+    inputs:
+      tested_commit:
+        required: true
+        type: string
+      source_run:
+        required: true
+        type: number
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: Bundle Windows 10 x86_64
+    runs-on: windows-2022
+    steps:
+      - name: Check out tested commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tested_commit }}
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build and prepare Windows artifacts
+        shell: pwsh
+        env:
+          TESTED_COMMIT: ${{ inputs.tested_commit }}
+          SOURCE_RUN: ${{ inputs.source_run }}
+        run: ./.github/scripts/bundle-windows.ps1
+      - name: Upload latest Windows NSIS installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: weather-windows-x86_64-nsis-latest
+          path: dist/windows-nsis
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload latest Windows portable tar
+        uses: actions/upload-artifact@v7
+        with:
+          name: weather-windows-x86_64-tar-latest
+          path: dist/windows-tar
+          if-no-files-found: error
+          retention-days: 30

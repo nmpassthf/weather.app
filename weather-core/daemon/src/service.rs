@@ -1,5 +1,7 @@
 mod helper;
 mod linux;
+#[cfg(windows)]
+mod windows;
 
 use std::path::PathBuf;
 
@@ -20,7 +22,9 @@ pub(crate) fn install_service(
         ServiceBackend::Systemd => {
             linux::systemd::install(system, path_override, config_override, manage_service)
         }
-        ServiceBackend::Windows => unsupported_windows_backend(),
+        ServiceBackend::Windows => {
+            windows_install(system, path_override, config_override, manage_service)
+        }
     }
 }
 
@@ -44,7 +48,14 @@ pub(crate) fn uninstall_service(
             with_bin || all,
             all,
         )?,
-        ServiceBackend::Windows => return unsupported_windows_backend(),
+        ServiceBackend::Windows => windows_uninstall(
+            system,
+            path_override,
+            config_override,
+            with_data,
+            with_bin,
+            all,
+        )?,
     }
     Ok(())
 }
@@ -62,7 +73,9 @@ pub(crate) fn reinstall_service(
         ServiceBackend::Systemd => {
             linux::systemd::reinstall(system, path_override, config_override, manage_service)
         }
-        ServiceBackend::Windows => unsupported_windows_backend(),
+        ServiceBackend::Windows => {
+            windows_reinstall(system, path_override, config_override, manage_service)
+        }
     }
 }
 
@@ -93,32 +106,98 @@ fn validate_service_backend_for(backend: ServiceBackend, platform: ServicePlatfo
         (ServiceBackend::Systemd, _) => {
             bail!("systemd service backend is supported only on Linux")
         }
-        (ServiceBackend::Windows, _) => unsupported_windows_backend(),
+        (ServiceBackend::Windows, ServicePlatform::Windows) => Ok(()),
+        (ServiceBackend::Windows, _) => {
+            bail!("Windows service backend is supported only on Windows")
+        }
     }
 }
 
-fn unsupported_windows_backend() -> Result<()> {
-    bail!(
-        "windows service backend is unsupported because weather-daemon does not implement an SCM service dispatcher"
-    )
+pub(crate) fn run_windows_service(
+    config: Option<PathBuf>,
+    log_level: Option<crate::cli::DaemonLogLevel>,
+) -> Result<()> {
+    #[cfg(windows)]
+    {
+        windows::run_dispatcher(config, log_level)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (config, log_level);
+        bail!("Windows service mode is supported only on Windows")
+    }
+}
+
+fn windows_install(
+    system: bool,
+    path_override: Option<PathBuf>,
+    config_override: Option<PathBuf>,
+    manage_service: bool,
+) -> Result<()> {
+    #[cfg(windows)]
+    {
+        windows::install(system, path_override, config_override, manage_service)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (system, path_override, config_override, manage_service);
+        bail!("Windows service backend is supported only on Windows")
+    }
+}
+
+fn windows_reinstall(
+    system: bool,
+    path_override: Option<PathBuf>,
+    config_override: Option<PathBuf>,
+    manage_service: bool,
+) -> Result<()> {
+    #[cfg(windows)]
+    {
+        windows::reinstall(system, path_override, config_override, manage_service)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (system, path_override, config_override, manage_service);
+        bail!("Windows service backend is supported only on Windows")
+    }
+}
+
+fn windows_uninstall(
+    system: bool,
+    path_override: Option<PathBuf>,
+    config_override: Option<PathBuf>,
+    with_data: bool,
+    with_bin: bool,
+    all: bool,
+) -> Result<()> {
+    #[cfg(windows)]
+    {
+        windows::uninstall(
+            system,
+            path_override,
+            config_override,
+            with_data,
+            with_bin,
+            all,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (
+            system,
+            path_override,
+            config_override,
+            with_data,
+            with_bin,
+            all,
+        );
+        bail!("Windows service backend is supported only on Windows")
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     use super::*;
-
-    fn unique_test_path(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "weather-service-{name}-{}-{nanos}",
-            std::process::id()
-        ))
-    }
 
     #[test]
     fn backend_support_matrix_is_explicit() {
@@ -129,77 +208,12 @@ mod tests {
             let err = validate_service_backend_for(ServiceBackend::Systemd, platform).unwrap_err();
             assert!(err.to_string().contains("only on Linux"));
         }
-        for platform in [
-            ServicePlatform::Linux,
-            ServicePlatform::Windows,
-            ServicePlatform::Other,
-        ] {
+        assert!(
+            validate_service_backend_for(ServiceBackend::Windows, ServicePlatform::Windows).is_ok()
+        );
+        for platform in [ServicePlatform::Linux, ServicePlatform::Other] {
             let err = validate_service_backend_for(ServiceBackend::Windows, platform).unwrap_err();
-            assert!(err.to_string().contains("SCM service dispatcher"));
+            assert!(err.to_string().contains("only on Windows"));
         }
-    }
-
-    #[test]
-    fn windows_install_is_rejected_before_creating_files() {
-        for manage_service in [true, false] {
-            let base = unique_test_path(if manage_service {
-                "windows-install"
-            } else {
-                "windows-manual-install"
-            });
-            let config = base.join("config/weather.toml");
-
-            let err = install_service(
-                ServiceBackend::Windows,
-                false,
-                Some(base.clone()),
-                Some(config),
-                manage_service,
-            )
-            .unwrap_err();
-
-            assert!(err.to_string().contains("SCM service dispatcher"));
-            assert!(!base.exists());
-        }
-    }
-
-    #[test]
-    fn windows_reinstall_is_rejected_before_creating_files() {
-        for manage_service in [true, false] {
-            let base = unique_test_path(if manage_service {
-                "windows-reinstall"
-            } else {
-                "windows-manual-reinstall"
-            });
-            let config = base.join("config/weather.toml");
-
-            let err = reinstall_service(
-                ServiceBackend::Windows,
-                false,
-                Some(base.clone()),
-                Some(config),
-                manage_service,
-            )
-            .unwrap_err();
-
-            assert!(err.to_string().contains("SCM service dispatcher"));
-            assert!(!base.exists());
-        }
-    }
-
-    #[test]
-    fn windows_remove_is_explicitly_rejected() {
-        let err = uninstall_service(
-            ServiceBackend::Windows,
-            false,
-            None,
-            None,
-            false,
-            false,
-            false,
-        )
-        .unwrap_err();
-
-        assert!(err.to_string().contains("SCM service dispatcher"));
     }
 }

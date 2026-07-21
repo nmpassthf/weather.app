@@ -105,7 +105,12 @@ fn resolve_base_path(system: bool, path_override: Option<PathBuf>) -> Result<Pat
         return Ok(p);
     }
     if system {
-        Ok(PathBuf::from("/opt/weather"))
+        if cfg!(windows) {
+            let program_data = std::env::var_os("PROGRAMDATA").context("PROGRAMDATA is not set")?;
+            Ok(PathBuf::from(program_data).join("Weather"))
+        } else {
+            Ok(PathBuf::from("/opt/weather"))
+        }
     } else {
         let home = std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))

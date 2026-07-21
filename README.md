@@ -16,7 +16,7 @@ The GUI and TUI share the same configuration, cache, and engine protocol.
 - Interactive TUI and one-shot text or JSON output.
 - Station search, management, forecasts, alerts, and temperature history.
 - Local caching, background refresh, proxy support, and stale-data fallback.
-- systemd user or system service installation on Linux.
+- systemd services on Linux and Windows SCM service installation.
 
 The executable selects its interface from the launch environment:
 
@@ -101,9 +101,21 @@ bun install --frozen-lockfile
 bun run bundle
 ```
 
-After CI succeeds on `master`, GitHub Actions produces Linux, Windows, and
-macOS bundles in the `weather-desktop-latest` artifact. Only the newest
-complete successful bundle set is retained.
+After CI succeeds on `master`, GitHub Actions publishes five independent latest
+artifacts:
+
+- `weather-linux-x86_64-latest`
+- `weather-windows-x86_64-nsis-latest`
+- `weather-windows-x86_64-tar-latest`
+- `weather-macos-universal-latest`
+- `weather-macos-aarch64-latest`
+
+Each target keeps its newest successful artifact without waiting for the other
+platform builds to succeed.
+
+The Windows NSIS installer performs a per-machine install and registers the
+embedded daemon as the auto-start `weather-daemon` service. The Windows tar
+artifact is portable and does not modify Windows services.
 
 ## Development
 
@@ -143,6 +155,12 @@ Install the daemon as a Linux user service when needed:
 
 ```sh
 weather.app daemon service install systemd
+```
+
+Windows service installation requires an elevated terminal and system scope:
+
+```powershell
+weather.app.exe daemon service install windows --system
 ```
 
 ## License

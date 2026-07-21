@@ -21,6 +21,9 @@ pub(crate) enum Command {
         foreground: bool,
         #[arg(long, requires = "foreground", hide = true)]
         owner_token: Option<String>,
+        /// Run under the Windows Service Control Manager dispatcher.
+        #[arg(long, hide = true, conflicts_with = "foreground")]
+        windows_service: bool,
     },
     Probe {
         #[arg(long, short = 'c')]
@@ -70,47 +73,47 @@ impl DaemonLogLevel {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ServiceCommand {
-    /// 安装服务。默认 user 模式(base=~/.weather),--system 装 /opt/weather(需 root)。
+    /// 安装服务。Linux 默认 user scope；Windows SCM 必须使用 --system。
     Install {
-        /// 服务后端：systemd 仅支持 Linux；windows 保留为明确的 unsupported 选项。
+        /// 服务后端：systemd 用于 Linux；windows 用于 Windows SCM。
         backend: ServiceBackend,
-        /// 显式 system 模式。默认 user。
+        /// system scope：Linux 使用 /opt/weather；Windows 使用 ProgramData\Weather。
         #[arg(long)]
         system: bool,
-        /// 覆盖 base path（默认 user: ~/.weather，system: /opt/weather）。
+        /// 覆盖 base path。
         #[arg(long)]
         path: Option<PathBuf>,
         /// 指定 config 路径(默认 <base>/config/weather.toml)。
         #[arg(long, short = 'c')]
         config: Option<PathBuf>,
-        /// 只安装文件/unit，不修改 systemd 状态；不能启用未实现的 Windows SCM backend。
+        /// 只安装文件/服务布局，不修改 systemd 或 Windows SCM 状态。
         #[arg(long)]
         no_modification_service: bool,
     },
-    /// 重新安装已存在的服务，并重载/启动 systemd unit。
+    /// 重新安装并启动 systemd unit 或 Windows SCM service。
     Reinstall {
-        /// 服务后端：systemd 仅支持 Linux；windows 保留为明确的 unsupported 选项。
+        /// 服务后端：systemd 用于 Linux；windows 用于 Windows SCM。
         backend: ServiceBackend,
-        /// 显式 system 模式。默认 user。
+        /// system scope；Windows SCM 必须启用。
         #[arg(long)]
         system: bool,
-        /// 覆盖 base path（默认 user: ~/.weather，system: /opt/weather）。
+        /// 覆盖 base path。
         #[arg(long)]
         path: Option<PathBuf>,
         /// 指定 config 路径(默认 <base>/config/weather.toml)。
         #[arg(long, short = 'c')]
         config: Option<PathBuf>,
-        /// 只重新安装文件/unit，不修改 systemd 状态；不能启用未实现的 Windows SCM backend。
+        /// 只重新安装文件/服务布局，不修改 systemd 或 Windows SCM 状态。
         #[arg(long)]
         no_modification_service: bool,
     },
     /// 卸载服务,可选清理数据/二进制。
     Remove {
         backend: ServiceBackend,
-        /// 删除 system scope；默认只处理当前用户的 service/layout。
+        /// 删除 system scope；Windows SCM 必须启用。
         #[arg(long)]
         system: bool,
-        /// 安装时使用的 base path（默认 user: ~/.weather，system: /opt/weather）。
+        /// 安装时使用的 base path。
         #[arg(long)]
         path: Option<PathBuf>,
         /// 安装时使用的 config 路径（默认 <base>/config/weather.toml）。
@@ -132,7 +135,7 @@ pub(crate) enum ServiceCommand {
 pub(crate) enum ServiceBackend {
     /// Linux systemd user/system service。
     Systemd,
-    /// 当前不支持：weather-daemon 尚未实现 Windows SCM dispatcher。
+    /// Windows Service Control Manager system service。
     Windows,
 }
 
@@ -182,6 +185,22 @@ mod tests {
     fn owner_token_requires_foreground_mode() {
         assert!(
             Cli::try_parse_from(["weather-daemon", "run", "--owner-token", "owner-token",])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_windows_service_mode_and_rejects_foreground() {
+        let cli = Cli::parse_from(["weather-daemon", "run", "--windows-service"]);
+        let Command::Run {
+            windows_service, ..
+        } = cli.command
+        else {
+            panic!("expected run command");
+        };
+        assert!(windows_service);
+        assert!(
+            Cli::try_parse_from(["weather-daemon", "run", "--windows-service", "--foreground",])
                 .is_err()
         );
     }

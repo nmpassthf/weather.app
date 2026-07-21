@@ -15,7 +15,7 @@ use crate::{
     cli::{Cli, Command, ServiceCommand},
     probe::probe,
     run::run,
-    service::{install_service, reinstall_service, uninstall_service},
+    service::{install_service, reinstall_service, run_windows_service, uninstall_service},
     stop::stop,
 };
 
@@ -27,7 +27,14 @@ pub async fn run_from(args: impl IntoIterator<Item = OsString>) -> Result<()> {
             log_level,
             foreground,
             owner_token,
-        } => run(config, log_level, foreground, owner_token).await,
+            windows_service,
+        } => {
+            if windows_service {
+                run_windows_service(config, log_level)
+            } else {
+                run(config, log_level, foreground, owner_token).await
+            }
+        }
         Command::Probe { config, verbose } => probe(config, verbose).await,
         Command::Service { command } => match command {
             ServiceCommand::Install {
