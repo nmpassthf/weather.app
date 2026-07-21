@@ -198,6 +198,40 @@ fn aliases_try_each_complete_conversion_and_filter_every_sentinel_shape() {
 }
 
 #[test]
+fn current_nmc_air_shape_maps_overall_fields_without_inventing_pollutants() {
+    let fixture = serde_json::json!({
+        "code": 0,
+        "msg": "success",
+        "data": {
+            "air": {
+                "forecasttime": "2026-07-21 12:00",
+                "aqi": 46,
+                "aq": 1,
+                "text": "优",
+                "aqiCode": "99006;99008"
+            }
+        }
+    });
+    let mapped = mapper::map_weather(
+        dto::decode_weather_response(fixture).unwrap(),
+        &Url::parse("https://www.nmc.cn/").unwrap(),
+    );
+
+    assert!(mapped.warnings.is_empty(), "{:?}", mapped.warnings);
+    let air = mapped.value.air.unwrap();
+    assert_eq!(air.publish_time.as_deref(), Some("2026-07-21 12:00"));
+    assert_eq!(air.aqi, Some(46.0));
+    assert_eq!(air.level.as_deref(), Some("一级"));
+    assert_eq!(air.category.as_deref(), Some("优"));
+    assert_eq!(air.pm2_5, None);
+    assert_eq!(air.pm10, None);
+    assert_eq!(air.no2, None);
+    assert_eq!(air.so2, None);
+    assert_eq!(air.co, None);
+    assert_eq!(air.o3, None);
+}
+
+#[test]
 fn textual_dash_placeholders_are_mapped_as_missing_values() {
     let mut fixture: Value = serde_json::from_str(FULL).unwrap();
     fixture["data"]["real"]["weather"]["info"] = Value::String("-".to_string());

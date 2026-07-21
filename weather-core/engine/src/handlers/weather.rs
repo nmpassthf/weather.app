@@ -1219,6 +1219,8 @@ mod tests {
             }),
             air: Some(AirQuality {
                 aqi: Some(aqi),
+                pm2_5: Some(18.0),
+                pm10: Some(35.0),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1264,7 +1266,10 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert_eq!(child.air.and_then(|air| air.aqi), Some(44.0));
+        let air = child.air.as_ref().unwrap();
+        assert_eq!(air.aqi, Some(44.0));
+        assert_eq!(air.pm2_5, Some(18.0));
+        assert_eq!(air.pm10, Some(35.0));
         engine.db.shutdown().await.unwrap();
     }
 

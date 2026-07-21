@@ -4,6 +4,7 @@ import {
   weatherAsset,
   weatherAtmosphere,
 } from "./assets";
+import { pollutantReadings } from "./air";
 import { invokeBinaryCommand, invokeCommand as invoke, listenEvent as listen } from "./bridge";
 import { calendarDateIso, multiDayDateLabel, multiDayDateTimeLabel } from "./date";
 import {
@@ -94,6 +95,7 @@ const SEARCH_DEBOUNCE_MS = 220;
 const STATION_SUMMARY_CONCURRENCY = 2;
 const RESOURCE_URL_CACHE_SIZE = 10;
 const climateNumberFormat = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 1 });
+const pollutantNumberFormat = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 1 });
 const resourceUrls = new Map<string, string>();
 const resourceRequests = new Map<string, Promise<string>>();
 let radarRenderToken = 0;
@@ -926,38 +928,25 @@ function renderForecast(weather: WeatherSnapshot | null, placeholder = false): v
 }
 
 function renderAir(weather: WeatherSnapshot | null, placeholder = false): void {
-  const air = weather?.air;
+  const air = placeholder ? null : weather?.air;
+  const aqiReading = typeof air?.aqi === "number" && Number.isFinite(air.aqi) ? air.aqi : null;
   const aqi = element("aqi");
-  aqi.textContent = value(air?.aqi);
-  aqi.dataset.level = aqiLevel(air?.aqi);
+  aqi.textContent = aqiReading === null ? "-" : value(aqiReading);
+  aqi.dataset.level = aqiLevel(aqiReading);
   const target = element<HTMLDivElement>("air-content");
   target.replaceChildren();
-  if (placeholder) {
-    const summary = document.createElement("p");
-    summary.className = "air-summary";
-    summary.textContent = "—";
-    const grid = document.createElement("div");
-    grid.className = "pollutant-grid";
-    for (const label of ["PM2.5", "PM10", "NO₂", "SO₂", "CO", "O₃"]) {
-      const item = document.createElement("span");
-      item.textContent = `${label} —`;
-      grid.append(item);
-    }
-    target.append(summary, grid);
-    return;
-  }
-  if (!air) {
-    target.append(emptyCopy("暂无空气质量数据"));
-    return;
-  }
   const summary = document.createElement("p");
   summary.className = "air-summary";
-  summary.textContent = [air.category, air.level, air.primary_pollutant ? `首要污染物 ${air.primary_pollutant}` : ""].filter(Boolean).join(" · ") || "暂无评级";
+  summary.textContent = air
+    ? [air.category, air.level, air.primary_pollutant ? `首要污染物 ${air.primary_pollutant}` : ""].filter(Boolean).join(" · ") || "-"
+    : "-";
   const grid = document.createElement("div");
   grid.className = "pollutant-grid";
-  for (const [label, reading] of [["PM2.5", air.pm2_5], ["PM10", air.pm10], ["NO₂", air.no2], ["SO₂", air.so2], ["CO", air.co], ["O₃", air.o3]] as const) {
+  for (const { label, reading, unit } of pollutantReadings(air)) {
     const item = document.createElement("span");
-    item.textContent = `${label} ${value(reading)}`;
+    item.textContent = reading === null
+      ? `${label} -`
+      : `${label} ${pollutantNumberFormat.format(reading)} ${unit}`;
     grid.append(item);
   }
   target.append(summary, grid);
