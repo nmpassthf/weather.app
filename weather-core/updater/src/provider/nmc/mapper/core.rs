@@ -30,6 +30,17 @@ pub(super) fn map_real(
     let weather = weather.as_ref();
     let wind = wind.as_ref();
     let sun = sun.as_ref();
+    let comfort_index = value::fixed_string(
+        weather.and_then(|weather| weather.comfort_index.as_ref()),
+        "real.weather.icomfort",
+        context,
+    );
+    let comfort_label = value::fixed_string(
+        weather.and_then(|weather| weather.comfort_label.as_ref()),
+        "real.weather.rcomfort",
+        context,
+    );
+    let mapped_comfort_label = comfort_index.as_deref().and_then(nmc_comfort_label);
     Some(MappedSection {
         station,
         value: ObservedWeather {
@@ -99,16 +110,11 @@ pub(super) fn map_real(
                 "real.weather.airpressure",
                 context,
             ),
-            comfort_index: value::fixed_string(
-                weather.and_then(|weather| weather.comfort_index.as_ref()),
-                "real.weather.icomfort",
-                context,
-            ),
-            comfort_label: value::fixed_string(
-                weather.and_then(|weather| weather.comfort_label.as_ref()),
-                "real.weather.rcomfort",
-                context,
-            ),
+            comfort_index,
+            // NMC's `icomfort` is a code (i4…i-4), while `rcomfort` is the
+            // provider's display text. Resolve the code here so renderers
+            // receive one unambiguous, human-readable comfort label.
+            comfort_label: mapped_comfort_label.unwrap_or(comfort_label),
             weather_icon: value::fixed_string(
                 weather.and_then(|weather| weather.weather_icon.as_ref()),
                 "real.weather.img",
@@ -121,6 +127,29 @@ pub(super) fn map_real(
             ),
         },
     })
+}
+
+/// Resolve the NMC-only comfort code. Other providers must not inherit this
+/// table; their normalized `comfort_label` is passed through unchanged.
+fn nmc_comfort_label(index: &str) -> Option<Option<String>> {
+    let normalized = index.trim().to_ascii_lowercase();
+    let code = normalized.strip_prefix('i').unwrap_or(&normalized);
+    let label = match code {
+        "4" => "很热，极不适应",
+        "3" => "热，很不舒适",
+        "2" => "暖，不舒适",
+        "1" => "温暖，较舒适",
+        "0" => "舒适，最可接受",
+        "-1" => "凉爽，较舒适",
+        "-2" => "凉，不舒适",
+        "-3" => "冷，很不舒适",
+        "-4" => "很冷，极不适应",
+        // 9999 is NMC's unavailable comfort sentinel. The nested `Some(None)`
+        // below marks it as recognized but intentionally leaves no label.
+        "9999" => return Some(None),
+        _ => return None,
+    };
+    Some(Some(label.to_string()))
 }
 
 pub(super) fn map_predict(

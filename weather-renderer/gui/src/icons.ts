@@ -4,6 +4,7 @@ export type UiIconName =
   | "chevron-down"
   | "chevron-right"
   | "chevron-up"
+  | "air"
   | "comfort"
   | "gauge"
   | "magnify";

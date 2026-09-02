@@ -798,7 +798,11 @@ function renderWeather(weather: WeatherSnapshot | null, placeholder = false): vo
   element("stale-badge").hidden = !weather?.stale;
 
   element("high-low").textContent = `最高 ${text(firstDay?.day_temperature)}° · 最低 ${text(firstDay?.night_temperature)}°`;
-  renderComfort(placeholder ? "—" : current?.comfort_label, placeholder ? "—" : current?.comfort_index);
+  renderComfort(
+    placeholder ? "—" : current?.comfort_label,
+    placeholder ? "—" : current?.comfort_index,
+    placeholder ? "—" : weather?.air?.category?.trim() || weather?.air?.level?.trim(),
+  );
 
   renderCurrentMetrics(weather);
   renderAlert(weather, placeholder);
@@ -808,11 +812,16 @@ function renderWeather(weather: WeatherSnapshot | null, placeholder = false): vo
   renderExtra(weather, placeholder);
 }
 
-function renderComfort(label: string | null | undefined, index: string | null | undefined): void {
+function renderComfort(
+  comfortLabel: string | null | undefined,
+  comfortIndex: string | null | undefined,
+  airQuality: string | null | undefined,
+): void {
   const comfort = element<HTMLDivElement>("comfort");
   const entries = [
-    { icon: "comfort", label: "舒适度", value: label },
-    { icon: "gauge", label: "指数", value: index },
+    { icon: "comfort", label: "舒适度", value: comfortLabel },
+    { icon: "gauge", label: "舒适指数", value: comfortIndex },
+    { icon: "air", label: "空气质量", value: airQuality },
   ] as const;
   comfort.replaceChildren();
   for (const entry of entries) {

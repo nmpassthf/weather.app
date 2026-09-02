@@ -1,8 +1,12 @@
-/target
-/todo
 /.weather
-superpowers/
-*.prd.*
+
 /weather-renderer/gui/node_modules
 /weather-renderer/gui/dist
 /weather-renderer/gui/src-tauri/gen
+/target
+
+/todo
+superpowers/
+*.prd.*
+
+.DS_Store

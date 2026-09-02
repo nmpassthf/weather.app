@@ -36,7 +36,7 @@ fn full_response_preserves_the_existing_structured_mapping_baseline() {
     assert_eq!(real.temperature, Some(30.0));
     assert_eq!(real.temperature_diff, Some(1.2));
     assert_eq!(real.air_pressure, Some(1001.0));
-    assert_eq!(real.comfort_label.as_deref(), Some("较舒适"));
+    assert_eq!(real.comfort_label.as_deref(), Some("热，很不舒适"));
     assert_eq!(real.comfort_index.as_deref(), Some("3"));
     assert_eq!(real.weather_icon.as_deref(), Some("0"));
     assert_eq!(real.wind_degree, Some(45.0));
@@ -79,6 +79,51 @@ fn full_response_preserves_the_existing_structured_mapping_baseline() {
         )
     );
     assert!(snapshot.debug.is_none());
+}
+
+#[test]
+fn nmc_comfort_index_is_resolved_to_the_human_readable_table_label() {
+    let expected = [
+        ("i4", "很热，极不适应"),
+        ("i3", "热，很不舒适"),
+        ("i2", "暖，不舒适"),
+        ("i1", "温暖，较舒适"),
+        ("i0", "舒适，最可接受"),
+        ("i-1", "凉爽，较舒适"),
+        ("i-2", "凉，不舒适"),
+        ("i-3", "冷，很不舒适"),
+        ("i-4", "很冷，极不适应"),
+    ];
+
+    for (index, label) in expected {
+        let mut fixture: Value = serde_json::from_str(FULL).expect("valid fixture");
+        fixture["data"]["real"]["weather"]["icomfort"] = Value::String(index.to_string());
+        fixture["data"]["real"]["weather"]["rcomfort"] =
+            Value::String("provider text must not win".to_string());
+        let data = dto::decode_weather_response(fixture).expect("successful fixture envelope");
+        let mapped = mapper::map_weather(
+            data,
+            &Url::parse("https://configured.example/nmc/").unwrap(),
+        );
+        assert!(mapped.warnings.is_empty(), "{:?}", mapped.warnings);
+        assert_eq!(
+            mapped.value.real.unwrap().comfort_label.as_deref(),
+            Some(label)
+        );
+    }
+}
+
+#[test]
+fn nmc_comfort_sentinel_is_rendered_as_an_unavailable_label() {
+    let mut fixture: Value = serde_json::from_str(FULL).expect("valid fixture");
+    fixture["data"]["real"]["weather"]["icomfort"] = Value::String("i9999".to_string());
+    fixture["data"]["real"]["weather"]["rcomfort"] = Value::String("暂无".to_string());
+    let data = dto::decode_weather_response(fixture).expect("successful fixture envelope");
+    let mapped = mapper::map_weather(
+        data,
+        &Url::parse("https://configured.example/nmc/").unwrap(),
+    );
+    assert_eq!(mapped.value.real.unwrap().comfort_label, None);
 }
 
 #[test]
@@ -180,7 +225,7 @@ fn aliases_try_each_complete_conversion_and_filter_every_sentinel_shape() {
     assert_eq!(real.humidity, None);
     assert_eq!(real.rain, None);
     assert_eq!(real.comfort_index.as_deref(), Some("1"));
-    assert_eq!(real.comfort_label.as_deref(), Some("71"));
+    assert_eq!(real.comfort_label.as_deref(), Some("温暖，较舒适"));
     let air = snapshot.air.unwrap();
     assert_eq!(air.publish_time.as_deref(), Some("2026-06-29 09:00"));
     assert_eq!(air.aqi, Some(66.0));
