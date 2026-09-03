@@ -1,4 +1,4 @@
-.DEFAULT_GOAL := all
+.DEFAULT_GOAL := bundle
 
 NATIVE_TARGET ?= $(shell rustc -vV | awk '/^host:/ { print $$2 }')
 MUSL_TARGET ?= x86_64-unknown-linux-musl
@@ -49,10 +49,18 @@ dynamic_section="$$("$(READELF)" -dW "$$artifact")"; \
 case "$$dynamic_section" in *NEEDED*) echo "dynamic dependency found in $$artifact" >&2; exit 1;; esac
 endef
 
-.PHONY: all gui tui native-all native-gui native-tui musl-tui \
+.PHONY: bundle all gui tui native-all native-gui native-tui musl-tui \
 	frontend-assets release-static help clean
 
-all: native-all
+# Build the current platform's installable desktop bundle. Tauri's desktop
+# feature includes the daemon, TUI, and GUI in the published application.
+bundle:
+	@command -v "$(BUN)" >/dev/null 2>&1 || { echo "missing Bun: $(BUN)" >&2; exit 1; }
+	cd "$(GUI_DIR)" && "$(BUN)" install --frozen-lockfile
+	cd "$(GUI_DIR)" && "$(BUN)" run bundle
+
+# Keep `make all` as a compatibility alias for the default bundle target.
+all: bundle
 
 gui: native-gui
 
@@ -101,10 +109,11 @@ frontend-assets:
 release-static: musl-tui
 
 help:
-	@echo "make              Native daemon + TUI + GUI (default)"
-	@echo "make gui          Native daemon + GUI"
-	@echo "make tui          Native daemon + TUI"
-	@echo "make musl-tui     Static musl daemon + TUI"
+	@echo "make              Current platform desktop bundle (daemon + TUI + GUI)"
+	@echo "make bundle       Same as make"
+	@echo "make gui          Current platform single binary (daemon + GUI)"
+	@echo "make tui          Current platform single binary (daemon + TUI)"
+	@echo "make musl-tui     Static musl single binary (daemon + TUI)"
 	@echo "make clean        Remove Cargo build artifacts"
 
 clean:

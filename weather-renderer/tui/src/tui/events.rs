@@ -308,7 +308,6 @@ impl TuiApp {
 
 #[cfg(test)]
 mod tests {
-    use prost::Message as _;
     use weather_schema::{
         EventEnvelope, RefreshEvent, SCHEMA_VERSION, StationConfig, TOPIC_ENGINE_LOG,
         TOPIC_ENGINE_REFRESH,
