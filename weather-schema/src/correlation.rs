@@ -31,7 +31,7 @@ impl CorrelationIdGenerator {
     fn next(&self, scope: &str) -> String {
         let sequence = self
             .next_sequence
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
             .expect("correlation ID sequence exhausted");

@@ -44,6 +44,8 @@ Requirements:
 - Stable Rust toolchain.
 - Bun 1.3.14.
 - Native Tauri dependencies for the target platform.
+- [Optional] `make` or `gnu-make` for release builds if you want to use the Makefile automation.
+- [Optional] `musl`, `musl-gcc` and `x86_64-unknown-linux-musl for rust` toolchain and C compiler for static Linux builds.
 
 Ubuntu 22.04 is the minimum supported Linux build target. See the
 [GUI development notes](weather-renderer/gui/README.md) for platform packages

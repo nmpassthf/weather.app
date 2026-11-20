@@ -393,10 +393,14 @@ body::before {
 .daily-temperature-header > div { display: grid; gap: 4px; }
 .daily-temperature-header strong { font-size: 13px; }
 .daily-temperature-source { flex: 0 0 auto; color: var(--muted); font-size: 9px; }
-.daily-temperature-chart { position: relative; min-width: 0; min-height: 174px; }
-.daily-temperature-scroll { display: grid; width: 100%; overflow-x: auto; overflow-y: hidden; align-items: center; justify-items: start; border-radius: 10px; background: color-mix(in srgb, var(--surface-solid), transparent 45%); overscroll-behavior-x: contain; scrollbar-width: thin; }
-.daily-temperature-scroll svg { display: block; min-width: 100%; max-width: none; margin-inline: auto; overflow: visible; cursor: crosshair; outline: none; touch-action: pan-x pan-y; -webkit-touch-callout: none; }
+.daily-temperature-chart { position: relative; min-width: 0; min-height: 184px; }
+.daily-temperature-plot { display: flex; min-width: 0; align-items: flex-start; }
+/* Reserve scrollbar space separately so rebuilding the SVG cannot shrink or center the plot. */
+.daily-temperature-scroll { display: block; min-width: 0; height: calc(var(--daily-temperature-plot-height) + 16px); flex: 1 1 0; overflow-x: auto; overflow-y: hidden; border-radius: 10px; background: color-mix(in srgb, var(--surface-solid), transparent 45%); overscroll-behavior-x: contain; scrollbar-width: thin; }
+.daily-temperature-scroll svg { display: block; min-width: 100%; max-width: none; height: var(--daily-temperature-plot-height); min-height: var(--daily-temperature-plot-height); margin-inline: auto; overflow: visible; cursor: crosshair; outline: none; touch-action: pan-x pan-y; -webkit-touch-callout: none; }
 .daily-temperature-scroll svg:focus-visible { box-shadow: inset 0 0 0 3px color-mix(in srgb, var(--accent), transparent 62%); }
+.daily-temperature-axis { display: block; flex: 0 0 36px; width: 36px; height: var(--daily-temperature-plot-height); overflow: visible; pointer-events: none; }
+.daily-temperature-axis-background { fill: color-mix(in srgb, var(--surface-solid), transparent 45%); }
 .daily-forecast-region { fill: color-mix(in srgb, var(--accent), transparent 94%); }
 .daily-forecast-boundary { stroke: color-mix(in srgb, var(--accent), transparent 58%); stroke-width: 1; stroke-dasharray: 4 4; vector-effect: non-scaling-stroke; }
 .daily-temperature-grid { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-stroke; }

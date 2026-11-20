@@ -800,7 +800,6 @@ function renderWeather(weather: WeatherSnapshot | null, placeholder = false): vo
   element("high-low").textContent = `最高 ${text(firstDay?.day_temperature)}° · 最低 ${text(firstDay?.night_temperature)}°`;
   renderComfort(
     placeholder ? "—" : current?.comfort_label,
-    placeholder ? "—" : current?.comfort_index,
     placeholder ? "—" : weather?.air?.category?.trim() || weather?.air?.level?.trim(),
   );
 
@@ -814,13 +813,11 @@ function renderWeather(weather: WeatherSnapshot | null, placeholder = false): vo
 
 function renderComfort(
   comfortLabel: string | null | undefined,
-  comfortIndex: string | null | undefined,
   airQuality: string | null | undefined,
 ): void {
   const comfort = element<HTMLDivElement>("comfort");
   const entries = [
     { icon: "comfort", label: "舒适度", value: comfortLabel },
-    { icon: "gauge", label: "舒适指数", value: comfortIndex },
     { icon: "air", label: "空气质量", value: airQuality },
   ] as const;
   comfort.replaceChildren();
@@ -1290,6 +1287,7 @@ type DailyTemperaturePlotPoint = {
 const DAILY_TEMPERATURE_HISTORY_DAYS = 2;
 const DAILY_TEMPERATURE_FORECAST_DAYS = 7;
 const DAILY_TEMPERATURE_HORIZONTAL_PADDING = 30;
+const DAILY_TEMPERATURE_AXIS_WIDTH = 36;
 const DAILY_TEMPERATURE_MIN_VIEWPORT_WIDTH = 320;
 const DAILY_TEMPERATURE_INITIAL_PAGE_SIZE = 7;
 const DAILY_TEMPERATURE_NEXT_PAGE_SIZE = 31;
@@ -1347,7 +1345,8 @@ function renderDailyTemperatureChart(
   const defaultStartIndex = Math.max(0, anchorIndex - DAILY_TEMPERATURE_HISTORY_DAYS);
   const defaultEndIndex = Math.min(points.length - 1, anchorIndex + DAILY_TEMPERATURE_FORECAST_DAYS);
   const defaultIntervals = Math.max(1, defaultEndIndex - defaultStartIndex);
-  const viewportWidth = Math.max(target.clientWidth, DAILY_TEMPERATURE_MIN_VIEWPORT_WIDTH);
+  const availablePlotWidth = Math.max(target.clientWidth - DAILY_TEMPERATURE_AXIS_WIDTH, 1);
+  const viewportWidth = Math.max(availablePlotWidth, DAILY_TEMPERATURE_MIN_VIEWPORT_WIDTH);
   const viewportPlotWidth = Math.max(
     1,
     viewportWidth - DAILY_TEMPERATURE_HORIZONTAL_PADDING * 2,
@@ -1407,12 +1406,7 @@ function renderDailyTemperatureChart(
     grid.setAttribute("x2", String(chartWidth - 12));
     grid.setAttribute("y1", y.toFixed(1));
     grid.setAttribute("y2", y.toFixed(1));
-    const label = document.createElementNS(svg.namespaceURI, "text");
-    label.setAttribute("class", "daily-temperature-y-label");
-    label.setAttribute("x", "2");
-    label.setAttribute("y", (y + 3).toFixed(1));
-    label.textContent = `${(minimum + ratio * temperatureSpan).toFixed(0)}°`;
-    svg.append(grid, label);
+    svg.append(grid);
   }
 
   const maxLine = document.createElementNS(svg.namespaceURI, "path");
@@ -1470,6 +1464,38 @@ function renderDailyTemperatureChart(
   scroll.className = "daily-temperature-scroll";
   scroll.dataset.pointSpacing = String(pointSpacing);
   scroll.append(svg);
+
+  // Keep the temperature scale in a fixed column while the data remains
+  // horizontally scrollable in the adjacent plot column.
+  const axis = document.createElementNS(svg.namespaceURI, "svg");
+  axis.classList.add("daily-temperature-axis");
+  axis.setAttribute("viewBox", `0 0 ${DAILY_TEMPERATURE_AXIS_WIDTH} ${chartHeight}`);
+  axis.setAttribute("aria-hidden", "true");
+  axis.setAttribute("focusable", "false");
+  const axisBackground = document.createElementNS(svg.namespaceURI, "rect");
+  axisBackground.setAttribute("class", "daily-temperature-axis-background");
+  axisBackground.setAttribute("width", String(DAILY_TEMPERATURE_AXIS_WIDTH));
+  axisBackground.setAttribute("height", String(chartHeight));
+  axis.append(axisBackground);
+  for (const ratio of [0, 0.5, 1]) {
+    const y = chartBottom - ratio * (chartBottom - chartTop);
+    const grid = document.createElementNS(svg.namespaceURI, "line");
+    grid.setAttribute("class", "daily-temperature-grid");
+    grid.setAttribute("x1", String(DAILY_TEMPERATURE_HORIZONTAL_PADDING - 5));
+    grid.setAttribute("x2", String(DAILY_TEMPERATURE_AXIS_WIDTH));
+    grid.setAttribute("y1", y.toFixed(1));
+    grid.setAttribute("y2", y.toFixed(1));
+    const label = document.createElementNS(svg.namespaceURI, "text");
+    label.setAttribute("class", "daily-temperature-y-label");
+    label.setAttribute("x", "2");
+    label.setAttribute("y", (y + 3).toFixed(1));
+    label.textContent = `${(minimum + ratio * temperatureSpan).toFixed(0)}°`;
+    axis.append(grid, label);
+  }
+  const plot = document.createElement("div");
+  plot.className = "daily-temperature-plot";
+  plot.style.setProperty("--daily-temperature-plot-height", `${chartHeight}px`);
+  plot.append(axis, scroll);
   const tooltip = document.createElement("div");
   tooltip.className = "chart-tooltip daily-temperature-tooltip";
   tooltip.setAttribute("role", "tooltip");
@@ -1498,7 +1524,7 @@ function renderDailyTemperatureChart(
   interactionHint.className = "chart-interaction-hint";
   interactionHint.textContent = "左右滑动 · 悬停 / 长按查看";
   legend.append(seriesLegend, interactionHint);
-  target.append(scroll, tooltip, legend);
+  target.append(plot, tooltip, legend);
   if (options.initialInterval === undefined) {
     animateChartPaths([maxLine as SVGGeometryElement, minLine as SVGGeometryElement]);
   }
