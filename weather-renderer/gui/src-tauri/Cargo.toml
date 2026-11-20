@@ -1,6 +1,6 @@
 [package]
 name = "weather-app"
-version = "0.1.3"
+version = "0.1.4"
 edition.workspace = true
 build = "build.rs"
 

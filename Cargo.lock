@@ -5787,7 +5787,7 @@ dependencies = [
 
 [[package]]
 name = "weather-app"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5809,11 +5809,11 @@ dependencies = [
 
 [[package]]
 name = "weather-build-support"
-version = "0.1.3"
+version = "0.1.4"
 
 [[package]]
 name = "weather-configure"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "chrono-tz",
@@ -5827,7 +5827,7 @@ dependencies = [
 
 [[package]]
 name = "weather-daemon"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5852,7 +5852,7 @@ dependencies = [
 
 [[package]]
 name = "weather-db"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5866,7 +5866,7 @@ dependencies = [
 
 [[package]]
 name = "weather-engine"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5892,7 +5892,7 @@ dependencies = [
 
 [[package]]
 name = "weather-manifest"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "fs2",
@@ -5903,7 +5903,7 @@ dependencies = [
 
 [[package]]
 name = "weather-renderer-common"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5917,7 +5917,7 @@ dependencies = [
 
 [[package]]
 name = "weather-schema"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "hex",
@@ -5934,7 +5934,7 @@ dependencies = [
 
 [[package]]
 name = "weather-tui"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5954,7 +5954,7 @@ dependencies = [
 
 [[package]]
 name = "weather-updater"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "reqwest 0.12.28",
@@ -5968,7 +5968,7 @@ dependencies = [
 
 [[package]]
 name = "weather-utils"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "reqwest 0.12.28",
